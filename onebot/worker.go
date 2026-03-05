@@ -37,7 +37,7 @@ func SendWechatMsg(m *SendMsg) {
 	defer cancel()
 	
 	targetId := m.UserId
-	if m.GroupID != "" && targetId == "" {
+	if m.GroupID != "" {
 		targetId = m.GroupID
 	}
 	

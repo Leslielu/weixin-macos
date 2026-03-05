@@ -65,6 +65,18 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				Error("写入失败", "err", err)
 				break
 			}
+		case "get_group_member_info":
+			err = conn.WriteJSON(map[string]any{
+				"echo":   m.Echo,
+				"status": "ok",
+				"data": map[string]any{
+					"nickname": userID2NicknameMap.Load(m.Params.GroupID + "_" + m.Params.UserID),
+				},
+			})
+			if err != nil {
+				Error("写入失败", "err", err)
+				break
+			}
 		case "send_private_msg", "send_group_msg":
 			err = SendWS(m.Params)
 			if err != nil {

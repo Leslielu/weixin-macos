@@ -14,8 +14,8 @@ func Download(rawMsg []byte) error {
 	
 	Info("下载文件", "file_id", downloadReq.FileID, "media_len", len(downloadReq.Media), "cdn_url", downloadReq.CDNURL[:10])
 	if downloadReqInter, ok := userID2FileMsgMap.Load(downloadReq.CDNURL); ok {
-		downloadReq = downloadReqInter.(*DownloadRequest)
-		downloadReq.Media = append(downloadReq.Media, downloadReq.Media...)
+		beforeDownloadReq := downloadReqInter.(*DownloadRequest)
+		beforeDownloadReq.Media = append(beforeDownloadReq.Media, downloadReq.Media...)
 	} else {
 		userID2FileMsgMap.Store(downloadReq.CDNURL, downloadReq)
 	}

@@ -35,6 +35,7 @@ type WechatMessage struct {
 	MsgResource string     `json:"msgsource"`
 	RawMessage  string     `json:"raw_message"`
 	ShowContent string     `json:"show_content"`
+	MessageType string     `json:"message_type"`
 }
 
 type Sender struct {
