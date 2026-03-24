@@ -103,7 +103,7 @@ function generateBytes(n) {
 // 双方公共使用的地址
 var triggerX1Payload;
 var triggerX0;
-var req2bufEnterAddr = baseAddr.add(`0x3806b30`);
+var req2bufEnterAddr = baseAddr.add(0x3806b30);
 var req2bufExitAddr = baseAddr.add(0x3807C44);
 var sendFuncAddr = baseAddr.add(0x498D2E0);
 var insertMsgAddr = ptr(0);
@@ -236,6 +236,10 @@ function attachReq2buf() {
             } else if (sendMsgType === "video") {
                 insertMsgAddr.writePointer(sendVideoMessageAddr);
                 console.log("[+] 发送视频消息成功! Req2Buf 已将 X24+0x60 指向新地址: " + sendVideoMessageAddr +
+                    "[+] Req2Buf 写入后内存预览: " + insertMsgAddr);
+            } else if (sendMsgType === "reply") {
+                insertMsgAddr.writePointer(sendReplyMessageAddr);
+                console.log("[+] 发送回复消息成功! Req2Buf 已将 X24+0x60 指向新地址: " + sendReplyMessageAddr +
                     "[+] Req2Buf 写入后内存预览: " + insertMsgAddr);
             }
         }
