@@ -1,5 +1,8 @@
-var moduleName = "wechat.dylib";
-var baseAddr = Process.findModuleByName(moduleName).base;
+var targetPath = "/Applications/WeChat.app/Contents/Resources/wechat.dylib";
+var module = Process.enumerateModules().find(function(m) {
+	return m.path === targetPath;
+});
+const baseAddr = module.base;
 if (!baseAddr) {
     console.error("[!] 找不到 WeChat 模块基址，请检查进程名。");
 }
@@ -78,7 +81,7 @@ function patchString(addr, plainStr) {
 // -------------------------全局变量分区-------------------------
 
 // 文本消息全局变量
-var textCallbackFuncAddr = baseAddr.add(0x2587018);
+var textCallbackFuncAddr = baseAddr.add(0x26779D4);
 var protobufAddr = textCallbackFuncAddr.add(0x40);
 var patchTextProtobufAddr = textCallbackFuncAddr.add(0x20);
 var patchTextProtobufByte
@@ -90,15 +93,15 @@ var sendTextMessageAddr = ptr(0);
 var textMessageAddr = ptr(0);
 var textProtoX1PayloadAddr = ptr(0);
 
-var sendMessageCallbackFunc = baseAddr.add(0x8A047B0);
+var sendMessageCallbackFunc = baseAddr.add(0x8C2C880);
 
 
 // 双方公共使用的地址
 var triggerX1Payload;
 var triggerX0;
-var req2bufEnterAddr = baseAddr.add(0x388b400);
-var req2bufExitAddr = baseAddr.add(0x388C514);
-var sendFuncAddr = baseAddr.add(0x4a5e108);
+var req2bufEnterAddr = baseAddr.add(0x39d51d8);
+var req2bufExitAddr = baseAddr.add(0x39D62EC);
+var sendFuncAddr = baseAddr.add(0x4bd0e1c);
 var insertMsgAddr = ptr(0);
 var sendMsgType = "";
 

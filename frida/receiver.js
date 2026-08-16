@@ -1,15 +1,18 @@
-var moduleName = "wechat.dylib";
-var baseAddr = Process.findModuleByName(moduleName).base;
+var targetPath = "/Applications/WeChat.app/Contents/Resources/wechat.dylib";
+var module = Process.enumerateModules().find(function(m) {
+	return m.path === targetPath;
+});
+const baseAddr = module.base
 if (!baseAddr) {
     console.error("[!] 找不到 WeChat 模块基址，请检查进程名。");
 }
 console.log("[+] WeChat base address: " + baseAddr);
 
-var buf2RespAddr = baseAddr.add(0x38b0a78)
-var downloadImagAddr = baseAddr.add(0x4cc945c) // image_download
-var downloadFileAddr = baseAddr.add(0x4c681e4) // c2c_download
-var downloadVideoAddr = baseAddr.add(0x4c89f68) // hdvideo_streaming
-var startDownloadMedia = baseAddr.add(0x4ba6340)
+var buf2RespAddr = baseAddr.add(0x39FAC00)
+var downloadImagAddr = baseAddr.add(0x4E6F32C) //  image_download
+var downloadFileAddr = baseAddr.add(0x4E0E264) //  c2c_download
+var downloadVideoAddr = baseAddr.add(0x4E28044) // hdvideo_streaming
+var startDownloadMedia = baseAddr.add(0x4d4c838)
 
 var downloadGlobalX0;
 var downloadFileX1 = ptr(0)
@@ -150,8 +153,8 @@ function setReceiver() {
     Interceptor.attach(downloadFileAddr, {
         onEnter: function (args) {
             var dataPtr = this.context.x22;
-            var dataLen = this.context.x0.toInt32();
-            var fileId = this.context.sp.add(0x30).readPointer().readUtf8String();
+            var dataLen = this.context.x2.toInt32();
+            var fileId = this.context.x19.add(0x2E0).readPointer().readUtf8String();
             var cdnUrl = this.context.x19.add(0x2F8).readPointer().readUtf8String();
 
             if (dataLen > 0) {
@@ -181,10 +184,10 @@ function setReceiver() {
 
     Interceptor.attach(downloadVideoAddr, {
         onEnter: function (args) {
-            var dataPtr = this.context.x1;
-            var dataLen = this.context.x24.toInt32();
-            var fileId = this.context.x22.add(0x40).readPointer().readUtf8String();
-            var cdnUrl = this.context.x22.add(0x58).readPointer().readUtf8String();
+            var dataPtr = this.context.x20.add(0x178).readPointer();
+            var dataLen = this.context.x23.toInt32();
+            var fileId = this.context.x19.add(0x2E0).readPointer().readUtf8String();
+            var cdnUrl = this.context.x19.add(0x2F8).readPointer().readUtf8String();
 
             if (dataLen > 0) {
                 var buffer = dataPtr.readByteArray(dataLen);

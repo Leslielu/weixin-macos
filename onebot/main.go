@@ -27,6 +27,7 @@ func main() {
 		initFrida()
 	}
 	go SendWorker()
+	go cleanExpiredDownloads()
 
 	http.HandleFunc("/send_private_msg", sendHandler)
 	http.HandleFunc("/send_group_msg", sendHandler)
@@ -60,13 +61,26 @@ func initFlag() {
 	flag.StringVar(&config.FridaGadgetAddr, "gadget_addr", "127.0.0.1:27042", "Gadget 地址: 127.0.0.1:27042 仅当 type 为 gadget 时有效")
 	flag.StringVar(&config.OnebotToken, "token", "MuseBot", "OneBot Token: MuseBot")
 	flag.StringVar(&config.ImagePath, "image_path", "", "图片路径: /Users/xxx/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/xxx/temp/xxx/2026-01/Img/")
-	flag.StringVar(&config.WechatConf, "wechat_conf", "../wechat_version/4_1_8_107_mac.json", "微信配置文件路径: ../wechat_version/4_1_6_12_mac.json")
+	flag.StringVar(&config.WechatConf, "wechat_conf", "../wechat_version/4_1_11_53_mac.json", "微信配置文件路径: ../wechat_version/4_1_6_12_mac.json")
 	flag.StringVar(&config.ConnType, "conn_type", "http", "连接类型: http | websocket")
 	flag.IntVar(&config.SendInterval, "send_interval", 1000, "发送间隔: ms")
 	flag.IntVar(&config.WechatPid, "wechat_pid", 0, "微信进程 PID，不设置则自动查找")
 	flag.StringVar(&logLevel, "log_level", "info", "log level")
 
 	flag.Parse()
+
+	if myWechatId == "" && config.ImagePath != "" {
+		if idx := strings.Index(config.ImagePath, "xwechat_files/"); idx != -1 {
+			rest := config.ImagePath[idx+len("xwechat_files/"):]
+			if end := strings.Index(rest, "/"); end != -1 {
+				rest = rest[:end]
+			}
+			// 去掉末尾的 "_xxxx" 后缀，保留 wxid_xxx 部分
+			if last := strings.LastIndex(rest, "_"); last > strings.Index(rest, "_") {
+				myWechatId = rest[:last]
+			}
+		}
+	}
 
 	fmt.Println("FridaType", config.FridaType)
 	fmt.Println("SendURL", config.SendURL)
@@ -125,8 +139,8 @@ func attachWechat() {
 			if err == nil {
 				break
 			}
-			Info("未发现正在运行的微信进程，5秒后重试...")
-			time.Sleep(5 * time.Second)
+			Info("未发现正在运行的微信进程，20秒后重试...")
+			time.Sleep(20 * time.Second)
 		}
 		Info("自动发现微信进程 PID", "PID", pid)
 	}
@@ -199,42 +213,118 @@ func loadJs() {
 					payloadJson, _ := json.Marshal(pMap)
 					if t, ok := pMap["type"]; ok {
 						switch t.(string) {
+						case "protobuf_msg":
+							go HandleProtobufMsgAndSend(pMap)
 						case "send":
 							if config.ConnType == "http" {
 								go SendHttpReq(payloadJson)
 							} else {
 								go SendWebSocketMsg(payloadJson)
 							}
-						case "finish":
-							finishChan <- struct{}{}
-						case "upload":
-							if selfId, ok := pMap["self_id"]; ok && myWechatId == "" {
-								myWechatId = selfId.(string)
-							}
+						case "buf2resp":
+							go func() {
+								msgType := ""
+								if mt, ok := pMap["msg_type"]; ok {
+									msgType = mt.(string)
+								}
+								if dataInter, ok := pMap["data"]; ok {
+									if dataArr, ok := dataInter.([]interface{}); ok {
+										rawBytes := make([]byte, len(dataArr))
+										for i, v := range dataArr {
+											if f, ok := v.(float64); ok {
+												rawBytes[i] = byte(int(f))
+											}
+										}
+										HandleBuf2Resp(msgType, rawBytes)
+									}
+								}
+							}()
 						case "upload_image_finish":
 							m := &SendMsg{
 								Type: "send_image",
 							}
+							targetId := ""
 							if targetIdInter, ok := pMap["target_id"]; ok {
-								targetIdStr := targetIdInter.(string)
-								if strings.Contains(targetIdStr, "wxid_") {
-									m.UserId = targetIdStr
+								targetId = targetIdInter.(string)
+								if strings.Contains(targetId, "wxid_") {
+									m.UserId = targetId
 								} else {
-									m.GroupID = targetIdStr
+									m.GroupID = targetId
 								}
+							}
+							if cdnKey, ok := pMap["cdn_key"]; ok {
+								m.CdnKey = cdnKey.(string)
+							}
+							if aesKey, ok := pMap["aes_key"]; ok {
+								m.AesKey = aesKey.(string)
+							}
+							if md5Key, ok := pMap["md5_key"]; ok {
+								m.Md5Key = md5Key.(string)
+							}
+							if ch, ok := pendingResultMap.LoadAndDelete(targetId); ok {
+								m.ResultChan = ch.(chan error)
 							}
 							msgChan <- m
 						case "upload_video_finish":
 							m := &SendMsg{
 								Type: "send_video",
 							}
+							targetId := ""
 							if targetIdInter, ok := pMap["target_id"]; ok {
-								targetIdStr := targetIdInter.(string)
-								if strings.Contains(targetIdStr, "wxid_") {
-									m.UserId = targetIdStr
+								targetId = targetIdInter.(string)
+								if strings.Contains(targetId, "wxid_") {
+									m.UserId = targetId
 								} else {
-									m.GroupID = targetIdStr
+									m.GroupID = targetId
 								}
+							}
+							if cdnKey, ok := pMap["cdn_key"]; ok {
+								m.CdnKey = cdnKey.(string)
+							}
+							if aesKey, ok := pMap["aes_key"]; ok {
+								m.AesKey = aesKey.(string)
+							}
+							if md5Key, ok := pMap["md5_key"]; ok {
+								m.Md5Key = md5Key.(string)
+							}
+							if videoId, ok := pMap["video_id"]; ok {
+								m.VideoId = videoId.(string)
+							}
+							if ch, ok := pendingResultMap.LoadAndDelete(targetId); ok {
+								m.ResultChan = ch.(chan error)
+							}
+							msgChan <- m
+						case "upload_voice_finish":
+							m := &SendMsg{
+								Type: "send_voice",
+							}
+							targetId := ""
+							if targetIdInter, ok := pMap["target_id"]; ok {
+								targetId = targetIdInter.(string)
+								if strings.Contains(targetId, "wxid_") {
+									m.UserId = targetId
+								} else {
+									m.GroupID = targetId
+								}
+							}
+							if cdnKey, ok := pMap["cdn_key"]; ok {
+								m.CdnKey = cdnKey.(string)
+							}
+							if aesKey, ok := pMap["aes_key"]; ok {
+								m.AesKey = aesKey.(string)
+							}
+							if voiceDuration, ok := pMap["voice_duration"]; ok {
+								if vd, ok := voiceDuration.(float64); ok {
+									m.VoiceDuration = int32(vd)
+								}
+							}
+							if silkDataLen, ok := pMap["silk_data_len"]; ok {
+								if sdl, ok := silkDataLen.(float64); ok {
+									m.SilkDataLen = int32(sdl)
+								}
+							}
+							if ch, ok := pendingResultMap.LoadAndDelete(targetId); ok {
+								m.ResultChan = ch.(chan error)
 							}
 							msgChan <- m
 						case "download":

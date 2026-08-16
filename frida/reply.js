@@ -18,7 +18,7 @@ var triggerX1Payload;
 var insertMsgAddr;
 
 // 回复消息回调函数地址 (基于用户提供: 0x24BDE40)
-var replyCallbackFuncAddr = baseAddr.add(0x24BDE40);
+var replyCallbackFuncAddr = baseAddr.add(0x260C444);
 var replyProtobufAddr = replyCallbackFuncAddr.add(0x50);
 var patchReplyProtobufFunc1 = replyCallbackFuncAddr.add(0x10);
 var patchReplyProtobufFunc1Byte;
@@ -26,13 +26,14 @@ var patchReplyProtobufFunc2 = replyCallbackFuncAddr.add(0x30);
 var patchReplyProtobufFunc2Byte;
 var replyProtobufDeleteAddr = replyCallbackFuncAddr.add(0x6c);
 var replyProtobufDeleteAddrByte;
+var replyMessageCallbackFunc1 = baseAddr.add(0x8C29A08); // 复用图片的callback函数
 
 // Reply消息相关地址 - 需要导出为全局变量供file.js使用
 var sendReplyMessageAddr = ptr(0);
 var replyMessageAddr = ptr(0);
 var replyCgiAddr = ptr(0);
 var replyProtobufBufAddr = ptr(0); // 用于存储protobuf数据的缓冲区
-var replyMessageCallbackFunc1 = baseAddr.add(0x89170D0); // 复用图片的callback函数
+
 
 // Reply消息内容相关
 var replyContent = ""; // 回复的文本内容
