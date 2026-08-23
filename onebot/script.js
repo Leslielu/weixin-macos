@@ -1,6 +1,6 @@
 var targetPath = "/Applications/WeChat.app/Contents/MacOS/WeChat";
 var module = Process.enumerateModules().find(function(m) {
-    return m.path === targetPath;
+    return m.path === targetPath || m.name === "WeChat";
 });
 if (!module) {
     throw new Error("[-] Cannot find module: " + targetPath);
@@ -46,7 +46,22 @@ ranges.forEach(function(r) {
             pending--;
             if (pending === 0) {
                 if (_req2bufSearchAddr === null) {
-                    throw new Error("[-] Cannot find 'req2buf' keyword in a range > 100MB");
+                    // 兜底: 原扫描要求"req2buf"命中在单个>100MB大range内, 但大range会随进程
+                    // 运行碎裂成小段导致定位失败(全盲)。改从模块表里挑: 名为wechat.dylib的
+                    // 模块有两个, Frameworks/下是16KB的stub, 真身在Resources/约147MB, 取最大者。
+                    var wechatModules = Process.enumerateModules().filter(function(m) {
+                        return m.name === "wechat.dylib";
+                    });
+                    wechatModules.sort(function(a, b) { return b.size - a.size; });
+                    if (wechatModules.length > 0 && wechatModules[0].size > 50 * 1024 * 1024) {
+                        baseAddr = wechatModules[0].base;
+                        console.log("[!] 大range扫描未命中, 已回退模块表定位: " + wechatModules[0].path +
+                            " base=" + baseAddr + " size=" + wechatModules[0].size);
+                        initAddresses();
+                        return;
+                    } else {
+                        throw new Error("[-] Cannot find 'req2buf' keyword in a range > 100MB");
+                    }
                 }
 
                 var foundRange = Process.findRangeByAddress(_req2bufSearchAddr);
@@ -243,9 +258,12 @@ var textMessageAddr = ptr(0);
 var sendMessageCallbackFunc;
 var retOneStub = ptr(0);
 var fakeVtable = ptr(0);
-var pendingInsertMsgAddr = ptr(0);  // 等待buf2resp后清理的insertMsgAddr
-var pendingSendMsgType = "";  // 等待buf2resp回调时使用的消息类型
-var pendingBuf2RespTaskId = 0;  // 等待buf2resp匹配的taskId
+// 等待buf2resp的任务表: taskId -> { addr, msgType, timerId }
+// 支持多任务并存 + 超时兜底: ack迟迟不来时提前清零 X24+0x60, 避免mars
+// 回收死任务时对伪造结构体做虚调用/delete导致SIGSEGV (2026-08-17 crash)
+var pendingBuf2RespTasks = {};
+// 正常ack在1s内返回, 10s未回基本可判定任务已死; 必须早于mars约20s的任务超时回收
+var PENDING_CLEANUP_TIMEOUT_MS = 10 * 1000;
 var textProtoDataAddr = ptr(0);
 
 
@@ -256,6 +274,7 @@ var req2bufEnterAddr;
 var req2bufExitAddr;
 var sendFuncAddr;
 var insertMsgAddr = ptr(0);
+var originalInsertMsgPtr = ptr(0);  // hook前X24+0x60的原始消息指针, 超时兜底时复原
 var sendMsgType = "";
 var buf2RespAddr;
 
@@ -581,6 +600,61 @@ function AttachSendFunc() {
 // -------------------------发送文本消息分区-------------------------
 
 
+// -------------------------buf2resp超时兜底分区-------------------------
+// req2bufExit后登记待ack任务: 命中buf2resp时清理指针并取消timer;
+// 超时未命中则复原X24+0x60的原始指针(而不是清零/留着伪造结构体),
+// 任务回到未注入的合法状态, mars无论重试重序列化还是超时回收delete都安全
+function armPendingBuf2RespTask(taskId, addr, msgType, originalPtr) {
+    pendingBuf2RespTasks[taskId] = {
+        addr: addr,
+        msgType: msgType,
+        originalPtr: originalPtr || ptr(0),
+        timerId: setTimeout(function () {
+            fallbackCleanupPendingTask(taskId);
+        }, PENDING_CLEANUP_TIMEOUT_MS),
+    };
+}
+
+// ack命中: 取消timer并移除登记, 返回entry供调用方读取msgType
+function finishPendingBuf2RespTask(taskId) {
+    var entry = pendingBuf2RespTasks[taskId];
+    if (!entry) {
+        return null;
+    }
+    delete pendingBuf2RespTasks[taskId];
+    if (entry.timerId !== null) {
+        clearTimeout(entry.timerId);
+        entry.timerId = null;
+    }
+    return entry;
+}
+
+// 超时兜底: 复原X24+0x60为原始消息指针(与成功路径写0不同, 此时任务
+// 可能仍被mars重试, 必须留合法对象)。entry再保留30s, 迟到的ack
+// 仍能匹配并把响应转发给Go (此时entry.addr已空, 只转发不再清理)
+function fallbackCleanupPendingTask(taskId) {
+    var entry = pendingBuf2RespTasks[taskId];
+    if (!entry) {
+        return;
+    }
+    entry.timerId = null;
+    try {
+        if (!entry.originalPtr.isNull()) {
+            entry.addr.writePointer(entry.originalPtr);
+            console.log("[!] buf2resp超时兜底: 已复原原始消息指针, msgType=" + entry.msgType + " taskId=" + taskId);
+        } else {
+            entry.addr.writeU64(0x0);
+            console.log("[!] buf2resp超时兜底: 原始指针不可用, 已清零 insertMsgAddr, msgType=" + entry.msgType + " taskId=" + taskId);
+        }
+    } catch (e) {
+        console.error("[!] buf2resp超时兜底清理失败: taskId=" + taskId + " err=" + e);
+    }
+    entry.addr = ptr(0);
+    setTimeout(function () {
+        delete pendingBuf2RespTasks[taskId];
+    }, 30 * 1000);
+}
+
 // -------------------------Req2Buf公共部分分区-------------------------
 function attachReq2buf() {
     Interceptor.attach(req2bufEnterAddr, {
@@ -591,6 +665,9 @@ function attachReq2buf() {
 
             const x24_base = this.context.x24;
             insertMsgAddr = x24_base.add(0x60);
+            // 保存hook前的原始消息指针(校验过可读), 超时兜底时复原,
+            // 让任务回到未注入的合法状态, mars重试/回收/delete都不会踩到伪造结构体
+            originalInsertMsgPtr = readPointerIfReadable(insertMsgAddr);
 
             if (sendMsgType === "text") {
                 insertMsgAddr.writePointer(sendTextMessageAddr);
@@ -636,9 +713,8 @@ function attachReq2buf() {
             }
             // 不立即清除insertMsgAddr，让mars能路由buf2resp回调
             // 用fakeVtable保护结构体，防止中间被访问时崩溃
-            pendingInsertMsgAddr = insertMsgAddr;
-            pendingSendMsgType = sendMsgType;
-            pendingBuf2RespTaskId = taskIdGlobal;
+            // 登记任务并挂超时兜底timer: ack超时则复原X24+0x60原始指针
+            armPendingBuf2RespTask(taskIdGlobal, insertMsgAddr, sendMsgType, originalInsertMsgPtr);
             taskIdGlobal = 0;
         }
     });
@@ -1059,34 +1135,36 @@ function setReceiver() {
 			var respTaskId = this.context.sp.add(0x140).readS32();
 			const currentPtr = this.context.x20;
 			const x2 = this.context.x0.toInt32();
+            // 先处理我们发送任务的ack: 无论响应数据是否可读, 清理动作都必须执行
+            // (错误响应往往指针不可读, 在校验前早退会跳过清理留下悬空伪造指针)
+            var pendingEntry = finishPendingBuf2RespTask(respTaskId);
+            if (pendingEntry && !pendingEntry.addr.isNull()) {
+                pendingEntry.addr.writeU64(0x0);
+                console.log("[+] buf2resp: 已清理 insertMsgAddr, msgType=" + pendingEntry.msgType + " taskId=" + respTaskId);
+            }
+
             if (!isReadablePointer(currentPtr) || x2 < 4 || x2 > MAX_FRIDA_MESSAGE_BYTES) {
-                console.error("[-] buf2resp: pointer 不可读 或 x2 大小不正确, ptr=" + currentPtr + " x2=" + x2);
+                if (pendingEntry) {
+                    console.log("[+] buf2resp: ack响应数据不可读, 已跳过数据转发, taskId=" + respTaskId);
+                } else {
+                    console.error("[-] buf2resp: pointer 不可读 或 x2 大小不正确, ptr=" + currentPtr + " x2=" + x2);
+                }
 				return;
             }
 
             // 判断是否是我们发送的消息的 ack
-            if (pendingBuf2RespTaskId !== 0 && respTaskId === pendingBuf2RespTaskId) {
-                // 清理 insertMsgAddr
-                if (!pendingInsertMsgAddr.isNull()) {
-                    pendingInsertMsgAddr.writeU64(0x0);
-                    console.log("[+] buf2resp: 已清理 insertMsgAddr, msgType=" + pendingSendMsgType + " taskId=" + respTaskId);
-                    pendingInsertMsgAddr = ptr(0);
-                }
-
+            if (pendingEntry) {
                 // 读取响应数据
 				var respData = x2 >= 4 && x2 <= MAX_FRIDA_MESSAGE_BYTES ? readByteArrayIfReadable(currentPtr, x2) : null;
 				if (respData) {
 					var bytes = new Uint8Array(respData);
-					console.log("[+] buf2resp: 收到响应, msgType=" + pendingSendMsgType + " taskId=" + respTaskId + " len=" + x2);
+					console.log("[+] buf2resp: 收到响应, msgType=" + pendingEntry.msgType + " taskId=" + respTaskId + " len=" + x2);
 					send({
 						type: "buf2resp",
-						msg_type: pendingSendMsgType,
+						msg_type: pendingEntry.msgType,
 						data: Array.from(bytes),
 					});
 				}
-
-				pendingBuf2RespTaskId = 0;
-				pendingSendMsgType = "";
 				return
             }
 

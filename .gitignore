@@ -24,3 +24,4 @@ requirements.md
 .gocache/
 .gomodcache/
 frida-devkit/
+frida-gadget-*.dylib
