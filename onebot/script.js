@@ -262,8 +262,11 @@ var fakeVtable = ptr(0);
 // 支持多任务并存 + 超时兜底: ack迟迟不来时提前清零 X24+0x60, 避免mars
 // 回收死任务时对伪造结构体做虚调用/delete导致SIGSEGV (2026-08-17 crash)
 var pendingBuf2RespTasks = {};
-// 正常ack在1s内返回, 10s未回基本可判定任务已死; 必须早于mars约20s的任务超时回收
-var PENDING_CLEANUP_TIMEOUT_MS = 10 * 1000;
+// 正常ack在1s内返回; 3s未回视为失败。必须赶在mars短链CGI失败窗口(~5s)之前
+// 复原原始指针: 8/20崩溃即任务无ack, ~5s失败回调在协程线程erase任务map时踩坏
+// 节点, 10s兜底来不及。original指针本就是sendFunc构造的合法消息, 提前复原=
+// 回到原生行为; 迟到ack仍能命中(entry保留30s), 只是entry.addr已空不再清理
+var PENDING_CLEANUP_TIMEOUT_MS = 3 * 1000;
 var textProtoDataAddr = ptr(0);
 
 
