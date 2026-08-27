@@ -935,6 +935,10 @@ function attachUploadMedia() {
 
 
 
+// 视频上传成功钥匙缓存: cdnKey -> { aesKey, md5Key, videoId }
+// CDN 秒传去重的响应不带 aesKey, 按 cdnKey 命中回填 (见 patchCdnOnComplete)
+var cdnVideoKeyCache = {};
+
 function patchCdnOnComplete() {
     Interceptor.attach(cndOnCompleteAddr, {
         onEnter: function (args) {
@@ -987,7 +991,8 @@ function patchCdnOnComplete() {
                             overwrite_msg_id: ""
                         });
                     } else if (currentFileId === videoFileId) {
-                        // 视频
+                        // 视频: 缓存成功上传的钥匙, 供秒传去重时回填
+                        cdnVideoKeyCache[cdnKey] = { aesKey: aesKey, md5Key: md5Key, videoId: videoId };
                         send({
                             type: "upload_video_finish",
                             target_id: targetId,
@@ -1006,6 +1011,21 @@ function patchCdnOnComplete() {
                             md5_key: md5Key
                         });
                     }
+                } else if (currentFileId === videoFileId && cdnKey !== "" && cdnKey != null && cdnVideoKeyCache[cdnKey]) {
+                    // CDN 秒传去重: 同一视频重复上传时服务端直接返回已有 filekey
+                    // (cdnKey 相同), 但响应不带 aesKey/md5Key (2026-08-27 先发个人再发群,
+                    // 群发送三次全部死在 "cdnKey or aesKey 为空")。文件就是上次我们自己传的,
+                    // 回填缓存钥匙即可正确解密; videoId 优先用本次响应里的(秒传响应会带)。
+                    var cached = cdnVideoKeyCache[cdnKey];
+                    console.log("[+] cndOnComplete 秒传命中, 回填缓存钥匙 cdnKey: " + cdnKey);
+                    send({
+                        type: "upload_video_finish",
+                        target_id: targetId,
+                        cdn_key: cdnKey,
+                        aes_key: cached.aesKey,
+                        md5_key: cached.md5Key,
+                        video_id: (videoId !== "" && videoId != null) ? videoId : cached.videoId
+                    });
                 } else {
                     console.error("cdnKey or aesKey 为空");
                 }
