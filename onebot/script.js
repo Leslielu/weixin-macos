@@ -1162,8 +1162,22 @@ function setReceiver() {
             // (错误响应往往指针不可读, 在校验前早退会跳过清理留下悬空伪造指针)
             var pendingEntry = finishPendingBuf2RespTask(respTaskId);
             if (pendingEntry && !pendingEntry.addr.isNull()) {
-                pendingEntry.addr.writeU64(0x0);
-                console.log("[+] buf2resp: 已清理 insertMsgAddr, msgType=" + pendingEntry.msgType + " taskId=" + respTaskId);
+                // 成功路径同样复原原始消息指针, 而不是写0: 已完成的任务若带 NULL
+                // 消息指针留在 mars 任务 map 里, 后续(数秒~数天后)清理 erase 时会
+                // 踩坏红黑树 (2026-09-02 02:22 crash: 文本成功后留下 NULL 节点,
+                // 图片失败的清理路径踩雷)。originalPtr 是 sendFunc 构造的合法消息,
+                // 复原后任务全程处于原生合法状态, OnTaskEnd 按原生流程回收即可
+                try {
+                    if (pendingEntry.originalPtr && !pendingEntry.originalPtr.isNull()) {
+                        pendingEntry.addr.writePointer(pendingEntry.originalPtr);
+                        console.log("[+] buf2resp: 已复原原始消息指针, msgType=" + pendingEntry.msgType + " taskId=" + respTaskId);
+                    } else {
+                        pendingEntry.addr.writeU64(0x0);
+                        console.log("[+] buf2resp: 原始指针不可用, 已清零 insertMsgAddr, msgType=" + pendingEntry.msgType + " taskId=" + respTaskId);
+                    }
+                } catch (e) {
+                    console.error("[!] buf2resp 清理异常: taskId=" + respTaskId + " err=" + e);
+                }
             }
 
             if (!isReadablePointer(currentPtr) || x2 < 4 || x2 > MAX_FRIDA_MESSAGE_BYTES) {
