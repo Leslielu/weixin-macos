@@ -1,5 +1,35 @@
 # 微信全自动重启登录方案
 
+## 2026-09-03 晨间真实崩溃实战（五层问题全暴露，已全修）
+
+**事故链**：06:10:45 微信真崩（SIGSEGV，.ips 在档）→ **"微信意外退出"弹窗(ReportCrash)挡在最前**
+→ 看门狗拉起微信，但三次回车全被前台门禁跳过（弹窗无 bundle ID = "前台应用未知"）→
+微信停在登录窗 45 分钟 → onebot 34s 循环。
+
+**五项修复（按发现顺序）**：
+1. **launchd 杀进程组**（最深）：看门狗(LaunchAgent)→start.sh→onebot 全在同一进程组，
+   launchd 在作业脚本退出时 SIGTERM 整组 → 看门狗起的 onebot 每次就绪后 2 秒必死
+   （FATAL"正在释放Frida"=SIGTERM处理器）。09-02 晚测试"通过"实为手动 ssh 重启掩盖。
+   **修复：plist `AbandonProcessGroup: true`**
+2. **前台门禁 sed 解析 bug**：`lsappinfo info -only bundleid` 输出 `="xxx"`等号后无空格，
+   原 sed 模式 `= "` 永不匹配 → 门禁一直返回"未知"全部跳过。修复：`= *"`
+3. **TCC"onebot要访问其他App的数据"模态弹窗（图片卡死真凶）**：onebot 写微信沙箱容器的
+   image_path 属 AppData 权限；ssh 手动启动有 Terminal 的授权链路覆盖，**launchd 启动是新身份
+   首次触发**，模态弹窗阻塞 write() → 图片任务无声卡死(还连带误诊为 resolver 死锁/微信冻结)。
+   修复：人工允许一次；TCC 按**路径**记录(`.../onebot/onebot`, client_type=1)，
+   **同路径重编译部署不会再弹**
+4. 崩溃弹窗挡道：v4 拉起前 `pkill ReportCrash`（`DialogType none` 用户级设置对该弹窗无效）
+5. 禁锁屏（锁屏时前台=loginwindow 无 bundle → 门禁跳过一切）：
+   `defaults write com.apple.screensaver askForPassword -int 0` + `defaults -currentHost write com.apple.screensaver idleTime -int 0`
+
+**防御性加固（同日）**：
+- script.js: resolver 加"登录稳定门禁"（收到过同步消息或脚本已跑 60s 才允许调 GetService——
+  虽然后证实死锁是误诊，但未登录状态下调用原生服务定位器仍属未知风险，保留防御）
+- http.go: `<-ch` 无界等待改 25s 有界（worker 卡死时 HTTP 客户端不再被拖死）
+
+**07:14 终极验证（全自动零人工）**：kill 微信 → 30s 看门狗拉起 → 三次回车(门禁修复后真发出)
+→ 链重启(新二进制+新脚本) → 文本 200 → 图片: 冷启动解析 CdnManager(第3次验证) → 200。
+
 ## 实施进展（2026-09-02 晚）
 
 **✅ 微信级全自动重启已上线并实测通过**（kill -9 实测：23:15:07 崩溃 → 23:18 全链路恢复 → 23:18:19 API 发图成功）：

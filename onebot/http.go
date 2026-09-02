@@ -140,13 +140,26 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 等待所有消息发送完成
+	// 有界等待: JS线程卡死(如原生调用挂起)时 worker 永不回包, 无界等待会拖死 HTTP 客户端
+	// (2026-09-03 事故: 冷启动解析 GetService 挂起 → JS线程死 → 图片HTTP 30s+无响应)
 	for _, ch := range resultChans {
-		if err := <-ch; err != nil {
+		select {
+		case err := <-ch:
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]any{
+					"status": "failed",
+					"error":  err.Error(),
+				})
+				return
+			}
+		case <-time.After(25 * time.Second):
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
+			w.WriteHeader(http.StatusGatewayTimeout)
 			json.NewEncoder(w).Encode(map[string]any{
 				"status": "failed",
-				"error":  err.Error(),
+				"error":  "send timeout: worker 无响应(可能 JS 线程卡死, 待看门狗自愈)",
 			})
 			return
 		}

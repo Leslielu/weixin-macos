@@ -225,8 +225,22 @@ function sendDownloadChunks(dataPtr, dataLen, fileId, cdnUrl) {
 // 2026-09-02 静态分析 4.1.10: 上传/下载分发链(0x4e5a6e4/0x4e5a7f4)都走
 // GetService("default")[0x4ca2130] -> 按类型名 "N4mars3cdn10CdnManagerE" getter[0x4e59dec]
 // -> [ctx+0x40]。该单例登录后即注册进全局服务表, 不需要先发一张图片触发。
+// ⚠️ 2026-09-03 事故教训: 登录未完成时服务表锁被登录流程持有, 此时在 Frida 线程调
+// GetService 会与微信主线程死锁, 微信整个冻结。因此必须有"登录稳定门禁":
+// 只在 (收到过任意同步消息 = 确已登录) 或 (脚本已跑 60s) 之后才允许解析。
+var scriptLoadTime = Date.now();
+var incomingTrafficSeen = false;
+function loginSettled() {
+    if (incomingTrafficSeen) return true;
+    if (Date.now() - scriptLoadTime > 60 * 1000) return true;
+    return false;
+}
 function resolveCdnManager() {
     if (cdnGetServiceAddr.equals(ptr(0)) || cdnManagerGetterAddr.equals(ptr(0))) {
+        return ptr(0);
+    }
+    if (!loginSettled()) {
+        console.log("[!] 登录尚未稳定, 暂缓 CdnManager 解析(防死锁), 稍后任务重试");
         return ptr(0);
     }
     try {
@@ -1294,6 +1308,8 @@ function setReceiver() {
                 return;
             }
 
+            // 任何同步消息到达 = 微信已登录, 解锁 CdnManager 解析门禁
+            incomingTrafficSeen = true;
             send({
                 type: "protobuf_msg",
                 data: Array.from(uint8Array),
