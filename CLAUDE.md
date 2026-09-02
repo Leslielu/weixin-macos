@@ -67,6 +67,9 @@ curl -X POST -H "Content-Type:application/json" \
 
 ## Key Architecture Notes
 
+### 崩溃/发送异常排查
+**先读 `docs/crash-history.md`** —— 历次崩溃的指纹、根因、已上线修复和遗留问题都在里面，别从零开始。
+
 ### Version-Specific Memory Addresses
 Each WeChat version requires specific memory offsets in `wechat_version/*.json`. When adding new versions:
 1. Use IDA Pro to find function addresses (search `MMStartTask`, `Req2Buf`)
