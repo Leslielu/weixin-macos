@@ -73,6 +73,9 @@ function initAddresses() {
 
     uploadImageAddr = baseAddr.add({{.uploadImageAddr}});
     cndOnCompleteAddr = baseAddr.add({{.cndOnCompleteAddr}});
+    // 冷启动 CdnManager 解析(可选, 旧版本 JSON 无此键则保持 ptr(0), 走 hook 捕获老路)
+    {{if .cdnGetServiceAddr}}cdnGetServiceAddr = baseAddr.add({{.cdnGetServiceAddr}});{{end}}
+    {{if .cdnManagerGetterAddr}}cdnManagerGetterAddr = baseAddr.add({{.cdnManagerGetterAddr}});{{end}}
 
     uploadGetCallbackWrapperAddr = baseAddr.add({{.uploadGetCallbackWrapperAddr}});
     uploadGetCallbackWrapperFuncAddr = baseAddr.add({{.uploadGetCallbackWrapperFuncAddr}});
@@ -203,7 +206,71 @@ function sendDownloadChunks(dataPtr, dataLen, fileId, cdnUrl) {
 	}
 }
 
+// mars::cdn::CdnManager 单例解析: 上传(uploadGlobalX0)/下载(downloadGlobalX0)共用的 this。
+// 2026-09-02 静态分析 4.1.10: 上传/下载分发链(0x4e5a6e4/0x4e5a7f4)都走
+// GetService("default")[0x4ca2130] -> 按类型名 "N4mars3cdn10CdnManagerE" getter[0x4e59dec]
+// -> [ctx+0x40]。该单例登录后即注册进全局服务表, 不需要先发一张图片触发。
+function resolveCdnManager() {
+    if (cdnGetServiceAddr.equals(ptr(0)) || cdnManagerGetterAddr.equals(ptr(0))) {
+        return ptr(0);
+    }
+    try {
+        // libc++ SSO 短字符串: 数据在 +0, 长度写在 +0x17 (对照 wechat.dylib std::string ctor)
+        var strDefault = Memory.alloc(24);
+        strDefault.writeUtf8String("default");
+        strDefault.add(0x17).writeU8(7);
+
+        var getService = new NativeFunction(cdnGetServiceAddr, 'pointer', ['pointer']);
+        var svc = getService(strDefault);
+        if (!isReadablePointer(svc)) {
+            console.error("[!] GetService(\"default\") 返回不可读: " + svc);
+            return ptr(0);
+        }
+        var getCtx = new NativeFunction(cdnManagerGetterAddr, 'pointer', ['pointer']);
+        var ctx = getCtx(svc);
+        if (!isReadablePointer(ctx)) {
+            console.error("[!] CdnManager getter 返回不可读: " + ctx);
+            return ptr(0);
+        }
+        var mgr = readPointerIfReadable(ctx.add(0x40));
+        if (!isReadablePointer(mgr)) {
+            console.error("[!] ctx+0x40 管理器指针不可读: ctx=" + ctx);
+            return ptr(0);
+        }
+        return mgr;
+    } catch (e) {
+        console.error("[!] resolveCdnManager 异常: " + e);
+        return ptr(0);
+    }
+}
+
+// CdnManager 兜底: 1) hook 已捕获的互回填(同一单例) 2) 都没有则走服务定位器解析
+function ensureCdnManagerX0() {
+    if (uploadGlobalX0.equals(ptr(0)) && downloadGlobalX0) {
+        uploadGlobalX0 = downloadGlobalX0;
+        console.log("[+] downloadGlobalX0 回填 uploadGlobalX0: " + uploadGlobalX0);
+    }
+    if (!downloadGlobalX0 && !uploadGlobalX0.equals(ptr(0))) {
+        downloadGlobalX0 = uploadGlobalX0;
+        console.log("[+] uploadGlobalX0 回填 downloadGlobalX0: " + downloadGlobalX0);
+    }
+    if (uploadGlobalX0.equals(ptr(0))) {
+        var mgr = resolveCdnManager();
+        if (!mgr.equals(ptr(0))) {
+            uploadGlobalX0 = mgr;
+            if (!downloadGlobalX0) {
+                downloadGlobalX0 = mgr;
+            }
+            console.log("[+] 冷启动服务定位器解析 CdnManager: " + mgr);
+        }
+    }
+    return !uploadGlobalX0.equals(ptr(0));
+}
+
 function fillUploadX1AndStart(idAddr, pathAddr, x1Buffer, receiver, md5, filePath, payloadHex) {
+    if (uploadGlobalX0.equals(ptr(0))) {
+        ensureCdnManagerX0();
+    }
     if (uploadGlobalX0.equals(ptr(0))) {
         console.error("[!] uploadGlobalX0 尚未初始化，请等待 hook 捕获");
         return "fail";
@@ -260,6 +327,8 @@ var sendMsgType = "";
 var buf2RespAddr;
 
 var uploadImageAddr;
+var cdnGetServiceAddr = ptr(0);      // GetService(std::string) 服务定位器, 冷启动解析 CdnManager 用
+var cdnManagerGetterAddr = ptr(0);   // 按类型名 "N4mars3cdn10CdnManagerE" 取 ctx 的 getter
 var cndOnCompleteAddr;
 var imgMessageCallbackFunc;
 var videoMessageCallbackFunc;
@@ -812,6 +881,9 @@ function triggerUploadVideo(receiver, md5, videoPath, payloadHex) {
 
 function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durationMs) {
     if (uploadGlobalX0.equals(ptr(0))) {
+        ensureCdnManagerX0();
+    }
+    if (uploadGlobalX0.equals(ptr(0))) {
         console.error("[!] uploadGlobalX0 尚未初始化，请等待 hook 捕获");
         return "fail";
     }
@@ -850,6 +922,11 @@ function attachUploadMedia() {
     Interceptor.attach(uploadImageAddr.add(0x10), {
         onEnter: function (args) {
 			uploadGlobalX0 = this.context.x0;
+			if (!downloadGlobalX0) {
+				// 上传/下载共用同一 mars::cdn::CdnManager 单例, 顺手回填
+				downloadGlobalX0 = this.context.x0;
+				console.log("[+] 上传hook回填 downloadGlobalX0: " + downloadGlobalX0);
+			}
 		}
     })
 }
@@ -1112,6 +1189,11 @@ function setReceiver() {
     Interceptor.attach(startDownloadMedia, {
         onEnter: function (args) {
             downloadGlobalX0 = this.context.x0;
+            if (uploadGlobalX0.equals(ptr(0))) {
+                // 上传/下载共用同一 mars::cdn::CdnManager 单例, 顺手回填
+                uploadGlobalX0 = this.context.x0;
+                console.log("[+] 下载hook回填 uploadGlobalX0: " + uploadGlobalX0);
+            }
             var fileIDAddr = readPointerIfReadable(this.context.x1.add(0x40));
             var fileId = readUtf8StringIfReadable(fileIDAddr);
             if (!fileId || !isReadablePointer(this.context.x1.add(0xA0))) {
@@ -1166,6 +1248,9 @@ function setReceiver() {
 
 // fileType:  HdImage => 1,Image => 2, thumbImage => 3, Video => 4, File => 5,
 function triggerDownload(receiver, cdnUrl, aesKey, filePath, fileType) {
+    if (!downloadGlobalX0) {
+        ensureCdnManagerX0();
+    }
     if (!downloadGlobalX0) {
         console.error("[!] downloadGlobalX0 尚未初始化，请等待 hook 捕获");
         return "fail";
