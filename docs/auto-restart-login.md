@@ -14,10 +14,20 @@
 2. **前台门禁 sed 解析 bug**：`lsappinfo info -only bundleid` 输出 `="xxx"`等号后无空格，
    原 sed 模式 `= "` 永不匹配 → 门禁一直返回"未知"全部跳过。修复：`= *"`
 3. **TCC"onebot要访问其他App的数据"模态弹窗（图片卡死真凶）**：onebot 写微信沙箱容器的
-   image_path 属 AppData 权限；ssh 手动启动有 Terminal 的授权链路覆盖，**launchd 启动是新身份
-   首次触发**，模态弹窗阻塞 write() → 图片任务无声卡死(还连带误诊为 resolver 死锁/微信冻结)。
-   修复：人工允许一次；TCC 按**路径**记录(`.../onebot/onebot`, client_type=1)，
-   **同路径重编译部署不会再弹**
+   image_path 属 AppData 权限；ssh 手动启动归入用户 GUI 会话的授权链路所以**从未弹过**
+   （这就是"以前 image_path 钉在4月目录也一直没事"的原因——写容器行为一直都在，
+   变的是 09-02 起 onebot 改由 launchd 看门狗拉起，成了 TCC 眼里的独立新身份），
+   launchd 启动是新身份首次触发，模态弹窗阻塞 write() → 图片任务无声卡死
+   (还连带误诊为 resolver 死锁/微信冻结)，且 TCC 按进程记录，**每次链重启的新 onebot
+   进程首次写容器都会再弹**。
+   **结构性修复（09-03 终版）：image_path 整体挪出容器** → `.image_path_override` 指向
+   `~/Prog/wxgate/botmedia/`。容器只限制外部写入、不限制微信读外部（已实测上传成功），
+   onebot 从此不再写容器，此授权关彻底消失
+4. **image_path 出容器的副作用：myWechatId 变空**（09-03 修）：main.go 原来从 image_path
+   里的 `xwechat_files/wxid_xxx_hash/` 段解析 bot 微信ID，路径挪出容器后解析失败 →
+   发消息 `wechat_id=` 为空（上传能成功但消息可能丢）。修复：onebot 新增 `-wechat_id`
+   显式参数（image_path 解析降级为兜底），start.sh 新增 `find_wechat_id`（从数据目录
+   剥 `_hash` 后缀提取，`.wechat_id_last` 缓存兜登录窗口期）传给 onebot
 4. 崩溃弹窗挡道：v4 拉起前 `pkill ReportCrash`（`DialogType none` 用户级设置对该弹窗无效）
 5. 禁锁屏（锁屏时前台=loginwindow 无 bundle → 门禁跳过一切）：
    `defaults write com.apple.screensaver askForPassword -int 0` + `defaults -currentHost write com.apple.screensaver idleTime -int 0`
@@ -53,7 +63,9 @@
   2. 微信被外部重启 → PID 变化检测(/tmp/wechat_watchdog.last_pid) → 重启 bot 链
   3. 58080 未监听 → 重启 bot 链
   - 挂起：`touch /tmp/wechat_watchdog.paused`（升级微信前必挂）
-- `start.sh` 补丁：find_image_path 增加 `.image_path_last` 上次成功路径兜底（登录窗口期账号目录短暂不可见）
+- `start.sh` 补丁：find_image_path 增加 `.image_path_last` 上次成功路径兜底（登录窗口期账号目录短暂不可见）；
+  `.image_path_override` 可覆盖 image_path（当前指向沙箱外 `~/Prog/wxgate/botmedia/`，根治 TCC AppData 弹窗）；
+  `find_wechat_id` 提取 bot wxid 并以 `-wechat_id` 显式传给 onebot（`.wechat_id_last` 缓存兜底）
 - 崩溃报告弹窗已关（`defaults write com.apple.CrashReporter DialogType none`，.ips 照常生成）
 - cliclick wrapper app（`~/Applications/clicclick.app`，带 Info.plist + adhoc 签名, 辅助功能已授权; 脚本内用 glob 解析路径）
 
