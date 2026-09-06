@@ -109,6 +109,12 @@ func initFridaGadget() {
 	if err != nil {
 		Fatal("❌ 附加失败", err)
 	}
+	// 微信进程崩了时 session 会断开 → 标记 wechatDead, 让 in-flight task 立即 fail-fast
+	// (2026-09-07 事故: 微信 SIGSEGV 后 in-flight task 跨崩溃边界完成信号永远丢)
+	session.On("detached", func(reason frida.SessionDetachReason, crash *frida.Crash) {
+		Warn("Frida session detached", "reason", reason, "crash", crash)
+		markWechatDead()
+	})
 
 	loadJs()
 
@@ -151,6 +157,11 @@ func attachWechat() {
 		Fatal("Attach 失败 (请检查 SIP 状态或权限)", "err", err)
 	}
 	Info("成功 Attach 微信进程", "PID", pid)
+	// 同 gadget 模式: 进程崩了时 session detach 触发, 让 in-flight task 立即中止
+	session.On("detached", func(reason frida.SessionDetachReason, crash *frida.Crash) {
+		Warn("Frida session detached", "reason", reason, "crash", crash)
+		markWechatDead()
+	})
 
 	loadJs()
 	MonitorProcess(pid)

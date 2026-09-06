@@ -154,7 +154,7 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 				})
 				return
 			}
-		case <-time.After(25 * time.Second):
+		case <-time.After(10 * time.Second):
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusGatewayTimeout)
 			json.NewEncoder(w).Encode(map[string]any{

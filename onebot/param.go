@@ -34,7 +34,17 @@ var (
 	buf2RespChan       = make(chan *Buf2RespData, 10)
 	debugRespChan      = make(chan []byte, 1)
 	appAttachRespChan  = make(chan []byte, 1)
+
+	// 微信 session 断开信号: session.On("detached") 时关闭, 关闭后所有 in-flight task 立即失败
+	// (2026-09-07 事故: 微信崩了, in-flight task 跨崩溃边界完成信号永远丢, worker 死锁 15s)
+	wechatDead     = make(chan struct{})
+	wechatDeadOnce sync.Once
 )
+
+// markWechatDead 关闭 wechatDead, 幂等, session.On("detached") 多次触发也只关一次
+func markWechatDead() {
+	wechatDeadOnce.Do(func() { close(wechatDead) })
+}
 
 // NextVersion 获取当前taskId作为版本号
 func NextVersion() uint32 {

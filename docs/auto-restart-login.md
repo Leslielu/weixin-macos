@@ -1,5 +1,21 @@
 # 微信全自动重启登录方案
 
+## 2026-09-07 真实微信崩溃实战（第六层 fail-fast 改造）
+
+**事故**：用户 06:31:48 发文本给 ludaohe，06:31:51 微信进程真崩（SIGSEGV），task 跨崩溃边界完成信号永远丢。worker 15s ctx 超时报 ERROR；看门狗 06:32:19 链重启 SIGTERM 杀掉 onebot。用户看到 HTTP 504 + 进程重启 + 消息丢失。
+
+**根因**：
+- gadget 模式**无 session.On("detached") 检测**——main.go:99 `initFridaGadget` 没注册 detach 回调，`attachWechat` 里虽然新加了但原 `MonitorProcess`(utils.go:625 5s 轮询) 只 local 模式跑
+- `fridaScript.ExportsCall`（frida-go v1.0.2 script.go:92）无 timeout，微信崩在 worker 取 msgChan 之后、ExportsCall 之前会**无限阻塞**，15s ctx timer 永远进不到
+
+**修复**（4 文件 ~119 行）：
+- `param.go`：全局 `wechatDead chan struct{}` + `markWechatDead()`（sync.Once 幂等）
+- `main.go`：两处 Attach 成功后注册 `session.On("detached", ...)` → markWechatDead
+- `worker.go`：ctx 15→5s；入队前和最终 select 加 wechatDead 分支；11 处 `ExportsCall` 走 `safeExportsCall(callCtx, ...)` helper，hit `frida.ErrContextCancelled` 时立即 markWechatDead 并 return error
+- `http.go`：25s → 10s 兜底（worker 5s ctx + wechatDead 立即释放，留 2x 余量；<8s 会和正常多块 appattach 撞车）
+
+**实测**（mac-m1 gadget 模式）：`pkill -9 WeChat` → 立即触发 `Frida session detached reason=4` 日志 → 后续 3 个并发 send 全部 <1s 返回 `{"error":"wechat crashed","status":"failed"}`（之前要 15s+SIGTERM 链重启）→ 看门狗 25s 内拉起+登录+重启链 → 新进程 send 正常。
+
 ## 2026-09-03 晨间真实崩溃实战（五层问题全暴露，已全修）
 
 **事故链**：06:10:45 微信真崩（SIGSEGV，.ips 在档）→ **"微信意外退出"弹窗(ReportCrash)挡在最前**

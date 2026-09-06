@@ -14,7 +14,21 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/frida/frida-go/frida"
 )
+
+// safeExportsCall 包装 ExportsCallWithContext, 微信崩时返回 ErrContextCancelled 时
+// 把 wechatDead 顺手标记为已断开(防止后续 task 还要再走死分支), 并让调用方 return
+// 11 处触发点统一走这里, 避免到处写 if result == ErrContextCancelled
+func safeExportsCall(ctx context.Context, fn string, args ...interface{}) (any, error) {
+	result := fridaScript.ExportsCallWithContext(ctx, fn, args...)
+	if result == frida.ErrContextCancelled {
+		markWechatDead()
+		return nil, errors.New("wechat crashed")
+	}
+	return result, nil
+}
 
 func SendWorker() {
 	defer func() {
@@ -48,8 +62,21 @@ func SendWechatMsg(m *SendMsg) {
 	currTaskId := atomic.AddInt64(&taskId, 1)
 	Info("📩 收到任务", "task_id", currTaskId, "type", m.Type)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// 入队时若微信已死, 直接失败, 不消耗 ExportsCall/buf2resp 等待时间
+	select {
+	case <-wechatDead:
+		Error("微信 session 已断开, 任务直接放弃", "taskId", currTaskId)
+		sendErr = errors.New("wechat crashed")
+		return
+	default:
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	// ExportsCallWithContext 用同一个 ctx, 微信崩时 RPC 也能 fail-fast
+	callCtx, callCancel := context.WithCancel(ctx)
+	defer callCancel()
 
 	targetId := m.UserId
 	if m.GroupID != "" {
@@ -71,7 +98,12 @@ func SendWechatMsg(m *SendMsg) {
 			return
 		}
 		payloadHex := BuildSendPayload(currTaskId, "text")
-		result := fridaScript.ExportsCall("triggerSendTextMessage", currTaskId, targetId, m.Content, m.AtUser, protoHex, payloadHex)
+		result, err := safeExportsCall(callCtx, "triggerSendTextMessage", currTaskId, targetId, m.Content, m.AtUser, protoHex, payloadHex)
+		if err != nil {
+			Error("发送文本中止", "task_id", currTaskId, "target_id", targetId, "err", err)
+			sendErr = err
+			return
+		}
 		Info("📩 发送文本任务执行结果", "result", result, "task_id", currTaskId, "target_id", targetId, "at_user", m.AtUser)
 		if result != "1" {
 			Error("发送文本失败", "task_id", currTaskId, "target_id", targetId, "result", result)
@@ -87,7 +119,12 @@ func SendWechatMsg(m *SendMsg) {
 		}
 
 		uploadPayloadHex := BuildUploadPayload("img")
-		result := fridaScript.ExportsCall("triggerUploadImg", targetId, md5Str, targetPath, uploadPayloadHex)
+		result, err := safeExportsCall(callCtx, "triggerUploadImg", targetId, md5Str, targetPath, uploadPayloadHex)
+		if err != nil {
+			Error("上传图片中止", "target_id", targetId, "md5", md5Str, "err", err)
+			sendErr = err
+			return
+		}
 		Info("📩 上传图片任务执行结果", "result", result, "target_id", targetId, "md5", md5Str, "path", targetPath)
 		if result != "0" {
 			Error("上传图片失败", "target_id", targetId, "md5", md5Str, "result", result)
@@ -107,7 +144,12 @@ func SendWechatMsg(m *SendMsg) {
 			return
 		}
 		payloadHex := BuildSendPayload(currTaskId, "img")
-		result := fridaScript.ExportsCall("triggerSendImgMessage", currTaskId, myWechatId, targetId, protoHex, payloadHex)
+		result, err := safeExportsCall(callCtx, "triggerSendImgMessage", currTaskId, myWechatId, targetId, protoHex, payloadHex)
+		if err != nil {
+			Error("发送图片中止", "task_id", currTaskId, "err", err)
+			sendErr = err
+			return
+		}
 		Info("📩 发送图片任务执行结果", "result", result, "task_id", currTaskId, "wechat_id", myWechatId, "target_id", targetId)
 		if result != "1" {
 			Error("发送图片失败", "task_id", currTaskId, "target_id", targetId, "result", result)
@@ -136,7 +178,12 @@ func SendWechatMsg(m *SendMsg) {
 		videoInfoMap.Store(targetId, info)
 
 		uploadPayloadHex := BuildUploadPayload("video")
-		result := fridaScript.ExportsCall("triggerUploadVideo", targetId, md5Str, targetPath, uploadPayloadHex)
+		result, err := safeExportsCall(callCtx, "triggerUploadVideo", targetId, md5Str, targetPath, uploadPayloadHex)
+		if err != nil {
+			Error("上传视频中止", "target_id", targetId, "md5", md5Str, "err", err)
+			sendErr = err
+			return
+		}
 		Info("📩 上传视频任务执行结果", "result", result, "target_id", targetId, "md5", md5Str, "path", targetPath, "duration", info.Duration, "size", info.VideoSize)
 		if result != "0" {
 			Error("上传视频失败", "target_id", targetId, "md5", md5Str, "result", result)
@@ -162,7 +209,12 @@ func SendWechatMsg(m *SendMsg) {
 			return
 		}
 		payloadHex := BuildSendPayload(currTaskId, "video")
-		result := fridaScript.ExportsCall("triggerSendVideoMessage", currTaskId, myWechatId, targetId, protoHex, payloadHex)
+		result, err := safeExportsCall(callCtx, "triggerSendVideoMessage", currTaskId, myWechatId, targetId, protoHex, payloadHex)
+		if err != nil {
+			Error("发送视频中止", "task_id", currTaskId, "err", err)
+			sendErr = err
+			return
+		}
 		Info("📩 发送视频任务执行结果", "result", result, "task_id", currTaskId, "wechat_id", myWechatId, "target_id", targetId, "duration", duration, "size", videoSize)
 		if result != "1" {
 			Error("发送视频失败", "task_id", currTaskId, "target_id", targetId, "result", result)
@@ -170,7 +222,12 @@ func SendWechatMsg(m *SendMsg) {
 			return
 		}
 	case "download":
-		result := fridaScript.ExportsCall("triggerDownload", targetId, m.FIleCdnUrl, m.AesKey, m.FilePath, m.FileType)
+		result, err := safeExportsCall(callCtx, "triggerDownload", targetId, m.FIleCdnUrl, m.AesKey, m.FilePath, m.FileType)
+		if err != nil {
+			Error("下载中止", "task_id", currTaskId, "err", err)
+			sendErr = err
+			return
+		}
 		Info("📩 下载任务执行结果", "result", result, "task_id", currTaskId, "wechat_id", myWechatId, "target_id", targetId)
 	case "reply":
 		replyInfo := &ReplyInfo{
@@ -190,7 +247,12 @@ func SendWechatMsg(m *SendMsg) {
 			return
 		}
 		payloadHex := BuildSendPayload(currTaskId, "reply")
-		result := fridaScript.ExportsCall("triggerSendReplyMessage", currTaskId, myWechatId, targetId, protoHex, payloadHex)
+		result, err := safeExportsCall(callCtx, "triggerSendReplyMessage", currTaskId, myWechatId, targetId, protoHex, payloadHex)
+		if err != nil {
+			Error("发送回复中止", "task_id", currTaskId, "err", err)
+			sendErr = err
+			return
+		}
 		Info("📩 发送回复任务执行结果", "result", result, "task_id", currTaskId, "wechat_id", myWechatId, "target_id", targetId)
 		if result != "1" {
 			Error("发送回复失败", "task_id", currTaskId, "target_id", targetId, "result", result)
@@ -217,7 +279,12 @@ func SendWechatMsg(m *SendMsg) {
 		audioHex := hex.EncodeToString(silkData)
 
 		uploadPayloadHex := BuildVoiceUploadPayload()
-		result := fridaScript.ExportsCall("triggerUploadVoice", targetId, targetPath, uploadPayloadHex, audioHex, voiceDurationMs)
+		result, err := safeExportsCall(callCtx, "triggerUploadVoice", targetId, targetPath, uploadPayloadHex, audioHex, voiceDurationMs)
+		if err != nil {
+			Error("上传语音中止", "target_id", targetId, "err", err)
+			sendErr = err
+			return
+		}
 		Info("📩 上传语音任务执行结果", "result", result, "target_id", targetId, "path", targetPath, "silk_len", len(silkData), "duration_ms", voiceDurationMs)
 		if result != "0" {
 			Error("上传语音失败", "target_id", targetId, "result", result)
@@ -237,7 +304,12 @@ func SendWechatMsg(m *SendMsg) {
 			return
 		}
 		payloadHex := BuildSendPayload(currTaskId, "voice")
-		result := fridaScript.ExportsCall("triggerSendVoiceMessage", currTaskId, myWechatId, targetId, protoHex, payloadHex)
+		result, err := safeExportsCall(callCtx, "triggerSendVoiceMessage", currTaskId, myWechatId, targetId, protoHex, payloadHex)
+		if err != nil {
+			Error("发送语音中止", "task_id", currTaskId, "err", err)
+			sendErr = err
+			return
+		}
 		Info("📩 发送语音任务执行结果", "result", result, "task_id", currTaskId, "wechat_id", myWechatId, "target_id", targetId, "unknown13", m.Unknown13)
 		if result != "1" {
 			Error("发送语音失败", "task_id", currTaskId, "target_id", targetId, "result", result)
@@ -268,7 +340,12 @@ func SendWechatMsg(m *SendMsg) {
 		for i, chunkHex := range chunks {
 			chunkTaskId := atomic.AddInt64(&taskId, 1)
 			payloadHex := BuildSendPayload(chunkTaskId, "appattach")
-			result := fridaScript.ExportsCall("triggerUploadAppAttach", chunkTaskId, myWechatId, targetId, chunkHex, payloadHex)
+			result, err := safeExportsCall(callCtx, "triggerUploadAppAttach", chunkTaskId, myWechatId, targetId, chunkHex, payloadHex)
+			if err != nil {
+				Error("uploadappattach分片中止", "chunk", i, "err", err)
+				sendErr = err
+				return
+			}
 			if result != "1" {
 				Error("uploadappattach分片发送失败", "chunk", i, "result", result)
 				sendErr = errors.New("upload app attach chunk failed")
@@ -310,7 +387,12 @@ func SendWechatMsg(m *SendMsg) {
 			return
 		}
 		payloadHex := BuildSendPayload(currTaskId, "file")
-		result := fridaScript.ExportsCall("triggerSendFileMessage", currTaskId, myWechatId, targetId, protoHex, payloadHex)
+		result, err := safeExportsCall(callCtx, "triggerSendFileMessage", currTaskId, myWechatId, targetId, protoHex, payloadHex)
+		if err != nil {
+			Error("发送文件中止", "task_id", currTaskId, "err", err)
+			sendErr = err
+			return
+		}
 		Info("📩 发送文件消息(simple)执行结果", "result", result, "task_id", currTaskId, "target_id", targetId)
 		if result != "1" {
 			Error("发送文件失败(simple)", "task_id", currTaskId, "target_id", targetId, "result", result)
@@ -323,6 +405,9 @@ func SendWechatMsg(m *SendMsg) {
 	case <-ctx.Done():
 		Error("任务执行超时！", "taskId", currTaskId)
 		sendErr = errors.New("send timeout")
+	case <-wechatDead:
+		Error("微信 session 已断开, 任务中止", "taskId", currTaskId)
+		sendErr = errors.New("wechat crashed")
 	case resp := <-buf2RespChan:
 		if resp.Err != nil {
 			Error("收到buf2resp失败信号", "taskId", currTaskId, "msg_type", resp.MsgType, "err", resp.Err)
