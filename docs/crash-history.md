@@ -1,7 +1,7 @@
 # 微信 Bot 崩溃档案与排查手册
 
 > 排查任何崩溃/发送异常前**先读本文**。记录历次崩溃的指纹、根因分析、已上线的修复和遗留问题。
-> 最后更新：2026-09-02
+> 最后更新：2026-09-07
 
 ## 速查：排查动作清单
 
@@ -93,6 +93,16 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 **修复**（commit `c0ee628`）：成功路径也复原 `originalInsertMsgPtr`，不再写 0（原始指针是 sendFunc 构造的合法消息，复原=全程原生状态）。原始指针不可用时仍回退写 0。
 **配套**（wxgate 仓库 commit `f1d0017`）：start.sh 的 onebot.log 从 `>` 截断改为 `>>` 追加 + 启动分隔行。
 
+### 2026-09-07 15:36 / 16:07 —— A 类（视频 duration=0 必崩，当日已修）
+
+**现象**：发视频必崩（两个不同视频同指纹，均为 A 类：栈顶 0x21e40 + 中间帧 0x3a5b\*\*\*），文字/图片完全正常。时序高度一致：`发送视频消息成功` → `autoBufferWrite 完成` → **~3 秒后 SIGSEGV**；崩溃跑里视频任务从未走到 buf2resp（健康跑 1 秒内就有）。
+
+**根因**：launchd/看门狗拉起的 onebot 进程 PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，找不到 `/opt/homebrew/bin/ffprobe` → `获取视频时长失败`（worker.go GetVideoDuration）→ **duration=0** → `BuildVideoMsgProto` 的 playlength 字段被 proto3 直接省略 → 微信协议层发送成功，但随后自身消息处理/任务回收路径踩 NULL（A 类机制）。A/B 证据：09-02~09-06 每天 07:53 定时视频（duration>0，当时 start.sh 手动调用继承交互 shell 完整 PATH）零崩溃；当天 11:2x 手动调 start.sh 同样 duration=10；15:36 起看门狗拉起后 duration=0 两次全崩；16:33 修复后 duration=10 发送成功且微信存活。
+
+**修复**：wxgate `start.sh` 启动 onebot 前 `export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"`（当日 16:29 部署 mac-m1 生效，16:33 验证通过）。
+
+**验证时的坑**：同一视频重复发送会撞 C 类秒传（aesKey 空 → abort → HTTP `send timeout`），看起来像"还是失败"。绕过：`ffmpeg -c:v libx264` 重编码改变流哈希强制首传。追加尾巴没用——cdnKey 只对视频流内容敏感。
+
 ## 已上线修复汇总
 
 | commit | 仓库 | 内容 |
@@ -109,6 +119,8 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 2. **Go 侧无全局发送锁**：并发 HTTP 发送可能交错全局变量（`originalInsertMsgPtr`/`taskIdGlobal`/`sendMsgType`）。`SendWorker` 虽是单 goroutine，但图片/视频的上传是异步的（`pendingResultMap` 按 targetId 寄存），上传在途时下一条发送仍可注入。同一 target 并发媒体上传还会在 `pendingResultMap` 互相覆盖。
 3. **IDA 深挖未做**：`0x3a5b***` / `0x1d8e***` 里被 erase 的到底是哪个 map、为什么节点是脏的。远端曾 lipo 出 `/tmp/wechat_arm64.dylib`（可能已被清理）。方法论：lipo -thin arm64 → objdump 反汇编 → 对照 wechat_version/*.json 已知地址。
 4. **B 类（cdn worker 下载路径）**未修未复发，观察中。
+5. **cdnVideoKeyCache 仅内存态**（2026-09-07 再次踩中）：onebot 进程重启后缓存丢失，同一视频（已在 CDN）首次发送必撞 C 类秒传 abort，HTTP 层表现为 `send timeout`（15:42/15:45/16:29/16:32 四次）。修法方向：缓存持久化到磁盘、或秒传响应降级处理。
+6. **duration 探测失败仍继续发送**（2026-09-07 根因的放大器）：worker.go 里 `GetVideoDuration` 失败只 ERROR 一条继续 duration=0 发送 = 主动触发 A 类崩溃。应改为直接 fail 该任务。
 
 ## 运维要点（血泪教训）
 
