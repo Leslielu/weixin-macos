@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -302,6 +303,11 @@ func loadJs() {
 							if videoId, ok := pMap["video_id"]; ok {
 								m.VideoId = videoId.(string)
 							}
+							// 持久化视频钥匙: onebot 重启后同一视频秒传去重时回填用
+							// (2026-09-07: JS 内存缓存跨进程丢失, 4 次 send timeout)
+							if m.CdnKey != "" && m.AesKey != "" {
+								go SaveCdnVideoKey(m.CdnKey, CdnVideoKeys{AesKey: m.AesKey, Md5Key: m.Md5Key, VideoId: m.VideoId})
+							}
 							if ch, ok := pendingResultMap.LoadAndDelete(targetId); ok {
 								m.ResultChan = ch.(chan error)
 							}
@@ -362,4 +368,19 @@ func loadJs() {
 
 	fridaScript = script
 	Info("✅ Frida 已就绪，微信控制通道已打通")
+
+	// 回灌持久化的视频钥匙进 JS 缓存: 跨进程秒传去重的 aesKey 回填
+	// (2026-09-07 前缓存只在 JS 内存里, onebot 一重启就丢)
+	if keys := LoadCdnVideoKeys(); len(keys) > 0 {
+		if j, err := json.Marshal(keys); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			result := fridaScript.ExportsCallWithContext(ctx, "hydrateCdnVideoCache", string(j))
+			cancel()
+			if result == frida.ErrContextCancelled {
+				Warn("回灌视频钥匙缓存失败(session 已断开)")
+			} else {
+				Info("已回灌视频钥匙缓存", "entries", len(keys), "resp", result)
+			}
+		}
+	}
 }

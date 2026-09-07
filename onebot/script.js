@@ -1030,6 +1030,22 @@ function attachUploadMedia() {
 // CDN 秒传去重的响应不带 aesKey, 按 cdnKey 命中回填 (见 patchCdnOnComplete)
 var cdnVideoKeyCache = {};
 
+// Go 启动时回灌持久化(./cdn_video_keys.json)的钥匙, 解决缓存跨进程丢失:
+// onebot 重启后同一视频首次上传必撞秒传去重(响应无 aesKey), 内存缓存为空
+// 就只能 abort → send timeout (2026-09-07 四次实锤)
+function hydrateCdnVideoCache(jsonStr) {
+    var persisted = JSON.parse(jsonStr);
+    var n = 0;
+    for (var k in persisted) {
+        if (persisted.hasOwnProperty(k) && persisted[k] && persisted[k].aesKey && !cdnVideoKeyCache[k]) {
+            cdnVideoKeyCache[k] = persisted[k];
+            n++;
+        }
+    }
+    console.log("[+] hydrateCdnVideoCache: 回灌 " + n + " 条视频钥匙");
+    return n;
+}
+
 function patchCdnOnComplete() {
     Interceptor.attach(cndOnCompleteAddr, {
         onEnter: function (args) {
@@ -1214,6 +1230,7 @@ function triggerSendVoiceMessage(taskId, sender, receiver, protoHex, payloadHex)
 // -------------------------发送语音消息分区-------------------------
 
 rpc.exports = {
+    hydrateCdnVideoCache: hydrateCdnVideoCache,
     triggerSendImgMessage: triggerSendImgMessage,
     triggerUploadImg: triggerUploadImg,
     triggerSendTextMessage: triggerSendTextMessage,

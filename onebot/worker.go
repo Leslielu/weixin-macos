@@ -165,13 +165,16 @@ func SendWechatMsg(m *SendMsg) {
 		}
 
 		// 获取视频时长和文件大小
+		// duration=0 会让 playlength 字段被 proto3 省略, 微信发送后 ~3s 必崩(A类,
+		// 2026-09-07 两次实锤), 探测失败必须中止发送而不是继续
 		info := &VideoInfo{}
 		duration, err := GetVideoDuration(targetPath)
 		if err != nil {
-			Error("获取视频时长失败", "err", err)
-		} else {
-			info.Duration = duration
+			Error("获取视频时长失败, 中止视频发送", "err", err)
+			sendErr = fmt.Errorf("video duration unknown (ffprobe missing?), abort send: %w", err)
+			return
 		}
+		info.Duration = duration
 		if fi, err := os.Stat(targetPath); err == nil {
 			info.VideoSize = int32(fi.Size())
 		}
