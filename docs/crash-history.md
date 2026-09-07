@@ -112,6 +112,8 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 | `15294ed` | weixin-macos | 视频 CDN 秒传 aesKey 空时按 cdnKey 回填缓存钥匙 |
 | `c0ee628` | weixin-macos | 成功路径也复原原始指针，不再写 NULL |
 | `f1d0017` | wxgate | onebot.log 追加模式，保留崩溃现场 |
+| `d852c00` | wxgate | start.sh export homebrew PATH（duration=0 崩溃根因，2026-09-07 部署验证） |
+| `e92caf0` | weixin-macos | 视频双保险：duration 探测失败 fail-fast + CDN 钥匙持久化 `cdn_video_keys.json` 启动回灌 |
 
 ## 遗留问题（按优先级）
 
@@ -119,8 +121,8 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 2. **Go 侧无全局发送锁**：并发 HTTP 发送可能交错全局变量（`originalInsertMsgPtr`/`taskIdGlobal`/`sendMsgType`）。`SendWorker` 虽是单 goroutine，但图片/视频的上传是异步的（`pendingResultMap` 按 targetId 寄存），上传在途时下一条发送仍可注入。同一 target 并发媒体上传还会在 `pendingResultMap` 互相覆盖。
 3. **IDA 深挖未做**：`0x3a5b***` / `0x1d8e***` 里被 erase 的到底是哪个 map、为什么节点是脏的。远端曾 lipo 出 `/tmp/wechat_arm64.dylib`（可能已被清理）。方法论：lipo -thin arm64 → objdump 反汇编 → 对照 wechat_version/*.json 已知地址。
 4. **B 类（cdn worker 下载路径）**未修未复发，观察中。
-5. **cdnVideoKeyCache 仅内存态**（2026-09-07 再次踩中）：onebot 进程重启后缓存丢失，同一视频（已在 CDN）首次发送必撞 C 类秒传 abort，HTTP 层表现为 `send timeout`（15:42/15:45/16:29/16:32 四次）。修法方向：缓存持久化到磁盘、或秒传响应降级处理。
-6. **duration 探测失败仍继续发送**（2026-09-07 根因的放大器）：worker.go 里 `GetVideoDuration` 失败只 ERROR 一条继续 duration=0 发送 = 主动触发 A 类崩溃。应改为直接 fail 该任务。
+5. ~~**cdnVideoKeyCache 仅内存态**~~ **已修**（`e92caf0`，2026-09-07）：钥匙落盘 `onebot/cdn_video_keys.json`，启动经 rpc `hydrateCdnVideoCache` 回灌。实测重启后重发同一视频秒传命中回灌缓存，发送成功。注意：CDN 秒传引用似乎会过期（同文件 2.5h 后重传走了全新上传），两种路径都已覆盖。
+6. ~~**duration 探测失败仍继续发送**~~ **已修**（`e92caf0`，2026-09-07）：`GetVideoDuration` 失败直接 fail 该任务，不再以 duration=0 发送引爆 A 类。
 
 ## 运维要点（血泪教训）
 
