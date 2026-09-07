@@ -1,5 +1,75 @@
 # 微信全自动重启登录方案
 
+## 2026-09-07 TCC 弹窗队列饿死微信启动（第七层：部署即触发的授权回归）
+
+**事故**：11:12 微信 SIGSEGV 崩（已知家族）→ 看门狗 11:34/11:50 两次拉起 → 微信永远停在前窗口期，
+三次回车全被前台门禁跳过（前台=Chrome/Finder）。排查确认**不是锁屏**（IOConsoleLocked=False）。
+
+**根因链**（截图实锤）：
+1. 当晨 fail-fast 修复**重编了 wxgate 二进制**（新 cdhash）→ TCC 视其为新应用，旧授权作废
+2. wxgate 启动时访问硬编码路径 `~/Documents/AIGC/data/calendar` → 弹"wxgate 想访问文稿文件夹"授权窗
+3. **TCC 弹窗全局排队：该窗无人点击期间，其他进程的受保护 open() 全部阻塞**
+   → 微信主线程死在 `wechat.dylib+0x26a74 → open()`（0% CPU、AppleEvent 超时 -1712、窗口永不创建）
+4. 看门狗只有"进程死活/PID变化/端口"三检，**没有"活着但从未出窗口"的挂死检测** → 永远不重试
+
+**定位手法**（可复用）：
+- `sample <pid> 3 -mayDie`：主线程 100% 停 `__open` = 阻塞型 open（TCC 弹窗或无写者 FIFO 二选一）
+- sshd 上下文 `ls ~/Documents` 得 EINTR = sshd 无 FDA（旁证 TCC 在管这个目录）
+- **远程看屏方案**：⌘⇧3 截图走"一次性 LaunchAgent + clicclick wrapper"（GUI 会话身份才有辅助功能授权；
+  ssh 直跑 clicclick 会报 Accessibility privileges not enabled）；
+  先 `defaults write com.apple.screencapture location ~/Prog/wxgate/shots` 把落盘改到 TCC 保护区外，
+  否则 sshd 读不回 Desktop 上的截图
+
+**修复**：LaunchAgent 合成点击 `c:1019,350` 点"允许"（1920x1080@1x 坐标=像素）→ 弹窗消散 →
+杀掉卡死实例重拉 → 秒过启动 → activate+回车登录 → start.sh restart 链重启 → filehelper 200。
+
+**遗留/待办**：
+- [x] ~~wxgate 依赖 `~/Documents/AIGC/data/calendar`~~（2026-09-07 下午已修：/zhtime 命令整体移除，
+      二进制内已无 AIGC 路径，wxgate 从此零 Documents 访问）
+- [x] ~~固定自签名证书签名~~（2026-09-07 下午已做：证书 CN=wxgate-signer 存 `~/.wxsign/`（10 年，
+      p12 已导入本地钥匙串并授权 codesign）。onebot=`com.leslie.onebot`，wxgate=`com.leslie.wxgate`。
+      **以后每次编译部署后必须重签**：`codesign --force --sign "wxgate-signer" --identifier
+      "com.leslie.wxgate" --timestamp=none <binary>`，TCC 授权按证书识别，重编不再丢）
+- [x] ~~onebot detach 后僵尸问题~~（2026-09-07 下午已修：markWechatDead 关 chan 后 2s 主动
+      Clean+exit(1)，恢复责任交看门狗。崩溃演练实测：14:03:14 杀微信 → 14:03:16 onebot 自退 →
+      14:03:39 拉起+回车成功 → 14:04:06 链恢复 → 发消息 200）
+- [ ] 看门狗加挂死检测：微信活着但 N 分钟从未成为前台/无窗口 → 截图存档 → kill 重拉
+      （今天场景已由 ①③ 大幅缓解，但理论上仍有其他弹窗形态）
+
+### 附：给 ludaohe 发图/发文本的方法（告警与验证通道）
+
+**首选现成工具** `~/Prog/wxgate/src/utils/wechat_sender.py`（mac-m1，wxgate 项目内）：
+
+- 走 wxgate 自己的 API `http://127.0.0.1:36060/api/send_private_msg`（不是 onebot 58080）
+- `send_message_sync(text)` / `send_photo_sync(file_path)` / `send_video_sync`，另有群聊 `send_group_*` 变体；
+  user_id 默认就是 ludaohe，无需换算 wxid
+- **图片直接传本地路径**，>500KB 自动 JPEG 压缩；自带 3 次重试 + 30s 超时
+- shell 里用：`cd ~/Prog/wxgate && python3 -c "from src.utils.wechat_sender import send_photo_sync; send_photo_sync('/tmp/x.png')"`
+  （依赖 requests/httpx，注意用项目 venv 的 python）
+
+**底层直调 onebot 58080（兜底，绕过 wxgate）**：
+
+```bash
+# 发文本（user_id 直接用 ludaohe，无需换算 wxid）
+curl -X POST -H "Content-Type:application/json" \
+  -d '{"user_id":"ludaohe","message":[{"type":"text","data":{"text":"xxx"}}]}' \
+  http://127.0.0.1:58080/send_private_msg
+
+# 发图片：file 字段只接受 base64（base64:// 前缀或 data URI），不接受本地路径！
+# 传路径会报 base64 decode failed。本地文件用 python 一行转：
+python3 -c "
+import base64, json, urllib.request
+with open('/path/to/img.png','rb') as f: b64 = base64.b64encode(f.read()).decode()
+body = json.dumps({'user_id':'ludaohe','message':[{'type':'image','data':{'file':'base64://'+b64}}]}).encode()
+req = urllib.request.Request('http://127.0.0.1:58080/send_private_msg', data=body, headers={'Content-Type':'application/json'})
+print(urllib.request.urlopen(req, timeout=60).read().decode())
+"
+```
+
+注意：链路刚重启/登录后的**头几秒**发文本可能报"尚未初始化"（triggerX0 需等微信后台同步触发一次
+StartTask hook 捕获，通常 10s 内）；失败等几秒重试即可。图片走 CdnManager 服务定位器冷启动解析，
+不受此限。
+
 ## 2026-09-07 真实微信崩溃实战（第六层 fail-fast 改造）
 
 **事故**：用户 06:31:48 发文本给 ludaohe，06:31:51 微信进程真崩（SIGSEGV），task 跨崩溃边界完成信号永远丢。worker 15s ctx 超时报 ERROR；看门狗 06:32:19 链重启 SIGTERM 杀掉 onebot。用户看到 HTTP 504 + 进程重启 + 消息丢失。

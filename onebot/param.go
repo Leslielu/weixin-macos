@@ -4,8 +4,10 @@ import (
 	"encoding/xml"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/frida/frida-go/frida"
 )
@@ -41,9 +43,22 @@ var (
 	wechatDeadOnce sync.Once
 )
 
-// markWechatDead 关闭 wechatDead, 幂等, session.On("detached") 多次触发也只关一次
+// markWechatDead 关闭 wechatDead, 幂等, session.On("detached") 多次触发也只关一次。
+// 关闭后延迟 2s 主动退出: gadget 模式 attach 的是已死进程, onebot 自己无法重连恢复,
+// 留着只会变成"58080 在听但永远报错"的僵尸(看门狗三项检查全过, 永不自愈)。
+// 退出后由看门狗兜底: 微信死了→拉起微信+链重启; 仅闪断→58080 未监听→restart_chain。
 func markWechatDead() {
-	wechatDeadOnce.Do(func() { close(wechatDead) })
+	wechatDeadOnce.Do(func() {
+		close(wechatDead)
+		go func() {
+			time.Sleep(2 * time.Second) // 等 in-flight 任务把错误响应写回 HTTP 客户端
+			Warn("微信 session 已断开, onebot 主动退出, 恢复交由看门狗")
+			fridaScript.Clean()
+			session.Clean()
+			device.Clean()
+			os.Exit(1)
+		}()
+	})
 }
 
 // NextVersion 获取当前taskId作为版本号
