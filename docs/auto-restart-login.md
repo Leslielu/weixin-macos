@@ -36,6 +36,17 @@
 - [ ] 看门狗加挂死检测：微信活着但 N 分钟从未成为前台/无窗口 → 截图存档 → kill 重拉
       （今天场景已由 ①③ 大幅缓解，但理论上仍有其他弹窗形态）
 
+### 附：看门狗恢复告警已上线（2026-09-07 14:15 演练#4 实测通过）
+
+看门狗不再是哑巴：微信死亡自愈后自动给 ludaohe 发**恢复告警文本 + 屏幕截图**；外部重启/58080
+未监听分支发文本告警。两个关键坑（已修）：
+- macOS 截屏默认 show-thumbnail 预览气泡 → 文件延迟 >5s 落盘，`ls -t` 拿到旧图。
+  已 `defaults write com.apple.screencapture show-thumbnail -bool false` + killall SystemUIServer
+- onebot CdnManager 有登录稳定门禁（脚本跑满 60s 或收到同步消息），链重启后 ~30s 内发图必失败。
+  时序改为：文本立即发 → sleep 50 过门禁 → 截屏补发（失败重试一次，留档 shots/）
+死亡瞬间不发（链路已断发不出，只记日志+截图留档）；链路彻底起不来的场景告警无法送达，
+如需死亡即时告警需 Telegram 旁路（wxgate python 环境依赖较重，未做）。
+
 ### 附：给 ludaohe 发图/发文本的方法（告警与验证通道）
 
 **首选现成工具** `~/Prog/wxgate/src/utils/wechat_sender.py`（mac-m1，wxgate 项目内）：
