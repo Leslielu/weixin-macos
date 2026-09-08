@@ -49,6 +49,25 @@ frida-core-devkit 17.8.1 存放在项目目录 `frida-devkit/`（已加入 .giti
 原始压缩包在 `~/frida-dev/frida-core-devkit-17.8.1-macos-arm64.tar.xz`。
 编译产物直接 rsync 到远端 Mac 即可，远端不需要编译环境。
 
+**编译后必须重签名**（mac-m1 上 onebot 以 `com.leslie.onebot` 固定证书签名运行）：
+每次 `go build` 产出全新未签名二进制，须用固定证书重签——证书身份不变，macOS TCC 授权才不会
+失效重弹窗。材料在本机 `~/.wxsign/`（`wxsign.p12` + `wxsign.p12.pass`，CN=wxgate-signer，
+2036 到期，wxgate/onebot 共用）。临时钥匙串法全程免 GUI 弹窗，用完即删：
+
+```bash
+cd ~/Prog/weixin-macos/onebot && \
+PASS=$(cat ~/.wxsign/wxsign.p12.pass) && \
+security create-keychain -p "$PASS" onebot-signer-tmp && \
+security import ~/.wxsign/wxsign.p12 -k onebot-signer-tmp -P "$PASS" && \
+security set-key-partition-list -S apple-tool:,apple: -k "$PASS" onebot-signer-tmp >/dev/null && \
+codesign --force --sign wxgate-signer --identifier com.leslie.onebot onebot && \
+security delete-keychain onebot-signer-tmp && \
+codesign --verify --strict onebot && echo SIGN_OK
+```
+
+部署：签名后 rsync/scp 二进制到 mac-m1 `~/Prog/weixin-macos/onebot/onebot`，再重启链路
+（mac-m1 `~/Prog/wxgate/start.sh restart`，先停 onebot→wxgate 再依序拉起）。
+
 ### Run OneBot
 ```bash
 # Local mode (SIP disabled)
