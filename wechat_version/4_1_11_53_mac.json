@@ -7,6 +7,8 @@
 	"autoBufferWriteFunc": "0x3E7FA8C",
 
 	"uploadImageAddr": "0x529bd7c",
+	"cdnGetServiceAddr": "0x50a15d0",
+	"cdnManagerGetterAddr": "0x5259290",
 	"cndOnCompleteAddr": "0x3E1575C",
 	"uploadGetCallbackWrapperAddr": "0x525ab20",
 	"uploadGetCallbackWrapperFuncAddr": "0x3E14FF8",
