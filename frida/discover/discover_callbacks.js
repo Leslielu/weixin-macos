@@ -58,6 +58,8 @@ function harvest(structPtr, label) {
       if (!(rel in KNOWN_SET) && !(rel in candidates)) {
         candidates[rel] = {via: label + "+0x" + off.toString(16)};
         n++;
+        // 立即武装, 不等 5 秒轮询 (回调可能在 harvest 后毫秒级触发)
+        armOne(rel);
       }
     }
   }
@@ -128,25 +130,26 @@ Interceptor.attach(base.add(KNOWN.uploadOnCompleteFuncAddr), {
 // 3) download 回调函数本体在 JSON 里没有直接键, 但 download 完成数据到达的
 //    "函数" 就是缺失键本身。无法预埋, 靠候选 hook 指纹:
 var armed = {};
+function armOne(rel) {
+  if (armed[rel]) return;
+  armed[rel] = true;
+  try {
+    Interceptor.attach(base.add(rel), {
+      onEnter: function (args) {
+        var tag = "base+0x" + rel.toString(16) + " (via " + candidates[rel].via + ")";
+        if (fingerprint(this.context, tag)) {
+          console.log("    => 该候选即 download 回调站点之一!");
+        }
+      }
+    });
+  } catch (e) {}
+}
+
 function armCandidates() {
-  var rels = Object.keys(candidates).map(Number).sort(function(a,b){return a-b;});
-  for (var rel of rels) {
-    if (armed[rel]) continue;
-    armed[rel] = true;
-    (function (rel) {
-      try {
-        Interceptor.attach(base.add(rel), {
-          onEnter: function (args) {
-            var tag = "base+0x" + rel.toString(16) + " (via " + candidates[rel].via + ")";
-            if (fingerprint(this.context, tag)) {
-              console.log("    => 该候选即 download 回调站点之一!");
-            }
-          }
-        });
-      } catch (e) {}
-    })(rel);
-  }
-  console.log("[*] 候选 hook 布设: " + Object.keys(armed).length + " 个");
+  var n0 = Object.keys(armed).length;
+  for (var rel of Object.keys(candidates)) armOne(Number(rel));
+  var n1 = Object.keys(armed).length;
+  if (n1 !== n0) console.log("[*] 候选 hook 布设: " + n1 + " 个");
 }
 
 // 每 5 秒把新 harvest 到的候选武装起来
