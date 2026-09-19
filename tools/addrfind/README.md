@@ -6,13 +6,21 @@
 ## 用法
 
 ```bash
-python3 tools/addrfind/addrfind.py 旧版dylib 旧版.json 新版dylib -o 新候选.json
-# 例：
+python3 tools/addrfind/addrfind.py 旧版dylib 旧版.json 新版dylib \
+  [-o 新候选.json] [--hint 更新版dylib 更新版partial.json]
+# 例（直接跳）：
 python3 tools/addrfind/addrfind.py \
   version_bin/wechat-4.1.10.53-arm64.dylib \
   wechat_version/4_1_10_53_mac.json \
   version_bin/wechat-4.1.11.53-arm64.dylib \
   -o /tmp/candidate.json
+# 例（逐级跳 + 反向链锚定：有更新版本的 partial 时强烈建议带上）：
+python3 tools/addrfind/addrfind.py \
+  version_bin/wechat-4.1.11.53-arm64.dylib wechat_version/4_1_11_53_mac.json \
+  version_bin/wechat-4.1.12.53-arm64.dylib \
+  --hint version_bin/wechat-4.1.13.269628-arm64.dylib \
+         wechat_version/4_1_13_269628_mac.partial.json \
+  -o wechat_version/4_1_12_53_mac.partial.json
 ```
 
 dylib 传 fat 或 arm64 单切片均可（fat 自动取 arm64）。切片提取：
@@ -83,12 +91,27 @@ lipo -thin arm64 /Applications/WeChat.app/Contents/Resources/wechat.dylib \
 6. **BL 站点相对位置**：同一调用关系，锚点与 BL 指令的相对偏移跨版本常不变
    （BL→uploadImageAddr 的站点在锚点前 0x4C，新旧一致）。
 
+## v2 第二阶段解析器（签名失配时自动启用）
+
+pass1（锚点签名+delta）之后，以下解析器迭代到不动点（4.1.11→4.1.12 实战固化）：
+
+| 解析器 | 套路 | 实战案例 |
+|---|---|---|
+| `alt-base` | 落点失败时以旧地址空间邻近（≤0x500000）的任意已解出键换基重试 | cdnManagerGetterAddr、wrapper |
+| `bl-backtrace` | 扫 `BL partner` 调用点，回溯前置 BL 目标多数投票（配置 BL_PAIRS） | cdnGetServiceAddr 25 票共识 |
+| `caller-xref` | 旧版 X 的 BL 调用站点签名匹配到新版，解码其 BL 目标；"新旧调用者数量一致"去歧（配置 CALLER_XREF） | sendFuncAddr（3 调用者定案） |
+| `rigid-cluster` | 簇内相对偏移逐版本不变，任一成员解出即推全部（配置 RIGID_CLUSTERS） | download 三成员 |
+| `reverse-hint` | `--hint` 给更新版 bin+json，用更新版签名反搜当前版 | uploadImageAddr @4.1.12 |
+
+仍 FAIL 的（如 BLR 间接调用的回调站点：uploadOnCompleteAddr、download 三成员
+@4.1.12）静态无 xref 可追，需运行时发现或 IDA。
+
 ## 输出解读
 
-- `anchor-search`：全局签名搜索命中，附候选数与置信度（1 个候选且 ≥30/32 为 high）
-- `delta`：按组内固定偏移推算且落点复核通过
-- `delta+local-search`：delta 漂移，局部搜索修正（会打印修正量）
-- `FAIL`：需 IDA 人工处理；找到其余键后也可回头用新键当锚点缩小范围
+- `anchor-search` / `delta` / `delta+local`：pass1（同 v1）
+- `alt-base+local` / `bl-backtrace` / `caller-xref` / `rigid-cluster` / `reverse-hint`：
+  pass2 解析器命中，note 里有所用基准/票数/复核分
+- `FAIL`：需 IDA 或运行时人工处理
 
 ## 注意
 

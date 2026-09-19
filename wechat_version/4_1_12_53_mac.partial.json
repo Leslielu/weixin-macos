@@ -1,16 +1,16 @@
 {
+  "sendFuncAddr": "0x53e4ecc",
   "req2bufEnterAddr": "0x413e9b4",
   "req2bufExitAddr": "0x413f87c",
-  "blrX8Addr": "0x413ea34",
   "buf2RespAddr": "0x4163f4c",
+  "blrX8Addr": "0x413ea34",
   "autoBufferWriteFunc": "0x4165368",
-  "sendFuncAddr": "0x53e4ecc",
   "uploadImageAddr": "0x5570098",
   "cdnGetServiceAddr": "0x53a7ac8",
   "cdnManagerGetterAddr": "0x551c1bc",
+  "cndOnCompleteAddr": "0x40fad60",
   "uploadGetCallbackWrapperAddr": "0x551f644",
   "uploadGetCallbackWrapperFuncAddr": "0x40fa5fc",
-  "cndOnCompleteAddr": "0x40fad60",
   "uploadOnCompleteFuncAddr": "0x40fb780",
   "startDownloadMedia": "0x5570d48"
 }
