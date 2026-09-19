@@ -1,0 +1,7 @@
+{
+  "uploadImageAddr": "0x575bf3c",
+  "cndOnCompleteAddr": "0x429e7dc",
+  "uploadGetCallbackWrapperFuncAddr": "0x429e078",
+  "uploadOnCompleteFuncAddr": "0x429f1fc",
+  "startDownloadMedia": "0x575cbec"
+}
