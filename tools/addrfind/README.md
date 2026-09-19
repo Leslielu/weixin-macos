@@ -57,6 +57,31 @@ lipo -thin arm64 /Applications/WeChat.app/Contents/Resources/wechat.dylib \
   uploadGetCallbackWrapperAddr=0x57098c8 (16/16)。
   其余需要 IDA 手找锚点（字符串 xref：`MMStartTask`、`newsendmsg`、
   `N4mars3cdn10CdnManagerE`，套路见 `docs/media-coldstart.md`）。
+- **逐级跳 4.1.11.53 → 4.1.12.53 (269365)：14/18**（见
+  `wechat_version/4_1_12_53_mac.partial.json`）。req2buf 全组、send、upload、
+  uploadcb、startDownloadMedia 全部确认；缺的 4 个（uploadOnCompleteAddr +
+  download 三成员）是 BLR 间接调用的回调站点，代码变化大且无 BL/xref 可追，
+  需运行时发现或 IDA。4.1.12→4.1.13 正向链与 4.1.11→4.1.13 直接跳结果
+  **三向交叉一致**（uploadcb 簇 + startDownloadMedia），链条方法验证成立。
+
+## 签名失配时的手工补强套路（按效力排序）
+
+均在 4.1.11→4.1.12 实战中验证，纯 Python 可实现（暂未固化进工具）：
+
+1. **反向链锚定**：新版本 A→C 直接跳找到的锚点，可用 C 的签名反搜中间版 B
+   （uploadImageAddr @4.1.12 就是这样拿到的，31/32 唯一候选）。
+2. **BL 回溯**：已知函数 Y（如 cdnManagerGetterAddr），扫新版 `BL Y` 调用点，
+   回溯每条调用点前面的 BL 目标 → 得到它的配对函数（25 个调用点一致指向
+   同一目标 → cdnGetServiceAddr 实锤）。
+3. **调用者签名反查 + 数量交叉**：找不到 X 本身时，找"调用 X 的站点"的签名；
+   多个候选时用"X 在旧版有 N 个 BL 调用者"过滤（sendFuncAddr 两个候选中
+   3 调用者的那个人工实锤）。
+4. **换基推算**：组内 delta 失效时，改用同区域其他已确认键做基准
+   （cdnManagerGetterAddr 用 wrapper 换基后命中）。
+5. **刚性簇联合搜索**：簇内相对偏移跨版本完全不变时（download 三成员），
+   找到任意一个即可推出全部；可用多签名联合打分去伪。
+6. **BL 站点相对位置**：同一调用关系，锚点与 BL 指令的相对偏移跨版本常不变
+   （BL→uploadImageAddr 的站点在锚点前 0x4C，新旧一致）。
 
 ## 输出解读
 
