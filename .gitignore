@@ -27,3 +27,4 @@ frida-devkit/
 frida-gadget-*.dylib
 # 各版本 wechat.dylib arm64 切片（addrfind 工具用，勿提交）
 version_bin/
+__pycache__/
