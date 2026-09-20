@@ -9,7 +9,7 @@
   "cdnGetServiceAddr": "0x53a7ac8",
   "cdnManagerGetterAddr": "0x551c1bc",
   "cndOnCompleteAddr": "0x40fad60",
-  "uploadGetCallbackWrapperAddr": "0x551f644",
+  "uploadGetCallbackWrapperAddr": "0x551da24",
   "uploadGetCallbackWrapperFuncAddr": "0x40fa5fc",
   "uploadOnCompleteFuncAddr": "0x40fb780",
   "startDownloadMedia": "0x5570d48",

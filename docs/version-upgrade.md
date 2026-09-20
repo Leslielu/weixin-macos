@@ -111,6 +111,26 @@ trio 无任何静态引用)——回调在运行时注册进堆对象, IDA 静�
 7. 发送链路崩溃先**两版同函数逐指令对比反汇编**确认语义是否漂移, 再怀疑地址——
    4.1.11 推出的基础地址(req2buf/sendFunc/blrX8)经实证零漂移, 别推翻方向。
 
+### 验收期媒体链路(2026-09-20 4.1.12 实战)
+
+8. **DIAG 日志必须单行聚合+限量+用完即删**。frida→Go→文件的 console.log 管道
+   ~1s/行; 回调洪泛时逐行 dump 会拖垮上传链路超过 HTTP 15s 超时 → 假象
+   "send timeout: worker 无响应", 实际 JS 链路已成功。判真伪: 查日志是否到
+   buf2resp ack + 让用户目视确认消息到达, 别只信 curl 响应。
+9. **cndOnComplete 结构逐字段 DIAG 验证, 别假设整体平移**。4.1.12: fileId/cdnKey/
+   aesKey/md5Key/targetId 均 +0x08, 但 **videoId 字段整个消失**(宽扫 0x00–0x260:
+   md5×3 拷贝+CDN IP, 没有 4.1.11 +0xf0 那种 32-hex 值)。空 videoId 传 ""
+   (proto3 省略空 bytes), 实测服务端 ack、视频可播放。JS 侧必须 `videoId || ""`
+   兜底——Go `videoId.(string)` 遇 null 键会 panic, 被 main.go recover 吞掉,
+   表现为 HTTP 超时但 onebot 不崩(日志搜 "message panic")。
+10. **媒体发送前先过 CdnManager 门禁**: onebot 重启后 ~60s(或无入站流量)内
+    uploadGlobalX0 未解析, 媒体任务直接 result=fail("登录尚未稳定, 暂缓 CdnManager
+    解析")。重启后等 >60s 再测媒体; 文本链路不经过它, 不受影响。
+11. **验收测试媒体每次新哈希**: C 类秒传对内容哈希敏感, onebot 重启后 JS 钥匙缓存
+    丢失(若 Go 落盘也没写成, 同一文件再传必 abort)。`ffmpeg -f lavfi -i testsrc=...`
+    合成 + 每次重编码改参数 = 可靠测试材料; 视频和图片一样走 SaveBase64Image,
+    API 传 `base64://...`, `-image_path` 必须传(否则上传 -20003)。
+
 ## 本地验证环境(4.1.12, 本机)
 
 ```bash
@@ -132,7 +152,12 @@ curl -X POST -H "Content-Type:application/json" \
 - **4.1.11→4.1.12 (2026-09-20)**: 14 键 addrfind 直出; 4 难键字符串锚定+结构匹配;
   全 18 键产出 `wechat_version/4_1_12_53_mac.json`。寄存器漂移 x22→x21、
   任务结构 +0x18、快照恢复修复。详见 docs/crash-history.md 4.1.12 节。
-  **验收期修复**: D 类(initAddresses 同步调用致 fakeVtable=0)+E 类(基址竞态挂堆)已修。
+  **验收期修复**: D 类(initAddresses 同步调用致 fakeVtable=0)+E 类(基址竞态挂堆)已修;
+  uploadGetCallbackWrapperAddr hook1 正确位=0x551da24(addrfind 误配 0x551f644
+  不同 consumer, bl-caller 扫描 13-14 调用点+4.1.11 对照实证, 仓库 JSON 已改);
+  cndOnComplete 结构 +0x08 但 videoId 字段消失(见铁律 9)。
+  **用户验收通过(2026-09-20)**: 收图/API发文本/收视频(不崩)/UI手动发图/收文件(不崩)/
+  API发图/API发视频 全绿。
   **收视频现状(用户决议搁置)**: hook 读数正确(std::string x20+0x178/0x180)、
   chunk 流入 Go、**不崩**; 但 4.1.12 视频是渐进式下载(不点播放只下预缓冲段),
   Go 60s 凑不齐报"文件下载超时或数据为空"(软错误非崩溃)。正解 = bot 主动模拟
