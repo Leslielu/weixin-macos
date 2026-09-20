@@ -132,6 +132,12 @@ curl -X POST -H "Content-Type:application/json" \
 - **4.1.11→4.1.12 (2026-09-20)**: 14 键 addrfind 直出; 4 难键字符串锚定+结构匹配;
   全 18 键产出 `wechat_version/4_1_12_53_mac.json`。寄存器漂移 x22→x21、
   任务结构 +0x18、快照恢复修复。详见 docs/crash-history.md 4.1.12 节。
+  **验收期修复**: D 类(initAddresses 同步调用致 fakeVtable=0)+E 类(基址竞态挂堆)已修。
+  **收视频现状(用户决议搁置)**: hook 读数正确(std::string x20+0x178/0x180)、
+  chunk 流入 Go、**不崩**; 但 4.1.12 视频是渐进式下载(不点播放只下预缓冲段),
+  Go 60s 凑不齐报"文件下载超时或数据为空"(软错误非崩溃)。正解 = bot 主动模拟
+  下载请求(worker "download" 任务→triggerDownload)而非等 UI 点击, 待 bot 需要
+  处理视频时再做。
 - **4.1.12→4.1.13**: 完整 4.1.12 JSON 解锁组内 delta, addrfind 一轮 15/18
   (含 4 难键全中); 剩 req2buf 三件套(enter/exit/blrX8)待字符串锚定
   (buf2Resp 锚 ±0x2000 线性 delta 已失败, mismatch 17-29/32)。
