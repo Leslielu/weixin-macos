@@ -156,6 +156,11 @@ curl -X POST -H "Content-Type:application/json" \
   uploadGetCallbackWrapperAddr hook1 正确位=0x551da24(addrfind 误配 0x551f644
   不同 consumer, bl-caller 扫描 13-14 调用点+4.1.11 对照实证, 仓库 JSON 已改);
   cndOnComplete 结构 +0x08 但 videoId 字段消失(见铁律 9)。
+  **staging 修复已全部合入 `onebot/script.js`**(structVer 版本开关: JSON 加
+  `"structVer": "2"`, 旧版 JSON 无此键渲染为 `<no value>` 自动走 4.1.11 原路径,
+  生产零变化; 基址模块表优先+setImmediate/快照恢复为通用修复两版共享;
+  DIAG 与 exceptions:propagate 未合入), 合入后仓库脚本+JSON 在 4.1.12 实测
+  文本/发图全链路通过(2026-09-20 13:13)。
   **用户验收通过(2026-09-20)**: 收图/API发文本/收视频(不崩)/UI手动发图/收文件(不崩)/
   API发图/API发视频 全绿。
   **收视频现状(用户决议搁置)**: hook 读数正确(std::string x20+0x178/0x180)、

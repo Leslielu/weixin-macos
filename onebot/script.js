@@ -8,12 +8,48 @@ if (!module) {
 var moduleBase = module.base;
 console.log("[+] WeChat module base: " + moduleBase);
 
-// Enumerate readable ranges within 500MB from module base to search for "req2buf"
+// 基址解析(2026-09-20 E类事故修正): 模块表优先。真身 wechat.dylib 是全进程唯一
+// >50MB 的同名模块(Frameworks/下是16KB stub), 基址确定无竞态。
+// 原 "req2buf字符串+>100MB range" 扫描存在竞态误命中: 堆里 MallocHelperZone
+// (合并range>100MB, rw-) 也有 "req2buf" 字符串拷贝, 扫描回调先到就赢 →
+// 基址定到堆上, 全部 hook 挂空, 登录后零事件(静默死亡, 无报错)。
 var searchSize = 1000 * 1024 * 1024;
 var searchEnd = moduleBase.add(searchSize);
 var _req2bufSearchAddr = null;
 var baseAddr = null;
 
+// 结构版本开关: 4.1.12 起上传完成结构 +0x08、下载任务结构 +0x18、寄存器漂移。
+// JSON 里 "structVer": "2" = 4.1.12 布局; 旧版 JSON 无此键(渲染为 <no value>),
+// 不等于 "2", 自动走 4.1.11 及以前的原路径。
+var structVer = "{{.structVer}}";
+
+function resolveBaseFromModuleTable() {
+    var wechatModules = Process.enumerateModules().filter(function(m) {
+        return m.name === "wechat.dylib";
+    });
+    wechatModules.sort(function(a, b) { return b.size - a.size; });
+    if (wechatModules.length > 0 && wechatModules[0].size > 50 * 1024 * 1024) {
+        return wechatModules[0];
+    }
+    return null;
+}
+
+// 必须 setImmediate 派发: initAddresses 内部依赖脚本中部 var 全局的初始化
+// (fakeVtable 等)。同步调用会抢在 var 初始化前执行, var 随后又把已赋值的
+// 全局重置回 ptr(0) —— 2026-09-20 D类 文本发送崩溃(fakeVtable=0 虚调用)即此因。
+setImmediate(function () {
+    var realModule = resolveBaseFromModuleTable();
+    if (realModule) {
+        baseAddr = realModule.base;
+        console.log("[+] 基址解析(模块表): " + realModule.path + " base=" + baseAddr + " size=" + realModule.size);
+        initAddresses();
+    } else {
+        console.log("[!] 模块表未找到真身 wechat.dylib, 回退 req2buf 字符串扫描");
+        resolveBaseByScan();
+    }
+});
+
+function resolveBaseByScan() {
 var ranges = Process.enumerateRanges("r--").filter(function(r) {
     var rangeEnd = r.base.add(r.size);
     return r.base.compare(searchEnd) < 0 && rangeEnd.compare(moduleBase) > 0;
@@ -32,9 +68,10 @@ ranges.forEach(function(r) {
             if (_req2bufSearchAddr === null) {
                 var rangeInfo = Process.findRangeByAddress(address);
                 if (rangeInfo) {
-                    if (rangeInfo.size > 100 * 1024 * 1024) {
+                    // 必须是可执行映射: 排除堆区(MallocHelperZone等)里的字符串拷贝
+                    if (rangeInfo.size > 100 * 1024 * 1024 && rangeInfo.protection.indexOf("x") !== -1) {
                         _req2bufSearchAddr = address;
-                        console.log("[+] Range size > 100MB, accepted as base address");
+                        console.log("[+] Range size > 100MB & executable, accepted as base address");
                     }
                 }
             }
@@ -46,22 +83,7 @@ ranges.forEach(function(r) {
             pending--;
             if (pending === 0) {
                 if (_req2bufSearchAddr === null) {
-                    // 兜底: 原扫描要求"req2buf"命中在单个>100MB大range内, 但大range会随进程
-                    // 运行碎裂成小段导致定位失败(全盲)。改从模块表里挑: 名为wechat.dylib的
-                    // 模块有两个, Frameworks/下是16KB的stub, 真身在Resources/约147MB, 取最大者。
-                    var wechatModules = Process.enumerateModules().filter(function(m) {
-                        return m.name === "wechat.dylib";
-                    });
-                    wechatModules.sort(function(a, b) { return b.size - a.size; });
-                    if (wechatModules.length > 0 && wechatModules[0].size > 50 * 1024 * 1024) {
-                        baseAddr = wechatModules[0].base;
-                        console.log("[!] 大range扫描未命中, 已回退模块表定位: " + wechatModules[0].path +
-                            " base=" + baseAddr + " size=" + wechatModules[0].size);
-                        initAddresses();
-                        return;
-                    } else {
-                        throw new Error("[-] Cannot find 'req2buf' keyword in a range > 100MB");
-                    }
+                    throw new Error("[-] Cannot find 'req2buf' keyword in an executable range > 100MB");
                 }
 
                 var foundRange = Process.findRangeByAddress(_req2bufSearchAddr);
@@ -74,6 +96,7 @@ ranges.forEach(function(r) {
         }
     });
 });
+}
 
 function initAddresses() {
     // 文本消息全局变量 (new_text.js approach)
@@ -353,6 +376,7 @@ var textProtoDataAddr = ptr(0);
 
 // 双方公共使用的地址
 var triggerX1Payload;
+var triggerTaskSnapshot = null;
 var triggerX0;
 var req2bufEnterAddr;
 var req2bufExitAddr;
@@ -671,12 +695,16 @@ function AttachSendFunc() {
     Interceptor.attach(sendFuncAddr.add(0x10), {
         onEnter: function (args) {
 
-            if (triggerX1Payload) {
-                return
-            }
-
+            // 每次都刷新捕获(upstream 只抓第一次): 保证 payload 指向最近的任务,
+            // 并快照完整任务结构(入口时任务已完整构造, 含回调子对象);
+            // 注入前整块恢复, 避免复用 free 后残骸里的野回调指针(4.1.12 崩溃根因)
             triggerX0 = this.context.x0;
             triggerX1Payload = this.context.x1;
+            try {
+                triggerTaskSnapshot = triggerX1Payload.readByteArray(0x300);
+            } catch (e) {
+                console.log("[-] 任务快照失败: " + e);
+            }
             console.log(`[+] 捕获到 StartTask 调用，X0：${triggerX0}, Payload: ${triggerX1Payload}`);
         }
     })
@@ -938,6 +966,10 @@ function triggerSendMediaMessage(taskId, sender, receiver, protoHex, payloadHex,
     info.sendMessageAddr.add(0x20).writeU32(taskIdGlobal);
 
     const payloadData = hexToByteArray(payloadHex);
+    // 先恢复完整任务结构快照(重建合法回调子对象, free 残骸的野回调指针会崩)
+    if (triggerTaskSnapshot) {
+        triggerX1Payload.writeByteArray(triggerTaskSnapshot);
+    }
     triggerX1Payload.writeByteArray(payloadData);
     triggerX1Payload.add(0x18).writePointer(info.cgiAddr);
     triggerX1Payload.add(0xb8).writePointer(triggerX1Payload.add(0xc0));
@@ -1052,7 +1084,12 @@ function patchCdnOnComplete() {
 
             try {
                 const x2 = this.context.x2;
-                const currentFileId = x2.add(0x20).readPointer().readUtf8String();
+                // 4.1.12(structVer=2): 完成结构整体 +0x08 (DIAG 实证: fileId 0x20→0x28,
+                // cdnKey 0x60→0x68, aesKey 0x78→0x80, md5Key 0x90→0x98, targetId 0x40→0x48);
+                // 且 videoId 字段整个消失(宽扫 0x00-0x260 无候选, 见 docs/version-upgrade.md
+                // 铁律9), structVer=2 直接传空串
+                const cndShift = (structVer === "2") ? 0x08 : 0;
+                const currentFileId = x2.add(0x20 + cndShift).readPointer().readUtf8String();
                 const imageFileId = imageIdAddr.readUtf8String();
                 const videoFileId = videoIdAddr.readUtf8String();
                 const voiceFileId = voiceIdAddr.readUtf8String();
@@ -1063,11 +1100,11 @@ function patchCdnOnComplete() {
                     return;
                 }
 
-                const cdnKey = x2.add(0x60).readPointer().readUtf8String();
-                const aesKey = x2.add(0x78).readPointer().readUtf8String();
-                const md5Key = x2.add(0x90).readPointer().readUtf8String();
-                const videoId = x2.add(0xf0).readPointer().readUtf8String();
-                const targetId = x2.add(0x40).readUtf8String();
+                const cdnKey = x2.add(0x60 + cndShift).readPointer().readUtf8String();
+                const aesKey = x2.add(0x78 + cndShift).readPointer().readUtf8String();
+                const md5Key = x2.add(0x90 + cndShift).readPointer().readUtf8String();
+                const videoId = (structVer === "2") ? "" : x2.add(0xf0).readPointer().readUtf8String();
+                const targetId = x2.add(0x40 + cndShift).readUtf8String();
 
                 console.log("cndOnComplete x2: " + x2 + " cdnKey: " + cdnKey + " aesKey: " + aesKey + " md5Key: " + md5Key + " videoId: " + videoId + " targetId: " + targetId);
 
@@ -1099,14 +1136,17 @@ function patchCdnOnComplete() {
                         });
                     } else if (currentFileId === videoFileId) {
                         // 视频: 缓存成功上传的钥匙, 供秒传去重时回填
-                        cdnVideoKeyCache[cdnKey] = { aesKey: aesKey, md5Key: md5Key, videoId: videoId };
+                        // videoId || "" 兜底: null 会让 Go 侧 videoId.(string) panic
+                        // (被 main.go recover 吞掉, 表现为 HTTP 超时假象); proto3 空 bytes
+                        // 字段会被省略, 4.1.12 实测服务端 ack、视频可播放
+                        cdnVideoKeyCache[cdnKey] = { aesKey: aesKey, md5Key: md5Key, videoId: videoId || "" };
                         send({
                             type: "upload_video_finish",
                             target_id: targetId,
                             cdn_key: cdnKey,
                             aes_key: aesKey,
                             md5_key: md5Key,
-                            video_id: videoId
+                            video_id: videoId || ""
                         });
                     } else {
                         // 图片
@@ -1131,7 +1171,7 @@ function patchCdnOnComplete() {
                         cdn_key: cdnKey,
                         aes_key: cached.aesKey,
                         md5_key: cached.md5Key,
-                        video_id: (videoId !== "" && videoId != null) ? videoId : cached.videoId
+                        video_id: (videoId !== "" && videoId != null) ? videoId : (cached.videoId || "")
                     });
                 } else {
                     console.error("cdnKey or aesKey 为空");
@@ -1359,12 +1399,20 @@ function setReceiver() {
         }
     })
 
+    // 4.1.12(structVer=2) 下载链路漂移(DIAG 实证, 详见 docs/version-upgrade.md):
+    // - file/imag 数据寄存器 x22→x21 (寄存器分配漂移, JSON hook 点即 mov x1,xN 指令)
+    // - 任务结构 +0x18: fileId 0x2E0→0x2F8, cdnUrl 0x2F8→0x310
+    // - 视频数据变为 libc++ std::string(x20+0x178), 长度必须读结构体(4.1.12 x23=0)
+    var dlIsV2 = (structVer === "2");
+    var dlFileIdOff = dlIsV2 ? 0x2F8 : 0x2E0;
+    var dlCdnUrlOff = dlIsV2 ? 0x310 : 0x2F8;
+
     Interceptor.attach(downloadFileAddr, {
         onEnter: function (args) {
-			var dataPtr = this.context.x22;
+			var dataPtr = dlIsV2 ? this.context.x21 : this.context.x22;
 			var dataLen = this.context.x2.toInt32();
-			var fileId = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(0x2E0)));
-			var cdnUrl = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(0x2F8)));
+			var fileId = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(dlFileIdOff)));
+			var cdnUrl = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(dlCdnUrlOff)));
 
             sendDownloadChunks(dataPtr, dataLen, fileId, cdnUrl);
         }
@@ -1372,10 +1420,10 @@ function setReceiver() {
 
     Interceptor.attach(downloadImagAddr, {
         onEnter: function (args) {
-            var dataPtr = this.context.x22;
+            var dataPtr = dlIsV2 ? this.context.x21 : this.context.x22;
             var dataLen = this.context.x2.toInt32();
-            var fileId = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(0x2E0)));
-            var cdnUrl = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(0x2F8)));
+            var fileId = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(dlFileIdOff)));
+            var cdnUrl = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(dlCdnUrlOff)));
 
             sendDownloadChunks(dataPtr, dataLen, fileId, cdnUrl);
         }
@@ -1383,10 +1431,27 @@ function setReceiver() {
 
     Interceptor.attach(downloadVideoAddr, {
         onEnter: function (args) {
-			var dataPtr = readPointerIfReadable(this.context.x20.add(0x178));
-			var dataLen = this.context.x23.toInt32();
-			var fileId = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(0x2E0)));
-			var cdnUrl = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(0x2F8)));
+            var dataPtr, dataLen;
+            if (dlIsV2) {
+                // libc++ std::string at x20+0x178: 数据指针 [+0], 长度 [+8],
+                // SSO 旗标 [+0x17]&0x80 (短串数据内联在对象里)
+                var sObj = this.context.x20.add(0x178);
+                try {
+                    var ssoFlag = sObj.add(0x17).readU8();
+                    if (ssoFlag & 0x80) {
+                        dataPtr = sObj;
+                        dataLen = ssoFlag & 0x7f;
+                    } else {
+                        dataPtr = readPointerIfReadable(sObj);
+                        dataLen = sObj.add(8).readU64().toUInt32();
+                    }
+                } catch (e) { dataPtr = ptr(0); dataLen = 0; }
+            } else {
+			    dataPtr = readPointerIfReadable(this.context.x20.add(0x178));
+			    dataLen = this.context.x23.toInt32();
+            }
+			var fileId = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(dlFileIdOff)));
+			var cdnUrl = readUtf8StringIfReadable(readPointerIfReadable(this.context.x19.add(dlCdnUrlOff)));
 
             sendDownloadChunks(dataPtr, dataLen, fileId, cdnUrl);
         }

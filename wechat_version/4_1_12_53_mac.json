@@ -1,4 +1,5 @@
 {
+  "structVer": "2",
   "sendFuncAddr": "0x53e4ecc",
   "req2bufEnterAddr": "0x413e9b4",
   "req2bufExitAddr": "0x413f87c",
