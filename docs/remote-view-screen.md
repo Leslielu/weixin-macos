@@ -96,6 +96,23 @@ launchctl bootout gui/501/com.user.oneshot_input 2>/dev/null
 rm ~/Library/LaunchAgents/com.user.oneshot_input.plist
 ```
 
+## 按钮坐标别信视觉模型，用像素分析
+
+2026-09-17 python3.11 TCC 弹窗实测：视觉模型两次给的按钮坐标一次偏 15px、一次完全跑偏，
+差点点到「不允许」。可靠做法是本地像素分析：
+
+1. **先问视觉模型弹窗在哪、写了什么**（内容识别可靠），坐标只当粗定位。
+2. 在粗定位区域打网格：逐格取最小亮度，`min<100` 画 `#`（文字/线条）、`min<180` 画 `+`，
+   渲染 ASCII 图——文字块、图标、按钮轮廓一目了然。
+3. 再沿按钮行做水平/垂直色带扫描（亮度跳变>8 即边界）：浅色模式弹窗里按钮是
+   lum≈227 的灰块、弹窗底 lum≈245、文字 lum≈35-80，两条文字块分属两个按钮，
+   文字中心=按钮中心（各往两边加 ~55px 即按钮边界）。
+4. 注意：**强调色非蓝色时默认按钮不是蓝底**（本机 graphite，全程无蓝色像素），
+   别用"找蓝色块"定位默认按钮。
+
+本地无 PIL 也不影响：`sips -s format bmp/ppm` 不可靠（ppm 不支持、bmp 头是垃圾），
+直接用纯 python 解 PNG（zlib.decompress + 逐行 unfilter，~50 行，见会话存档或重写）。
+
 ## 排障要点
 
 - 触发后没产物：查 `launchctl print gui/501/com.user.oneshot_input` 的 `last exit code`；err 输出在 plist 同级加 `StandardErrorPath` 键
