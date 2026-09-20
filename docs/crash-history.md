@@ -103,7 +103,27 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 
 **验证时的坑**：同一视频重复发送会撞 C 类秒传（aesKey 空 → abort → HTTP `send timeout`），看起来像"还是失败"。绕过：`ffmpeg -c:v libx264` 重编码改变流哈希强制首传。追加尾巴没用——cdnKey 只对视频流内容敏感。
 
-## 已上线修复汇总
+### 2026-09-20 —— 4.1.12 适配期两起崩溃（本地实验机，不影响生产）
+
+**A. 合成文本发送必崩（free 残骸野回调指针，已修待合入）**
+
+**现象**：本地 4.1.12 + gadget，`triggerSendTextMessage` 一发就崩，栈顶落在 sendFunc 构造的任务结构被子函数 delete/虚调用的位置。4.1.11 生产同代码零崩溃。
+
+**根因**：`triggerX1Payload` 是从上一次真实任务捕获的指针，微信早已 free 该 slab（毒化填充）。4.1.12 任务结构多了 +0x18（info ptr 0x2a0→0x2b8），残骸里的回调子对象指针比 4.1.11 更"野"，直接复用必踩。
+
+**修复**（staging `/tmp/onebot-run/script.js` 已验证，**待合入仓库 onebot/script.js**）：sendFunc 入口快照整块任务结构（0x300 字节），`triggerSendMediaMessage` 写 payload 前先整块恢复快照，重建合法回调子对象后再注入。
+
+**B. UI 发图即崩（盲挂候选改写运行时 __TEXT，方法已废弃）**
+
+**现象**：用户在 UI 手动发图，微信 SIGILL。崩溃 PC 0x53a827c，但该地址静态字节是 `mov x0,x21`——这条指令不可能 SIGILL。
+
+**根因**：discover 驱动对 harvest 出来的未知指针直接 `Interceptor.attach`（盲挂），等于往运行时 __TEXT 里插桩打补丁。挂错点后原指令语义被破坏，用户正常操作踩中。46K+ 处 `ldaddal` 释放序列命中也证明非 distinctive 字节模式做候选过滤毫无区分度。
+
+**教训（铁律）**：发现流程必须静态优先——字符串锚定/结构匹配 + callscan 目视确认后才允许挂运行时；绝不盲挂。配套方法论已沉淀到 `.claude/skills/wechat-version-upgrade/SKILL.md` + `tools/addrfind/string_anchor.py`。
+
+**C. 附带发现（frida 约束）**：`Interceptor.attach` 在 `bl` 指令上必失败（"unable to intercept...please file a bug"），且该异常会中断同一 setup 函数里后续所有 hook。下载三件套 hook 点一律取 `bl` 前一条 `mov x1,xN`，数据寄存器 4.1.11 x22 → 4.1.12 x21（寄存器分配漂移，跨版本必须逐版 callscan 确认）。
+
+
 
 | commit | 仓库 | 内容 |
 |---|---|---|

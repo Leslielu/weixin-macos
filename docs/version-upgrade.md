@@ -1,0 +1,133 @@
+
+# 微信 macOS 版本升级适配
+
+上游 WeChat 4.x 真身在 `WeChat.app/Contents/Resources/wechat.dylib`(~150MB arm64),
+`MacOS/WeChat` 只是 182K stub。`wechat_version/*.json` 里的地址 = arm64 切片 vmaddr 偏移(从 0 起)。
+本项目所有 hook 都基于这些偏移 + 运行时模块基址。
+
+**涉及生产**: mac-m1 跑着 4.1.11.53 + 看门狗, 任何本地实验不得碰它;
+本地实验机用 frida gadget 模式(127.0.0.1:27042, 会话数 ~3 上限)。
+
+## 总流程(每级小步跳版)
+
+```
+0. 切片: lipo -thin arm64 wechat.dylib -output version_bin/wechat-<版本>-arm64.dylib
+1. addrfind 全量跑(签名+组内delta): 80% 键直接出来
+2. string_anchor find-json 补签名失配键(下载三件套等)
+3. uploadOnCompleteAddr 类: hexfind 结构匹配
+4. 每个候选 callscan 目视确认语义(寄存器/mov+bl 对)
+5. 本地 4.1.12 gadget + onebot 全链路验证(见下) —— 用户验收
+6. 验收通过才产正式 JSON 提交, 再跳下一版
+```
+
+小步跳版(4.1.11→4.1.12→4.1.13)是用户定的策略: 签名匹配率高, 避免 IDA。
+
+## 工具
+
+- `tools/addrfind/addrfind.py 旧.dylib 旧.json 新.dylib -o out.json` — 主力,
+  签名搜索+组内 delta。组锚定见其 README(req2buf 组锚 req2bufEnterAddr, upload 组锚 uploadImageAddr)。
+- `tools/addrfind/string_anchor.py` — addrfind 失配时的补强(见下"字符串锚定法")
+- `tools/addrfind/verify_group.py` — capstone 助记符比对回归
+- venv: `~/.venvs/wechat-re/bin/python3`(capstone+frida, 无 numpy)
+- 切片库: `version_bin/`(4.1.10/11/12/13)
+
+## 字符串锚定法(2026-09-20 实战结晶)
+
+**适用**: 函数体被重构导致指令签名失配 —— 典型是 mars CDN 下载三件套
+(downloadFileAddr/downloadVideoAddr/downloadImagAddr, 4.1.11→4.1.12 addrfind 全灭)。
+
+**原理**: 编译器烧进 __TEXT 的字符串跨版本不变:
+- 构建路径 `/Users/bkdevops/.wconan2/mmnet/<hash>/.../c2c_download_task.cc`
+  (注意: <hash> 构建目录每次变, 路径串本体跨版本失配, 别当锚)
+- 日志格式串 `cdntask %_ write last padding %_ bytes.`
+- 方法名 `OnRecvedData` / 断言文本 / base64 表
+
+老版本目标块周边必有 `adrp+add` 引用; 同串在新版本定位后扫引用点,
+按「引用点 + 老版本相对偏移」推目标位置, 锚间一致性评分。
+
+**算法要点(string_anchor.py locate 已实现, 踩过的坑)**:
+- 种子只用稀有串(全库字节出现 ≤8 次); 热门串(mars::cdn/base64表)引用上千,
+  全局引用表必然截断 → 4.1.12 实测 mars::cdn 有 200+ 引用, cap 永远轮不到真值点
+- 串在 __cstring **任意对齐**, 别做 %4 检查(曾把 video 的锚全跳光)
+- 每个旧拷贝×每个引用点都是独立种子(拷贝错位 → 预测平移)
+- 验证用「预测位置局部窗口反汇编」看加载串内容是否吻合, 不建全局引用表
+- 簇评分 = Σ 不同锚各自最高分(跨锚互证累加)
+
+**产出语义**: 定位到函数/代码块级; 最终 hook 点必须 `callscan` 目视确认。
+4.1.12 实测: file/video 精确到指令, imag 只到函数级(差 0x284, 函数重写幅度大)。
+
+## 结构字节匹配法(uploadOnCompleteAddr 类)
+
+虚调用块附近常只有 "default" 等通用串, 锚定法无效。改搜已知指令序列字节:
+```
+ldr x8,[x0]; ldr x8,[x8,#0x30]; mov x1,x19; mov x2,x21; blr x8
+= hex 080040f9 081940f9 ...(用 capstone 编码或老版本直接抠字节)
+```
+在已知邻近函数(如 uploadGetCallbackWrapperAddr)±0x4000 窗口内 hexfind,
+再 callscan 确认。4.1.12 的 0x551e0e4 就这么来的(7 指令全等唯一点)。
+
+## 4 个难键的本质(别再走弯路)
+
+downloadFile/Imag/Video + uploadOnComplete 是**函数体中段的回调分发点**(非函数入口),
+且 trio 在 __DATA 零静态引用(chained-fixup 验证过: rebase 位 bit63==0, 目标在低36位,
+trio 无任何静态引用)——回调在运行时注册进堆对象, IDA 静态交叉引用也找不到。
+唯一出路 = 字符串锚定/结构匹配 + 语义确认。
+
+## hook 点语义表(下载三件套)
+
+| 版本 | file/imag 数据寄存器 | 说明 |
+|------|------|------|
+| 4.1.11 | x22 | JSON 地址 = `mov x1,x22` 指令 |
+| 4.1.12 | x21 | 同位置编译器分到 x21 —— **寄存器分配漂移** |
+
+- frida **不能在 bl 上 attach**("unable to intercept...file a bug"),
+  一律挂 bl 前一条 mov, 从 context 读数据寄存器
+- 挂错点异常会中断同 setup 函数里后续所有 hook(异常抛出后剩下的 attach 不执行)
+- fileId = task+0x2E0, cdnUrl = task+0x2F8(task 指针在 x19)—— 4.1.12 任务结构
+  info ptr 0x2a0→0x2b8(+0x18), 这两个偏移可能也漂, hook 后 DIAG dump 验证
+  (0x568e5d8 的 `ldr x20,[x8,#0x2e0]` 佐证 4.1.12 仍是 0x2e0)
+
+## 运行时安全铁律(血泪)
+
+1. **绝不盲挂候选地址**。2026-09-20 事故: discover 驱动对 harvest 出的未知指针
+   盲目 Interceptor.attach(改写运行时 __TEXT), 用户 UI 发图即崩。
+   判定手法: 崩溃 PC 处静态字节是 `mov x0,x21`(不可能 SIGILL) → 证明运行时被我们改写。
+   发现流程必须**静态优先**, 运行时只挂已 callscan 确认的点。
+2. 上传/注入复用任务结构前**整块快照恢复**(sendFunc 入口 dump 0x300,
+   注入前 writeByteArray 恢复)—— free 残骸里的野回调指针是 4.1.12 文本发送崩溃根因。
+3. `MMStartTask` NativeFunction 的 `{ exceptions: 'propagate' }` 只限 discover 排查,
+   生产脚本必须去掉。
+4. 生产链路(4.1.11/mac-m1)零打扰; 本地验证用 gadget 模式 + 一次性 onebot 实例。
+
+## 本地验证环境(4.1.12, 本机)
+
+```bash
+# onebot(gadget 模式, 用候选 JSON 试跑)
+cd /tmp/onebot-run && nohup /tmp/onebot-local -type=gadget -gadget_addr=127.0.0.1:27042 \
+  -wechat_conf=/tmp/onebot-run/4_1_12_discover.json -receive_host=127.0.0.1:58080 \
+  -send_url=http://127.0.0.1:9999/void > /tmp/onebot-local.log 2>&1 &
+# 测发送
+curl -X POST -H "Content-Type:application/json" \
+  -d '{"user_id":"<wxid>","message":[{"type":"text","data":{"text":"hi"}}]}' \
+  http://127.0.0.1:58080/send_private_msg
+```
+
+日志 /tmp/onebot-local.log; 9999/void 的报错是预期噪音。
+验收顺序: 文本→图片→视频→文件→(收)图/视频/文件→引用回复, 每步看日志无 ERROR/崩溃。
+
+## 版本实战存档
+
+- **4.1.11→4.1.12 (2026-09-20)**: 14 键 addrfind 直出; 4 难键字符串锚定+结构匹配;
+  全 18 键产出 `wechat_version/4_1_12_53_mac.json`。寄存器漂移 x22→x21、
+  任务结构 +0x18、快照恢复修复。详见 docs/crash-history.md 4.1.12 节。
+- **4.1.12→4.1.13**: 完整 4.1.12 JSON 解锁组内 delta, addrfind 一轮 15/18
+  (含 4 难键全中); 剩 req2buf 三件套(enter/exit/blrX8)待字符串锚定
+  (buf2Resp 锚 ±0x2000 线性 delta 已失败, mismatch 17-29/32)。
+  候选在 /tmp/4_1_13_candidate.json(会丢, 结论: 15/18 可复现)。
+  **用户要求: 4.1.12 验收通过后才继续 4.1.13。**
+
+## 维护约定
+
+- 新版本 JSON 命名 `wechat_version/4_1_XX_YY_mac.json`, 键序与 4.1.11 一致
+- 每次适配完成: 更新本 SKILL 的"版本实战存档"、crash-history.md、commit
+- 用户全局规则: git reset 须审批; Agents.md 不要改(有变更只提交)
