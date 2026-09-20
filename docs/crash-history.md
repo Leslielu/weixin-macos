@@ -123,6 +123,28 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 
 **C. 附带发现（frida 约束）**：`Interceptor.attach` 在 `bl` 指令上必失败（"unable to intercept...please file a bug"），且该异常会中断同一 setup 函数里后续所有 hook。下载三件套 hook 点一律取 `bl` 前一条 `mov x1,xN`，数据寄存器 4.1.11 x22 → 4.1.12 x21（寄存器分配漂移，跨版本必须逐版 callscan 确认）。
 
+**D. 文本发送崩 Req2Buf 虚调用（重构引入的执行顺序 bug，当日已修）**
+
+**现象**：重构基址解析后首次文本发送，~1s 后 SIGSEGV。崩溃点 `wechat.dylib+0x413ea24`（`ldr x8,[x8,#0x10]`，FAR=0x10），位于 Req2Buf 内 rbtree find 之后：find 正确命中我们冒充的节点（x23=sendTextMessageAddr，key+0x20 匹配），但 `[value+0x28]` 指向的 textMessageAddr 的虚表槽读出 0。
+
+**排查手法（值得复用）**：先把 4.1.11/4.1.12 的 Req2Buf 从 hook 点开始**逐指令对比**——两版完全同构（`ldr x9,[x24,#0x60]!` + 同一 rbtree find + 同一虚调用序列），证明 addrfind 推出的基础地址**零漂移**、注入机制本身成立；再加只读 DIAG 在 setup 末尾回读，一把抓到 `fakeVtable=0x0`。
+
+**根因**：`initAddresses()` 被改成脚本体顶部**同步**调用（原为 Memory.scan 的 onComplete 回调）。此时脚本中部的 `var fakeVtable = ptr(0)` 等初始化**尚未执行**；setupRetOneStub 先赋值 fakeVtable，脚本继续执行到 var 初始化行又把它**重置回 0**，随后 setImmediate 的 setupSendTextMessageDynamic 把 0 写进 textMessageAddr+0x00 → 虚空调用。
+
+**修复**：派发包进 `setImmediate`，恢复"全脚本 var 初始化完成后才 initAddresses"的语义。修复后文本全链路验证通过（BLR X8→autoBufferWrite→buf2resp ack）。
+
+**铁律**：**initAddresses 只能异步派发（setImmediate/回调），绝不同步提前调用。** 改 script.js 顶层执行顺序时，必须确认所有 `var X = ptr(0)` 初始化与使用点的先后关系。
+
+**E. 基址竞态：hook 全挂到堆上（"req2buf" 扫描法新失效模式，当日已修）**
+
+**现象**：onebot 启动日志正常（"已就绪，控制通道已打通"），但登录后零同步流量、triggerX0 永远捕不到、发送报"尚未初始化"。无崩溃无报错，纯静默死亡。
+
+**根因**："req2buf 字符串 + >100MB range" 扫描存在**竞态误命中**：堆区 MallocHelperZone（合并 range >100MB，rw-）里也有 "req2buf" 字符串拷贝，扫描回调先到就赢 → 基址定到 0x130000000 堆上（真身 __TEXT 实际在 0x148000000，vmmap 实证），全部 hook 挂空。此前只知道大 range 碎裂会"失败"，这次发现还能"**错误地成功**"。
+
+**修复**：模块表优先（真身是全进程唯一 >50MB 的 wechat.dylib，无竞态）；字符串扫描仅兜底且必须校验 range 含可执行权限。注意修复本身曾引入 D 类 bug——见上条，两个改动必须一起回看的教训就在这。
+
+**F. gadget 会话耗尽（运维约束）**：反复重启 onebot（一个下午 4-5 次）会耗尽 gadget 内部会话资源 → 控制通道整体卡死（frida-ps 都 hang）→ 只能重启微信进程恢复。**改 script.js 要批量改完再重启，别改一处重启一次。**另外 macOS 按 bundle ID 单例激活：日常 4.1.13 在跑时 `open` 4.1.12 是空操作，必须 `open -n`。
+
 
 
 | commit | 仓库 | 内容 |

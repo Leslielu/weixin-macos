@@ -102,6 +102,14 @@ trio 无任何静态引用)——回调在运行时注册进堆对象, IDA 静�
 3. `MMStartTask` NativeFunction 的 `{ exceptions: 'propagate' }` 只限 discover 排查,
    生产脚本必须去掉。
 4. 生产链路(4.1.11/mac-m1)零打扰; 本地验证用 gadget 模式 + 一次性 onebot 实例。
+5. **initAddresses 只能异步派发**(setImmediate 或 Memory.scan 回调)。同步提前调用会
+   抢在脚本中部 `var fakeVtable = ptr(0)` 等初始化之前执行, var 随后把已赋值全局
+   重置回 0 → 注入结构虚表=0 → 发送必崩(2026-09-20 D 类, 详见 crash-history)。
+6. **基址解析模块表优先**(唯一 >50MB 的 wechat.dylib); "req2buf" 字符串扫描只能兜底
+   且必须校验 range 可执行——堆里 MallocHelperZone(>100MB)也有该串, 竞态命中则
+   hook 全挂空且无报错(2026-09-20 E 类: 静默死亡, 登录后零流量)。
+7. 发送链路崩溃先**两版同函数逐指令对比反汇编**确认语义是否漂移, 再怀疑地址——
+   4.1.11 推出的基础地址(req2buf/sendFunc/blrX8)经实证零漂移, 别推翻方向。
 
 ## 本地验证环境(4.1.12, 本机)
 
@@ -135,3 +143,7 @@ curl -X POST -H "Content-Type:application/json" \
 - 新版本 JSON 命名 `wechat_version/4_1_XX_YY_mac.json`, 键序与 4.1.11 一致
 - 每次适配完成: 更新本 SKILL 的"版本实战存档"、crash-history.md、commit
 - 用户全局规则: git reset 须审批; Agents.md 不要改(有变更只提交)
+- **gadget 会话预算**: 反复重启 onebot 会耗尽 gadget 内部会话(控制通道整体卡死,
+  只能重启微信)。改 script.js 批量改完再重启, 别改一处重启一次
+- **bundle ID 单例**: 日常 4.1.13 在跑时 `open` 4.1.12 是空操作(只激活已有实例),
+  必须 `open -n`; 登录前先 `ps` 确认进程路径是 WeChat-4.1.12.app
