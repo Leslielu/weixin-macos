@@ -83,9 +83,13 @@ trio 无任何静态引用)——回调在运行时注册进堆对象, IDA 静�
 - frida **不能在 bl 上 attach**("unable to intercept...file a bug"),
   一律挂 bl 前一条 mov, 从 context 读数据寄存器
 - 挂错点异常会中断同 setup 函数里后续所有 hook(异常抛出后剩下的 attach 不执行)
-- fileId = task+0x2E0, cdnUrl = task+0x2F8(task 指针在 x19)—— 4.1.12 任务结构
-  info ptr 0x2a0→0x2b8(+0x18), 这两个偏移可能也漂, hook 后 DIAG dump 验证
-  (0x568e5d8 的 `ldr x20,[x8,#0x2e0]` 佐证 4.1.12 仍是 0x2e0)
+- **fileId/cdnUrl 偏移随任务结构增长整体平移**(task 指针在 x19):
+  4.1.11 = +0x2E0/+0x2F8; **4.1.12 = +0x2F8/+0x310**(+0x18, 与 info ptr
+  0x2a0→0x2b8 的结构增长一致)。2026-09-20 真实群文件下载 DIAG 实证
+  (+0x2f8 读出 `...@chatroom_..._..._1` 即 fileId)。
+  每版必须 DIAG dump 验证, 别信静态反汇编里的 `[x8,#0x2e0]`(x8 基址
+  可能是别的对象, 4.1.12 实测误导过一次)
+- 另 +0x328 = 本地落盘路径(xwechat_files 下), DIAG 时一并可见
 
 ## 运行时安全铁律(血泪)
 
