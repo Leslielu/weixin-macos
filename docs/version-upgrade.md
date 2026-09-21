@@ -168,11 +168,38 @@ curl -X POST -H "Content-Type:application/json" \
   Go 60s 凑不齐报"文件下载超时或数据为空"(软错误非崩溃)。正解 = bot 主动模拟
   下载请求(worker "download" 任务→triggerDownload)而非等 UI 点击, 待 bot 需要
   处理视频时再做。
-- **4.1.12→4.1.13**: 完整 4.1.12 JSON 解锁组内 delta, addrfind 一轮 15/18
-  (含 4 难键全中); 剩 req2buf 三件套(enter/exit/blrX8)待字符串锚定
-  (buf2Resp 锚 ±0x2000 线性 delta 已失败, mismatch 17-29/32)。
-  候选在 /tmp/4_1_13_candidate.json(会丢, 结论: 15/18 可复现)。
-  **用户要求: 4.1.12 验收通过后才继续 4.1.13。**
+- **4.1.12→4.1.13**: addrfind 一轮 15/18(含 4 难键全中)。随后反汇编定案:
+  req2buf 三件套在 4.1.13 **功能身份换位**——旧 enter 点成了完成回调 H 中段,
+  真发送入口是 SubmitCgi(0x42e3450, mgr+msg), 发送范式整体改 V3 零伪造。
+  完整解码+V3 设计+实战战报见 **docs/4.1.13-submitcgi-analysis.md**。
+  候选 /tmp/onebot-run/4_1_13_candidate.json(会丢)。
+  **✅ 收消息已解决并经用户确认(2026-09-20)**: 收发统一响应分发点
+  `respDispatchAddr`=0x42e5044(H 尾部 blr 前一条 mov x0,x22, read-only hook):
+  onEnter 读 x22=msg/x1=AutoBuffer(双重解引用 D=ab[0], data=D[0], len=D+0xc),
+  首字节 0x08 → `protobuf_msg` 送 Go, 文本/引用/群聊全通。旧 buf2RespAddr
+  (0x430783c)身份换位已死, structVer=3 直接不挂。发送 ack 也走同一点:
+  msg+8 taskid 命中 pending 表 → buf2resp 转发 Go。manager 捕获 =
+  `mgrCaptureAddr` 0x42e4c2c(H found 路径 ldr x22,[x25,#0x28] 下一条, x19=mgr)。
+  **✅ 发送机制端到端打通(2026-09-20 22:53, 用户确认消息送达)**: SubmitCgi
+  原生建 Task/insert/StartTask 全链成功, nativeTaskId=345, 消息真实送达。
+  **✅ 完成后崩溃已修复并验证(2026-09-21 07:04)**: 根因 = completeCb
+  NativeCallback 签名不匹配; 修复 = CModule `complete_stub`(不读参数返回0)。
+  两发(taskid 193/375)送达且微信存活。铁律: native 虚调用路径零例外
+  禁 NativeCallback。战报/铁律/下一步全在 4.1.13-submitcgi-analysis.md。
+  **✅ 媒体五类全通(2026-09-21, 用户确认图/文件/语音, 视频/引用 API 成功)**:
+  图 11.1s / 视频 2.9s / 文件 4.7s / 语音 22.3s(含 19s 出队空等) / 引用 6.3s,
+  全部拿到服务端 ret=0 真实 verdict。当天两大战果: ① resp-dispatch ack 分支
+  裸读修复(0x33 zone 对 findRangeByAddress 不可见, 门控读静默吞 ack —— 与
+  cndOnComplete 同根因, 该 zone 唯一正确读法 = 裸读+try/catch);
+  ② cndOnCompleteV3 自动定位器(fileId 锚点扫描+全槽验证, delta=0x8 跨会话
+  稳定, 4.1.13 槽内是内联 std::string 对象)。Go 超时调优 worker 35s /
+  http 36s; 出队泵 v2(7 syscall × 合法tid)纯保险网。
+  **✅ 收尾完成(2026-09-21 08:53)**: [D] 探针全删 + protoHexByMsgAddr 删除,
+  清理版文本回归 2.1s 全链; 版本 JSON 落 `wechat_version/4_1_13_63_mac.json`
+  (structVer "3", 新增 mgrCaptureAddr/respDispatchAddr 两键)。
+  **⚠️ 运维铁律(08:48 实锤)**: kill 存活微信上的 onebot = gadget 会话拆除
+  竞态, 可崩宿主(崩溃线程 frida-gadget-tcp-27042)。**换脚本必须微信+onebot
+  同步重启**; gadget 会话预算实测 ~9 次/微信生命周期。
 
 ## 维护约定
 

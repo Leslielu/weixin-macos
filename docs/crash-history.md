@@ -143,7 +143,19 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 
 **修复**：模块表优先（真身是全进程唯一 >50MB 的 wechat.dylib，无竞态）；字符串扫描仅兜底且必须校验 range 含可执行权限。注意修复本身曾引入 D 类 bug——见上条，两个改动必须一起回看的教训就在这。
 
-**F. gadget 会话耗尽（运维约束）**：反复重启 onebot（一个下午 4-5 次）会耗尽 gadget 内部会话资源 → 控制通道整体卡死（frida-ps 都 hang）→ 只能重启微信进程恢复。**改 script.js 要批量改完再重启，别改一处重启一次。**另外 macOS 按 bundle ID 单例激活：日常 4.1.13 在跑时 `open` 4.1.12 是空操作，必须 `open -n`。
+**F. gadget 会话耗尽（运维约束）**：反复重启 onebot（一个下午 4-5 次）会耗尽 gadget 内部会话资源 → 控制通道整体卡死（frida-ps 都 hang）→ 只能重启微信进程恢复。**改 script.js 要批量改完再重启，别改一处重启一次。**另外 macOS 按 bundle ID 单例激活：日常 4.1.13 在跑时 `open` 4.1.12 是空操作，必须 `open -n`。（2026-09-21 实测预算 ~9 次/微信生命周期。）
+
+**G. gadget 会话拆除竞态崩宿主（2026-09-21 08:48 实锤，新铁律）**：
+
+```
+触发:    kill onebot(优雅退出也算) → ~8s 后微信 SIGSEGV
+线程名:  frida-gadget-tcp-27042 (gadget 自己的 TCP 控制线程)
+栈顶:    野地址(0x139a38038); 后续帧全在 FridaGadget.dylib (+0x1d1d38/+0x1d1f40 会话拆除路径)
+与适配代码无关: 当时两次发送均 fail-fast 未调 SubmitCgi
+```
+
+本质：kill onebot = gadget 会话拆除，拆除路径本身有竞态（同样的 kill 08:46 活了、08:48 崩了，概率性）。与 F 同族（gadget 会话生命周期脆弱）。
+**修复 = 规程**：换 script.js 必须**微信+onebot 同步重启**（先重启微信再起新 onebot），永不单独 kill 存活微信上的 onebot。
 
 
 
@@ -168,7 +180,7 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 
 ## 运维要点（血泪教训）
 
-- **script.js 是 onebot 启动时读盘的**（main.go 里 `os.ReadFile("./script.js")` 只执行一次）——改完 rsync **必须 restart onebot 才生效**，不存在热更新
+- **script.js 是 onebot 启动时读盘的**（main.go 里 `os.ReadFile("./script.js")` 只执行一次）——改完 rsync **必须 restart onebot 才生效**，不存在热更新。而 restart onebot 对存活微信是拆除竞态（G 类）⇒ **换脚本的完整规程 = 改好 → 重启微信 → 登录 → 起新 onebot**，一步到位别反复
 - **不能随意改逆向地址定位逻辑**：原 script.js 扫 "req2buf" 字符串 + >100MB 大 range 是区分 stub/真身的判别器。微信运行数小时后大 range 会碎裂（449→486 个），扫描会持续失败——兜底分支（模块表取 name=wechat.dylib 且 size>50MB 的最大者）不是理论需要，实战触发过
 - onebot 裸跑不带 `-wechat_conf` 会去找 4_1_11_53 的 json（上游改了 flag 默认值），远端装的是 4.1.10.53。start.sh 已显式传参，别把 4_1_11 json 同步到远端
 - onebot 断线 3 天后不会自动重连；微信崩溃后 onebot 不会自己恢复，恢复 = `open ~/Applications/WeChat.app` + `cd ~/Prog/wxgate && bash start.sh restart`
