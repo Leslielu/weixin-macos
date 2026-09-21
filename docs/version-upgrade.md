@@ -5,6 +5,20 @@
 `MacOS/WeChat` 只是 182K stub。`wechat_version/*.json` 里的地址 = arm64 切片 vmaddr 偏移(从 0 起)。
 本项目所有 hook 都基于这些偏移 + 运行时模块基址。
 
+## 文档结构(谁放什么)
+
+| 文档 | 角色 |
+|---|---|
+| **本文** | 总方法论: 流程/工具用法/跨版本方法/铁律 + 各版存档索引 |
+| `docs/4.1.12-adaptation.md` | 4.1.12 细档: 实战全貌(难键攻略/漂移清单/适配期崩溃/验收) |
+| `docs/4.1.13-submitcgi-analysis.md` | 4.1.13 细档: 身份换位定案/V3 范式/蹦床铁律/媒体战报 |
+| `docs/crash-history.md` | 崩溃档案: 历次崩溃指纹/根因/修复, 排查先读 |
+| `.claude/skills/.../SKILL.md` | skill 速查入口(本地, .gitignore 不入库), 指向本文 |
+
+**新版本适配完成时**: 产细档 `docs/4_1_XX_adaptation.md`(或范式级变化时
+如 `-submitcgi-analysis.md` 命名), 本文存档节写摘要+指向, crash-history 补
+新崩溃指纹, SKILL.md 吸收新铁律。
+
 **涉及生产**: mac-m1 跑着 4.1.11.53 + 看门狗, 任何本地实验不得碰它;
 本地实验机用 frida gadget 模式(127.0.0.1:27042, 会话数 ~3 上限)。
 
@@ -151,7 +165,8 @@ curl -X POST -H "Content-Type:application/json" \
 
 - **4.1.11→4.1.12 (2026-09-20)**: 14 键 addrfind 直出; 4 难键字符串锚定+结构匹配;
   全 18 键产出 `wechat_version/4_1_12_53_mac.json`。寄存器漂移 x22→x21、
-  任务结构 +0x18、快照恢复修复。详见 docs/crash-history.md 4.1.12 节。
+  任务结构 +0x18、快照恢复修复。**完整战报见 `docs/4.1.12-adaptation.md`**,
+  崩溃指纹见 docs/crash-history.md 4.1.12 节。
   **验收期修复**: D 类(initAddresses 同步调用致 fakeVtable=0)+E 类(基址竞态挂堆)已修;
   uploadGetCallbackWrapperAddr hook1 正确位=0x551da24(addrfind 误配 0x551f644
   不同 consumer, bl-caller 扫描 13-14 调用点+4.1.11 对照实证, 仓库 JSON 已改);
