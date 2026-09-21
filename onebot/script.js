@@ -115,6 +115,12 @@ function initAddresses() {
     {{if .cdnGetServiceAddr}}cdnGetServiceAddr = baseAddr.add({{.cdnGetServiceAddr}});{{end}}
     {{if .cdnManagerGetterAddr}}cdnManagerGetterAddr = baseAddr.add({{.cdnManagerGetterAddr}});{{end}}
 
+    // 4.1.13(structVer=3) manager 捕获点(可选键, 旧版 JSON 无此键则 ptr(0) 禁用)
+    {{if .mgrCaptureAddr}}mgrCaptureAddr = baseAddr.add({{.mgrCaptureAddr}});{{end}}
+    // 4.1.13(structVer=3) H 尾部响应分发点(可选键): resp(msg=x22, ab=x1) 前的 mov,
+    // 收消息(protobuf_msg)与发送 ack(buf2resp)统一走这里, 取代 4.1.11 的 buf2RespAddr
+    {{if .respDispatchAddr}}respDispatchAddr = baseAddr.add({{.respDispatchAddr}});{{end}}
+
     uploadGetCallbackWrapperAddr = baseAddr.add({{.uploadGetCallbackWrapperAddr}});
     uploadGetCallbackWrapperFuncAddr = baseAddr.add({{.uploadGetCallbackWrapperFuncAddr}});
     uploadOnCompleteAddr = baseAddr.add({{.uploadOnCompleteAddr}});
@@ -389,6 +395,9 @@ var buf2RespAddr;
 var uploadImageAddr;
 var cdnGetServiceAddr = ptr(0);      // GetService(std::string) 服务定位器, 冷启动解析 CdnManager 用
 var cdnManagerGetterAddr = ptr(0);   // 按类型名 "N4mars3cdn10CdnManagerE" 取 ctx 的 getter
+var msgMapMgrGlobal = ptr(0);        // 4.1.13: msg-map manager this, 捕获点 hook 顺手捕获
+var mgrCaptureAddr = ptr(0);         // 4.1.13: manager 捕获 hook 点(0x42e4c2c, H found 路径)
+var respDispatchAddr = ptr(0);       // 4.1.13: H 尾部响应分发点(0x42e5044, mov x0,x22)
 var cndOnCompleteAddr;
 var imgMessageCallbackFunc;
 var videoMessageCallbackFunc;
@@ -623,6 +632,13 @@ function setupRetOneStub() {
         // MOV W0, #1 = 0x52800020, RET = 0xD65F03C0 (little-endian)
         code.writeByteArray([0x20, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6]);
     });
+    // ⚠️ 2026-09-20 22:35 实锤: Memory.alloc 返回 rw- 页, patchCode 改完代码后
+    // "恢复原保护"仍是 rw-(不可执行) → 原生 blr 进 stub = AV + mgr+0x80 毒锁。
+    // 旧两代 retOneStub "能跑"是当时 gadget alloc 即 RWX 的历史行为,不可依赖;
+    // 显式提权 r-x 一劳永逸, 失败则拒绝继续(虚调用必崩)。
+    if (!Memory.protect(retOneStub, Process.pageSize, 'r-x')) {
+        throw new Error("[-] retOneStub 页提权 r-x 失败, 原生虚调用必崩, 拒绝继续");
+    }
     console.log("[+] Return-1 stub created at: " + retOneStub);
 
     // 构造假vtable：所有槽位指向retOneStub，这样mars对我们伪造结构做虚调用时不会崩溃
@@ -637,6 +653,11 @@ function attachBlrX8Hook() {
     console.log("[+] Hooking BLR X8 at: " + blrX8Addr);
 
     var nativeAutoBufferWrite = new NativeFunction(autoBufferWriteFunc, 'int', ['pointer', 'pointer', 'int']);
+
+    if (structVer === "3") {
+        setupV3SendCallbacks(); // 序列化注入 = CModule serialize_stub(见函数内注释)
+        return;
+    }
 
     Interceptor.attach(blrX8Addr, {
         onEnter: function(args) {
@@ -687,11 +708,319 @@ function attachBlrX8Hook() {
 }
 
 
+// ---------------------4.1.13(structVer=3) SubmitCgi 零伪造发送分区---------------------
+// 范式(2026-09-20 静态定案, 详见 docs/4.1.13-submitcgi-analysis.md):
+// 4.1.13 真发送入口 = SubmitCgi(0x42e3450, mgr, msg)。一次调用微信原生完成:
+// 建 Task(0x218) → 分配真 taskid 写回 msg+8 → 红黑树原生 insert → StartTask。
+// 旧 replay 范式死于 Task 0x1A0→0x218 模板过期(errType=7 本地否决)+
+// manager 消费者改 find-and-pop。我们只提供伪造 msg:
+//   +0x00 专用虚表(+0x10 序列化 = CModule serialize_stub 注入包体;
+//          +0x18 响应 = ret_one 空转, ack 由 resp-dispatch hook 转发)
+//   +0x18 URI 老libc++长串 {cgiBuf,len,len}+0x2f=0x80 (拷贝构造只读ptr/size)
+//   +0x68 假回调对象(其虚表 +0x30 = CModule complete_stub, 返回 0 ⇒ msg 永不析构)
+// 唯一 hook 点 = mgrCaptureAddr(0x42e4c2c, read-only 捕获 x19=manager)。
+// 入口(0x42e3450/H头/另一consumer)只 call 不 attach —— attach 即崩原生流量。
+// 2026-09-20 22:53 首通实证: 本范式消息已真实送达(nativeTaskId=345, 用户确认);
+// 2026-09-21 complete_stub 验证通过: 文本+图/视频/文件/语音/引用五类媒体全部
+// 送达且微信存活, 后置崩溃零复发。
+var v3Send = null; // 惰性构建的 {msgVtable, callbackVtable, submitCgi, autoBufferWrite, cm}
+
+function setupV3SendCallbacks() {
+    if (v3Send !== null) {
+        return;
+    }
+    var autoBufferWrite = new NativeFunction(autoBufferWriteFunc, 'int', ['pointer', 'pointer', 'int']);
+    var submitCgi = new NativeFunction(req2bufEnterAddr, 'int', ['pointer', 'pointer']);
+
+    // ⚠️ 蹦床铁律(2026-09-20 实锤×6) —— 四条:
+    // 1) NativeCallback 在"JS已进入线程上经 NativeFunction 调用再被 native 虚调用"
+    //    = 确定性 AV@0x4/0xa(三次)。V1/V2 两代 native 路径零 NativeCallback。
+    // 2) SubmitCgi 函数体内任何地址不可 hook —— 指令点 hook 重定位破坏原生热路径
+    //    (22:17 原生 msg 虚表指针变垃圾, minidump 实锤)。
+    // 3) Memory.alloc+patchCode 自有页: JS 线程可执行(自检 ret=1)但微信原生线程
+    //    blr 必 AV@页地址(22:35 rw-页 / 22:43 r-x提权页, 同址两杀) —— 自有页执行权
+    //    存在线程级门槛, 自有页一律不得作为 native 虚调用目标。
+    // 4) frida 自家 code allocator 页(trampoline/CModule)整晚被微信线程执行无恙
+    //    (所有 read-only hook 都在跑) —— 唯一可信的自有执行区。
+    // ⇒ 序列化注入 = CModule 纯机器码: vt+0x10 = cm.serialize_stub, 内部直调
+    //   autoBufferWrite(per-send 数据经假回调对象邮箱 cb+0x08/+0x10 传入),
+    //   native 路径零 JS / 零 hook / 零 NativeCallback, 三个杀手一次全灭。
+    // 完成回调 cb->vt+0x30 也改 CModule complete_stub(2026-09-20 22:53 后置崩溃
+    // 修复, 09-21 五类媒体+文本验证通过): 22:53 首通实证消息已送达但 ~1s 后微信
+    // 崩 —— 完成回调是发送路径上最后一个 NativeCallback, 签名是猜的(4 指针),
+    // 编组读错栈即崩。complete_stub 纯机器码: 不读任何参数(签名免疫), 返回 0 跳过
+    // msg 析构; errType 可见性由 resp-dispatch ack 转发给 Go(响应体含服务端 ret)兜底。
+    var cm;
+    try {
+        cm = new CModule(`
+#include <stdint.h>
+extern int autoBufferWrite(void* ab, const void* data, int len);
+// payload 邮箱在假回调对象里(JS 侧 rw- 可写, native 只对它做虚调用):
+//   msg+0x68 -> cb; cb+0x08 = dataPtr; cb+0x10 = len
+// (CModule 页 r-x, C 全局 JS 写不进去 = AV; 假回调对象是纯 JS 堆, 无此问题)
+int serialize_stub(void* msg, void* autobuf) {
+    void* cb = *(void**)((char*)msg + 0x68);
+    if (cb != 0) {
+        const void* data = *(void**)((char*)cb + 0x08);
+        int len = *(int*)((char*)cb + 0x10);
+        if (data != 0 && len > 0) {
+            autoBufferWrite(autobuf, data, len);
+        }
+    }
+    return 1;
+}
+// 完成回调 stub: 纯机器码, 不读任何参数(H 的调用签名未知, 读寄存器/栈指针
+// 等于赌签名), 返回 0 = H 尾部跳过 msg 析构。22:53 后置崩溃修复, 09-21 验证通过。
+int complete_stub(void) { return 0; }
+int ret_one(void) { return 1; }
+`, { autoBufferWrite: autoBufferWriteFunc });
+    } catch (e) {
+        console.error("[!] V3 CModule 编译失败, 发送禁用(收消息不受影响): " + e);
+        return;
+    }
+
+    // 加载期自检: CModule 可编译可调用(JS 线程)。微信线程执行权由 frida code
+    // allocator 保证(trampoline 同源, 本会话整晚实证)。
+    // ⚠️ QuickJS 运行时(本 gadget) CModule 函数导出 = 纯 NativePointer, 不可直接
+    // 调用, 须包 NativeFunction; 数据全局 = 指向存储槽的指针, 经 .writeXxx 读写。
+    var cmRetOne = new NativeFunction(cm.ret_one, 'int', []);
+    if (cmRetOne() !== 1) {
+        console.error("[!] V3 CModule 自检失败, 发送禁用(收消息不受影响)");
+        return;
+    }
+    console.log("[+] V3 CModule ready: serialize_stub=" + cm.serialize_stub +
+        " ret_one=" + cm.ret_one + " (frida code allocator 页, 微信线程可执行)");
+
+    // 专用虚表: 不复用 fakeVtable(其它假对象仍在用, 防串味)。全槽位 cm.ret_one
+    // (frida code allocator, 避开自有页铁律3); +0x10 序列化 = serialize_stub;
+    // +0x18 buf2resp = ret_one(ack 由 resp-dispatch hook 转发)。
+    var msgVtable = Memory.alloc(512);
+    for (var i = 0; i < 64; i++) {
+        msgVtable.add(i * 8).writePointer(cm.ret_one);
+    }
+    msgVtable.add(0x10).writePointer(cm.serialize_stub);
+
+    var callbackVtable = Memory.alloc(512);
+    for (var j = 0; j < 64; j++) {
+        callbackVtable.add(j * 8).writePointer(cm.ret_one);
+    }
+    // +0x30 完成 = CModule stub: 最后一个离开 native 路径的完成回调(09-21 验证通过)
+    callbackVtable.add(0x30).writePointer(cm.complete_stub);
+
+    v3Send = {
+        msgVtable: msgVtable,
+        callbackVtable: callbackVtable,
+        submitCgi: submitCgi,
+        autoBufferWrite: autoBufferWrite,
+        cm: cm,
+    };
+    console.log("[+] V3 send callbacks ready: msgVtable=" + msgVtable + " callbackVtable=" + callbackVtable);
+}
+
+// 无锁预检: 用 JS 自建 AutoBuffer 走一遍 write, 验证 0x4308c58 家族在 4.1.13 语义未变。
+// 毒锁教训(2026-09-20): SubmitCgi 中途 AV 会跳过 unlock → mgr+0x80 锁永久毒死,
+// 微信全部 CGI 卡死只能重启。预检不过绝不调 SubmitCgi。
+function v3DryRunAutoBuffer() {
+    try {
+        var D = Memory.alloc(0x18);            // 镜像 0x4308a9c 构造产物: 0x18 全零描述块
+        var ab = Memory.alloc(16);
+        ab.writePointer(D);
+        var sample = Memory.alloc(8);
+        sample.writeByteArray([0x08, 0x01, 0x12, 0x03, 0x61, 0x62, 0x63, 0x00]);
+        var w = new NativeFunction(autoBufferWriteFunc, 'int', ['pointer', 'pointer', 'int']);
+        w(ab, sample, 7);
+        var dataPtr = D.readPointer();
+        var len = D.add(0xc).readU32();
+        return !dataPtr.equals(ptr(0)) && len === 7;
+    } catch (e) {
+        console.log("[D] dryrun AB err: " + e);
+        return false;
+    }
+}
+
+// 把 8 类消息结构按 SubmitCgi 期望的 msg 布局整形(幂等, 每次发送前调用):
+// URI 老libc++长串覆盖 +0x18..0x2f(顺带清掉旧 +0x20/+0x28 的 4.1.12 残留),
+// +0x30 flags(Task+0x31=1/+0x32=0x0101, 媒体实证值照抄), +0x38..0x4f 合法空串,
+// +0x68 假回调对象(NULL=H 内 __cxa_throw 硬崩)。
+function applyV3MsgLayout(msgAddr, cgiBuf, uriLen) {
+    msgAddr.add(0x00).writePointer(v3Send.msgVtable);
+    msgAddr.add(0x08).writeU32(0);           // taskid: 原生实证(submitProbe)传 0, SubmitCgi 分配后回写 msg+8
+    // selector: 4.1.13 运行时观测 0x8a/0xd6/0x206 三类消息全部 sel=1 (realmsg dump);
+    // 4.1.11 时代的 3 是旧范式值, 跨大版本不可靠, 对齐本版观测
+    msgAddr.add(0x10).writeU64(1);
+    msgAddr.add(0x18).writePointer(cgiBuf);
+    msgAddr.add(0x20).writeU64(uriLen);        // size
+    // cap/+0x2f 旗标: 优先照抄运行时观测到的真实msg值(2026-09-20 realmsg dump),
+    // 未观测到时保守回退 size/0x80
+    var capVal = uriLen, flagVal = 0x80;
+    if (v3Observed.capValid) {
+        capVal = v3Observed.cap;
+        flagVal = v3Observed.flag;
+    }
+    msgAddr.add(0x28).writeU64(capVal);
+    msgAddr.add(0x2f).writeU8(flagVal);        // 长串旗标 = string+0x17 最高位
+    // +0x30: 按消息类分化(sync类=0x01010000, 发送/cmdid 0x8a 类=0x01010100, realmsg 实证)。
+    // 发送路径沿用 4.1.11/12 两代实证值 0x01010100 → +0x31=1, +0x32=0x0101
+    msgAddr.add(0x30).writeU64(uint64("0x0000000001010100"));
+    for (var off = 0x38; off <= 0x4f; off += 8) {
+        msgAddr.add(off).writeU64(0);          // msg+0x38 空串(全零=短串size0, H 干净跳过)
+    }
+    // +0x40..0x47: 原生 newsendmsg 稳定字节 00 00 00 00 01 00 00 00 (submitProbe 两条一致),
+    // 即 +0x44=1。字段语义未知, 逐字节照抄原生 —— 原生自己这么传必然不比零差
+    msgAddr.add(0x40).writeU64(uint64("0x0000000100000000"));
+    msgAddr.add(0x68).writePointer(ensureFakeCallbackObj());
+}
+
+// V3 异步提交队列: SubmitCgi 必须在微信原生(网络)线程上下文执行。
+// 两次实锤(20:24 AV@0x4, 21:00 AV@0xa): 从 frida JS 线程直调, 输入布局已逐字节
+// 验证正确仍然崩, 且崩点地址随运行时变化 = 线程局部状态(TLS)依赖; 原生 UI 发送
+// 走同一 SubmitCgi 全程无恙。
+// 出队点 ×2(谁先触发谁执行): SubmitCgi 入口 hook(微信自提交 newsync/心跳/上报,
+// 线程正处原生 SubmitCgi 上下文, TLS 必然齐备) + resp-dispatch(H 解锁后网络线程)。
+// 空闲期 CGI 事件间隔实测可达 20-45s, 保质期 30s(22:06 实测 21s 间隔, 8s 太短误杀)。
+var v3PendingSubmit = null;
+var V3_SUBMIT_STALE_MS = 30 * 1000;
+// 毒锁标记: SubmitCgi 中途 AV 会跳过 unlock → mgr+0x80 永久死锁, 本轮微信
+// 生命周期内所有 CGI(收发)全灭只能重启。置位后禁发(fail-fast), 绝不再碰 SubmitCgi
+var v3SubmitPoisoned = false;
+
+function drainPendingSubmitNative() {
+    if (v3PendingSubmit === null) {
+        return;
+    }
+    var job = v3PendingSubmit;
+    v3PendingSubmit = null; // 先取走: 单次尝试, AV/异常绝不重试(防连环毒锁)
+    if (Date.now() - job.ts > V3_SUBMIT_STALE_MS) {
+        console.log("[!] " + job.msgType + ": 原生线程提交出队超时, 放弃(Go 侧已超时)");
+        return;
+    }
+    sendMsgType = job.msgType;
+    try {
+        v3Send.submitCgi(msgMapMgrGlobal, job.info.messageAddr);
+        var nativeTaskId = job.info.messageAddr.add(0x08).readU32();
+        if (nativeTaskId) {
+            armPendingBuf2RespTask(nativeTaskId, ptr(0), job.msgType, ptr(0));
+            console.log("[+] V3 SubmitCgi 原生线程提交: msgType=" + job.msgType + " nativeTaskId=" + nativeTaskId);
+        } else {
+            console.error("[!] " + job.msgType + ": SubmitCgi 后 msg+8 无 taskid(本地拒绝)");
+        }
+    } catch (e) {
+        v3SubmitPoisoned = true;
+        console.error("[!] " + job.msgType + ": 原生线程 SubmitCgi 异常(mgr+0x80 已毒, 微信需重启): " + e +
+            " vt_raw=" + v3Hex16(job.info.messageAddr, 0x00));
+    }
+}
+
+// 出队泵 v2(2026-09-21 文件流两连败实证): select 单符号泵零命中 —— mmnet
+// 网络线程的等待函数不是 select。改为: (a) 合法线程集合 = 三个原生事件点
+// (SubmitCgi入口/resp-dispatch/mgr-capture)实际观测到的 tid, 这些线程被
+// 实证可安全跑 SubmitCgi; (b) 多符号泵 select/poll/kevent/kevent64/
+// kevent_qos/recvfrom/read 全挂, 命中合法 tid 即出队, 首次命中单行日志
+// 标记赢家(验收后手工裁剪只留赢家); (c) 首次 resp-dispatch 抓原生栈回溯,
+// 直接看网络线程事件循环在等什么(一次性 DIAG)。
+var v3ValidTids = {};
+var v3TidLogN = 0;
+var v3PumpArmed = false;
+var v3PumpHitLog = {};
+var v3BtDone = false;
+function v3NoteValidTid(tid) {
+    if (!v3ValidTids[tid]) {
+        v3ValidTids[tid] = 1;
+        if (v3TidLogN < 6) {
+            v3TidLogN++;
+            console.log("[+] V3 出队合法线程 tid=" + tid);
+        }
+    }
+}
+function v3SymAddr(name) {
+    var addr = null;
+    try {
+        if (typeof Module.getGlobalExportByName === "function") {
+            addr = Module.getGlobalExportByName(name);
+        }
+    } catch (e1) {}
+    if (!addr) { try { addr = Module.findExportByName(null, name); } catch (e2) {} }
+    if (!addr) { try { addr = Process.getModuleByName("libsystem_kernel.dylib").getExportByName(name); } catch (e3) {} }
+    return (addr && !addr.isNull()) ? addr : null;
+}
+function setupV3DrainPump() {
+    if (v3PumpArmed) return;
+    v3PumpArmed = true;
+    var armed = [];
+    ["select", "poll", "kevent", "kevent64", "kevent_qos", "recvfrom", "read"].forEach(function(name) {
+        var addr = v3SymAddr(name);
+        if (!addr) return;
+        try {
+            Interceptor.attach(addr, {
+                onEnter: function() {
+                    if (v3PendingSubmit !== null && v3ValidTids[this.threadId]) {
+                        if (!v3PumpHitLog[name]) {
+                            v3PumpHitLog[name] = 1;
+                            console.log("[+] V3 出队泵命中(" + name + ") tid=" + this.threadId);
+                        }
+                        drainPendingSubmitNative();
+                    }
+                }
+            });
+            armed.push(name);
+        } catch (eAttach) { /* 该符号挂不上就跳过 */ }
+    });
+    console.log("[+] V3 出队泵v2已挂载: " + armed.join(",") +
+        " 合法tid=" + Object.keys(v3ValidTids).join("/"));
+}
+
+// structVer=3 发送主路径: 交给微信原生建 Task/insert/StartTask。
+// 返回 "1" 后 Go 侧照旧走 channel 等 ack(0x430783c 主路 + respCapture 兜底)。
+function submitViaSubmitCgi(info, msgType, protoHex) {
+    if (v3Send === null) {
+        console.error("[!] " + msgType + ": V3 回调未初始化");
+        return "fail";
+    }
+    if (msgMapMgrGlobal.equals(ptr(0))) {
+        console.error("[!] " + msgType + ": manager 尚未捕获(等原生任意任务完成一次后再试)");
+        return "fail";
+    }
+    if (v3SubmitPoisoned) {
+        console.error("[!] " + msgType + ": SubmitCgi 已毒锁, 本轮微信生命周期内禁发, 需重启微信");
+        return "fail";
+    }
+    info.protoHexSetter(protoHex);
+    sendMsgType = msgType;
+
+    // payload 先落缓冲区; 邮箱指针在 applyV3MsgLayout 设置好 msg+0x68 后再写
+    var finalPayload = hexToByteArray(protoHex);
+    textProtoDataAddr.writeByteArray(finalPayload);
+
+    applyV3MsgLayout(info.messageAddr, info.cgiAddr, info.uri.length);
+
+    // 序列化注入数据就位: payload 指针/长度写进假回调对象邮箱(cb+0x08/+0x10,
+    // 见 CModule 源码注释), CModule serialize_stub 在原生线程经 msg+0x68 读取
+    var cbMailbox = info.messageAddr.add(0x68).readPointer();
+    cbMailbox.add(0x08).writePointer(textProtoDataAddr);
+    cbMailbox.add(0x10).writeS32(finalPayload.length);
+
+    if (!v3DryRunAutoBuffer()) {
+        console.error("[!] " + msgType + ": AutoBuffer 预检失败, 放弃 SubmitCgi(防毒锁)");
+        return "fail";
+    }
+    v3PendingSubmit = { info: info, msgType: msgType, ts: Date.now() };
+    console.log("[+] " + msgType + ": 已入队原生线程提交(等下一次 resp-dispatch 出队)");
+    return "1";
+}
+// ---------------------4.1.13 SubmitCgi 零伪造发送分区---------------------
+
+
 function triggerSendTextMessage(taskId, receiver, content, atUser, protoHex, payloadHex) {
     return triggerSendMediaMessage(taskId, "", receiver, protoHex, payloadHex, "text");
 }
 
 function AttachSendFunc() {
+    // 4.1.13(structVer=3): SubmitCgi 范式不再 replay MMStartTask, 无需捕获
+    // X0/X1/快照; 不挂此 hook 也省掉每条原生消息一条 console.log 的管道开销
+    if (structVer === "3") {
+        console.log("[+] V3: 跳过 AttachSendFunc (SubmitCgi 范式无需 StartTask 捕获)");
+        return;
+    }
     Interceptor.attach(sendFuncAddr.add(0x10), {
         onEnter: function (args) {
 
@@ -715,6 +1044,125 @@ function AttachSendFunc() {
 
 
 // -------------------------buf2resp超时兜底分区-------------------------
+// 4.1.13: H 完成路径强制要求 msg+0x68 有回调对象, NULL 即
+// __cxa_throw 硬断言(2026-09-20 15:13 实锤: 崩溃帧 0x42e5120 → bl 0x21f518
+// 抛异常)。structVer=3 用专用 callbackVtable: vt+0x30 = CModule complete_stub
+// (纯机器码返回 0 ⇒ H 尾部跳过 msg 析构; 09-21 五类媒体验证通过);
+// 旧版仍用 fakeVtable 空转。
+var fakeCallbackObj = ptr(0);
+function ensureFakeCallbackObj() {
+    if (fakeCallbackObj.equals(ptr(0))) {
+        var vt = (structVer === "3" && v3Send !== null) ? v3Send.callbackVtable : fakeVtable;
+        fakeCallbackObj = Memory.alloc(64);
+        fakeCallbackObj.writePointer(vt);
+        console.log("[+] Fake callback obj created at: " + fakeCallbackObj + " vtable=" + vt);
+    }
+    return fakeCallbackObj;
+}
+
+// 4.1.13(structVer=3) 收发统一响应分发点: 0x42e5044 (blr 前一条 mov x0,x22)。
+// 所有完成 CGI 任务的响应都经 msg->vt+0x18(msg=x22, ab=x1) 分发 ——
+// 收消息(首字节 0x08 → protobuf_msg)与我们的发送 ack(pending 表命中 → buf2resp)
+// 在此合流, 取代 4.1.11 的 buf2RespAddr(该点 4.1.13 身份换位已死, 零触发实证)。
+// read-only: 原生 resp 虚调用在 hook 返回后照常执行。热路径零日志(铁律8)。
+function attachRespDispatchV3() {
+    if (respDispatchAddr.equals(ptr(0))) {
+        console.error("[!] JSON 缺 respDispatchAddr, V3 收消息/ack 不可用");
+        return;
+    }
+    console.log("[+] Hooking resp-dispatch V3 at: " + respDispatchAddr);
+    Interceptor.attach(respDispatchAddr, {
+        onEnter: function (args) {
+            try {
+                // 原生线程出队(H 解锁后网络线程, 见 v3PendingSubmit 注释)
+                drainPendingSubmitNative();
+                v3NoteValidTid(this.threadId);
+                if (!v3BtDone) {
+                    v3BtDone = true;
+                    // 一次性 DIAG: 网络线程的调用栈, 直接暴露事件循环的等待函数
+                    try {
+                        var bt = Thread.backtrace(this.context, Backtracer.ACCURATE).slice(0, 14);
+                        var frames = bt.map(function(a) {
+                            var s = DebugSymbol.fromAddress(a);
+                            return (s.module ? s.module.name : "?") + "!" + (s.name || ("+0x" + s.offset.toString(16)));
+                        });
+                        console.log("[D] netbt " + frames.join(" <- "));
+                    } catch (eBt) {}
+                    setImmediate(setupV3DrainPump);
+                }
+                var msg = this.context.x22;
+                var ab = this.context.x1;
+                // tid 先行: 命中我们任务的 ack 才走裸读分支
+                var tid = 0;
+                try { tid = msg.add(0x08).readU32(); } catch (eTid) { return; }
+                var entry = finishPendingBuf2RespTask(tid);
+                if (entry) {
+                    // ack 数据必须裸读: 响应结构所在 malloc zone(0x33_...)对
+                    // findRangeByAddress 不可见, 门控读全数误报空 → ack 被静默
+                    // 吞掉(2026-09-21 实证: 文本两发+图片一发全部送达但 Go 侧
+                    // "收到buf2resp" 零命中, 与 cndOnComplete 同一根因)
+                    var dataPtr = ptr(0), dataLen = 0;
+                    try {
+                        var D = ab.readPointer();        // D = ab[0]
+                        dataPtr = D.readPointer();        // data = D[0]
+                        dataLen = D.add(0xc).readU32();
+                    } catch (eD) {}
+                    var ackData = null;
+                    try {
+                        if (!dataPtr.isNull() && dataLen > 0 && dataLen <= MAX_FRIDA_MESSAGE_BYTES) {
+                            ackData = dataPtr.readByteArray(dataLen);
+                        }
+                    } catch (eR) {}
+                    if (ackData) {
+                        console.log("[+] V3 ack命中: tid=" + tid + " msgType=" + entry.msgType + " len=" + dataLen);
+                        send({
+                            type: "buf2resp",
+                            msg_type: entry.msgType,
+                            data: Array.from(new Uint8Array(ackData)),
+                        });
+                    } else {
+                        // 数据读不出也放行(空数组): 任务已真实完成, 卡住不放
+                        // Go 会假超时; 空 data Go 侧报错但流程收尾可见
+                        console.log("[!] V3 ack命中但数据不可读: tid=" + tid + " msgType=" + entry.msgType +
+                            " dataPtr=" + dataPtr + " len=" + dataLen);
+                        send({
+                            type: "buf2resp",
+                            msg_type: entry.msgType,
+                            data: [],
+                        });
+                    }
+                    return;
+                }
+                // 非我们任务 → 收消息路径(门控读, 收消息链路已实证可用)
+                var D = readPointerIfReadable(ab);
+                var dataPtr = readPointerIfReadable(D);
+                var dataLen = 0;
+                if (!D.equals(ptr(0))) {
+                    dataLen = D.add(0xc).readU32();
+                }
+                if (dataLen < 4 || dataLen > MAX_FRIDA_MESSAGE_BYTES) {
+                    return;
+                }
+                var mem = readByteArrayIfReadable(dataPtr, dataLen);
+                if (!mem) {
+                    return;
+                }
+                var uint8Array = new Uint8Array(mem);
+                if (uint8Array[0] !== 0x08) {
+                    return;
+                }
+                incomingTrafficSeen = true;
+                send({
+                    type: "protobuf_msg",
+                    data: Array.from(uint8Array),
+                });
+            } catch (e) {
+                // 热路径: 静默容错, 单条异常不能影响原生分发
+            }
+        }
+    });
+}
+
 // req2bufExit后登记待ack任务: 命中buf2resp时清理指针并取消timer;
 // 超时未命中则复原X24+0x60的原始指针(而不是清零/留着伪造结构体),
 // 任务回到未注入的合法状态, mars无论重试重序列化还是超时回收delete都安全
@@ -752,6 +1200,14 @@ function fallbackCleanupPendingTask(taskId) {
         return;
     }
     entry.timerId = null;
+    if (entry.addr.isNull()) {
+        // 4.1.13(structVer=3): 节点已由 mars 原生 erase+delete, 没有需要复原的
+        // 指针。entry 再保留 30s, 迟到的 ack 仍能匹配并把响应转发给 Go
+        setTimeout(function () {
+            delete pendingBuf2RespTasks[taskId];
+        }, 30 * 1000);
+        return;
+    }
     try {
         if (!entry.originalPtr.isNull()) {
             entry.addr.writePointer(entry.originalPtr);
@@ -770,7 +1226,80 @@ function fallbackCleanupPendingTask(taskId) {
 }
 
 // -------------------------Req2Buf公共部分分区-------------------------
+
+// 4.1.13(structVer=3): V3 唯一 hook 点 = H found 路径 msg 装载指令的下一条
+// (JSON mgrCaptureAddr=0x42e4c2c): ldr x22,[x25,#0x28] 刚执行完, x19=manager
+// this。原生消息每次 pop 都经过这里, read-only 捕获 mgr 供 SubmitCgi 调用。
+// not-found 路径不经过此 hook, 天然无感。其余一切(建 Task/insert/StartTask)
+// 全部由 SubmitCgi 原生完成, 不再有序列化点 hook / msg 替换 / 手写红黑树。
+// 入口 hook 禁区(attach 即崩原生流量, 2026-09-20 两次实锤): 0x42e48dc(H头)、
+// 0x42e40e8(另一consumer); SubmitCgi 0x42e3450 本体只 call 不 hook。
+// 运行时自适应: 从第一条真实 msg 抄字符串 cap/+0x2f 旗标(机械性字段跨消息类通用)。
+// 背景: 2026-09-20 SubmitCgi 中途 AV 会跳过 unlock → mgr+0x80 锁永久毒死,
+// 微信全部 CGI 卡死(看不到消息), 只能重启微信。伪造布局必须先对齐真货再放行。
+var v3Observed = { capValid: false, cap: 0, flag: 0x80 };
+function v3Hex16(addr, off) {
+    try {
+        return Array.from(new Uint8Array(addr.add(off).readByteArray(16)))
+            .map(function (b) { return ("0" + b.toString(16)).slice(-2); }).join("");
+    } catch (e) { return "unreadable"; }
+}
+
+function attachMgrCaptureV3() {
+    if (mgrCaptureAddr.equals(ptr(0))) {
+        console.error("[!] JSON 缺 mgrCaptureAddr, V3 无法捕获 manager, 发送不可用");
+        return;
+    }
+    console.log("[+] Hooking mgr-capture V3 at: " + mgrCaptureAddr);
+    Interceptor.attach(mgrCaptureAddr, {
+        onEnter: function (args) {
+            v3NoteValidTid(this.threadId);
+            if (msgMapMgrGlobal.equals(ptr(0))) {
+                msgMapMgrGlobal = this.context.x19;
+                console.log("[+] V3: 捕获 msg-map manager = " + msgMapMgrGlobal);
+            }
+            // 运行时自适应(生产机制, 非探针): 从第一条真实 msg 抄字符串 cap/+0x2f
+            // 旗标, 伪造 msg 照抄(见 applyV3MsgLayout); 观测失败走保守回退
+            if (!v3Observed.capValid) {
+                try {
+                    var m = this.context.x22;
+                    var capV = m.add(0x28).readU64();
+                    var flagV = m.add(0x2f).readU8();
+                    if (capV.toNumber() > 0 && (flagV & 0x80)) {
+                        v3Observed.capValid = true;
+                        v3Observed.cap = capV;
+                        v3Observed.flag = flagV;
+                        console.log("[+] V3 观测真实msg字符串布局: cap=0x" + capV.toString(16) + " flag=0x" + flagV.toString(16) + " (伪造msg将照抄)");
+                    }
+                } catch (e) { /* 未观测到走保守回退 */ }
+            }
+        }
+    });
+}
+
+// SubmitCgi 入口出队点(三出队点之一): 微信自提交 CGI 时线程正处原生 SubmitCgi
+// 上下文(TLS 齐备; 此时尚未拿锁, 内层提交完整走完返回后外层才继续, 无嵌套死锁)。
+// 入口本体只挂这个 read-only 出队 hook, 不读不写任何参数。
+function attachSubmitCgiDrainV3() {
+    Interceptor.attach(req2bufEnterAddr, {
+        onEnter: function (args) {
+            drainPendingSubmitNative();
+            v3NoteValidTid(this.threadId);
+        }
+    });
+    console.log("[+] Hooking SubmitCgi 入口出队点(read-only)");
+}
+
+// [已废弃] cmdid 注册表分发探针(0x4320b40): 收消息候选路由排查期探针,
+// resp-dispatch(0x42e5044) 实证为收发统一分发点后删除(2026-09-21)。
+
 function attachReq2buf() {
+    if (structVer === "3") {
+        attachMgrCaptureV3();
+        attachRespDispatchV3();
+        attachSubmitCgiDrainV3();
+        return;
+    }
     Interceptor.attach(req2bufEnterAddr, {
         onEnter: function (args) {
             if (!this.context.x1.equals(taskIdGlobal)) {
@@ -931,31 +1460,41 @@ function setupSendImgMessageDynamic() {
 
 
 
+// -------------------------4.1.13 msg-map 原生插入分区(已废弃)-------------------------
+// 手写红黑树 insert 方案已被 SubmitCgi 零伪造范式取代(2026-09-20):
+// SubmitCgi 原生完成 insert, 无需也不应手工插节点。历史结论存档见
+// docs/4.1.13-submitcgi-analysis.md。
+
 function triggerSendMediaMessage(taskId, sender, receiver, protoHex, payloadHex, msgType) {
     if (!taskId || !receiver) {
         console.error("[!] " + msgType + ": taskId or receiver is empty!");
         return "fail";
     }
 
-    if (!triggerX0 || !triggerX1Payload) {
-        console.error("[!] triggerX0 或 triggerX1Payload 尚未初始化，请等待 hook 捕获");
-        return "fail";
-    }
-
     var msgAddrInfo = {
-        "text":  { messageAddr: textMessageAddr,  sendMessageAddr: sendTextMessageAddr,  cgiAddr: textCgiAddr,  protoHexSetter: function(h) { textProtoHexGlobal = h; } },
-        "img":   { messageAddr: imgMessageAddr,   sendMessageAddr: sendImgMessageAddr,   cgiAddr: imgCgiAddr,   protoHexSetter: function(h) { imgProtoHexGlobal = h; } },
-        "video": { messageAddr: videoMessageAddr, sendMessageAddr: sendVideoMessageAddr, cgiAddr: videoCgiAddr, protoHexSetter: function(h) { videoProtoHexGlobal = h; } },
-        "reply": { messageAddr: replyMessageAddr, sendMessageAddr: sendReplyMessageAddr, cgiAddr: replyCgiAddr, protoHexSetter: function(h) { replyProtoHexGlobal = h; } },
-        "voice": { messageAddr: voiceMessageAddr, sendMessageAddr: sendVoiceMessageAddr, cgiAddr: voiceCgiAddr, protoHexSetter: function(h) { voiceProtoHexGlobal = h; } },
-        "file":  { messageAddr: fileMessageAddr,  sendMessageAddr: sendFileMessageAddr,  cgiAddr: fileCgiAddr,  protoHexSetter: function(h) { fileProtoHexGlobal = h; } },
-        "fileupload": { messageAddr: fileUploadMessageAddr, sendMessageAddr: sendFileUploadMessageAddr, cgiAddr: fileUploadCgiAddr, protoHexSetter: function(h) { fileUploadProtoHexGlobal = h; } },
-        "appattach": { messageAddr: appAttachMessageAddr, sendMessageAddr: sendAppAttachMessageAddr, cgiAddr: appAttachCgiAddr, protoHexSetter: function(h) { appAttachProtoHexGlobal = h; } },
+        "text":  { messageAddr: textMessageAddr,  sendMessageAddr: sendTextMessageAddr,  cgiAddr: textCgiAddr,  uri: "/cgi-bin/micromsg-bin/newsendmsg",      protoHexSetter: function(h) { textProtoHexGlobal = h; } },
+        "img":   { messageAddr: imgMessageAddr,   sendMessageAddr: sendImgMessageAddr,   cgiAddr: imgCgiAddr,   uri: "/cgi-bin/micromsg-bin/uploadmsgimg",     protoHexSetter: function(h) { imgProtoHexGlobal = h; } },
+        "video": { messageAddr: videoMessageAddr, sendMessageAddr: sendVideoMessageAddr, cgiAddr: videoCgiAddr, uri: "/cgi-bin/micromsg-bin/uploadvideo",       protoHexSetter: function(h) { videoProtoHexGlobal = h; } },
+        "reply": { messageAddr: replyMessageAddr, sendMessageAddr: sendReplyMessageAddr, cgiAddr: replyCgiAddr, uri: "/cgi-bin/micromsg-bin/sendappmsg",        protoHexSetter: function(h) { replyProtoHexGlobal = h; } },
+        "voice": { messageAddr: voiceMessageAddr, sendMessageAddr: sendVoiceMessageAddr, cgiAddr: voiceCgiAddr, uri: "/cgi-bin/micromsg-bin/uploadvoice",       protoHexSetter: function(h) { voiceProtoHexGlobal = h; } },
+        "file":  { messageAddr: fileMessageAddr,  sendMessageAddr: sendFileMessageAddr,  cgiAddr: fileCgiAddr,  uri: "/cgi-bin/micromsg-bin/sendappmsg",        protoHexSetter: function(h) { fileProtoHexGlobal = h; } },
+        "fileupload": { messageAddr: fileUploadMessageAddr, sendMessageAddr: sendFileUploadMessageAddr, cgiAddr: fileUploadCgiAddr, uri: "/cgi-bin/micromsg-bin/sendfileuploadmsg", protoHexSetter: function(h) { fileUploadProtoHexGlobal = h; } },
+        "appattach": { messageAddr: appAttachMessageAddr, sendMessageAddr: sendAppAttachMessageAddr, cgiAddr: appAttachCgiAddr, uri: "/cgi-bin/micromsg-bin/uploadappattach", protoHexSetter: function(h) { appAttachProtoHexGlobal = h; } },
     };
 
     var info = msgAddrInfo[msgType];
     if (!info) {
         console.error("[!] unknown msgType: " + msgType);
+        return "fail";
+    }
+
+    // 4.1.13(structVer=3): SubmitCgi 零伪造路径, 微信自建 Task/insert/StartTask
+    if (structVer === "3") {
+        return submitViaSubmitCgi(info, msgType, protoHex);
+    }
+
+    if (!triggerX0 || !triggerX1Payload) {
+        console.error("[!] triggerX0 或 triggerX1Payload 尚未初始化，请等待 hook 捕获");
         return "fail";
     }
 
@@ -1078,12 +1617,121 @@ function hydrateCdnVideoCache(jsonStr) {
     return n;
 }
 
+// 4.1.13(structVer=3) CDN 完成结构自动定位: 老偏移 +0x20 读出 null
+// (2026-09-21 媒体验收首发实证), 完成结构再漂移(4.1.11→12 曾 +0x08)。
+// 锚 = 我们生成的 fileId(全局唯一串); 扫 x2+0x00..0x160 命中后按 4.1.11
+// 相对布局(target/cdn/aes/md5 = fileId+0x20/+0x40/+0x58/+0x70)平移推算,
+// 逐槽内容验证(32-hex / ==receiver), 全过才缓存偏移 —— 运行时一次定位,
+// 不赌静态偏移, 也不为 DIAG 多烧一次 gadget 会话。
+var v3CndOff = null;
+// 槽位读串, 三种编码全兜(2026-09-21 cndScan 实证: 4.1.13 槽里是内联 std::string
+// 对象 {char*@0, size@8, cap|flag@0x10}, 不再是裸 char*):
+// (a) 槽=char*(或内联string对象的ptr字段): 解一层读字符
+// (b) 槽=string对象指针: 解两层
+// (c) 槽本身=内联SSO串(4.1.11 targetId/4.1.13 +0x48 即此)
+// ⚠️ 必须裸读+try/catch, 不能走 IfReadable 门控助手: 完成结构所在的
+// 0x33_00000000 malloc zone 对 findRangeByAddress 不可见, 门控全数误报空
+// (与 submitViaSubmitCgi readback 注释同一坑, 2026-09-21 二次实锤)
+function v3ReadStr(base, off) {
+    var slot = base.add(off);
+    try {
+        var p = slot.readPointer();
+        if (!p.isNull()) {
+            try { var sa = p.readUtf8String(); if (sa && sa.length > 0) return sa; } catch (e1) {}
+            try { var sb = p.readPointer().readUtf8String(); if (sb && sb.length > 0) return sb; } catch (e2) {}
+        }
+    } catch (e0) {}
+    try { var sc = slot.readUtf8String(); if (sc && sc.length > 0) return sc; } catch (e3) {}
+    return "";
+}
+function v3LocateCndOffsets(x2, expected, receiver) {
+    var fidOff = -1;
+    for (var off = 0x00; off <= 0x160; off += 8) {
+        var s = v3ReadStr(x2, off);
+        if (!s || s.length === 0) continue;
+        if (fidOff < 0 && expected[s]) fidOff = off;
+    }
+    if (fidOff < 0) return null;
+    var delta = fidOff - 0x20;
+    var cand = { fileId: fidOff, target: 0x40 + delta, cdn: 0x60 + delta, aes: 0x78 + delta, md5: 0x90 + delta };
+    var tgt = v3ReadStr(x2, cand.target);
+    var cdn = v3ReadStr(x2, cand.cdn);
+    var aes = v3ReadStr(x2, cand.aes);
+    var md5 = v3ReadStr(x2, cand.md5);
+    var hexish = function (t) { return t && /^[0-9a-f]{16,64}$/.test(t); };
+    var ok = tgt === receiver && cdn && cdn.length >= 8 && hexish(aes) && hexish(md5);
+    console.log((ok ? "[+] cnd定位成功(全槽验证通过): " : "[!] cnd定位验证失败: ") +
+        "delta=0x" + delta.toString(16) + " target=" + tgt + " cdn=" + cdn + " aes=" + aes + " md5=" + md5);
+    return ok ? cand : null;
+}
+function cndOnCompleteV3(x2) {
+    const imageFileId = imageIdAddr.readUtf8String();
+    const videoFileId = videoIdAddr.readUtf8String();
+    const voiceFileId = voiceIdAddr.readUtf8String();
+    const fileUploadFileId = uploadFileIdAddr.readUtf8String();
+    var expected = {};
+    if (imageFileId) expected[imageFileId] = "img";
+    if (videoFileId) expected[videoFileId] = "video";
+    if (voiceFileId) expected[voiceFileId] = "voice";
+    if (fileUploadFileId && fileUploadFileId !== "file_upload_not_init") expected[fileUploadFileId] = "fileUpload";
+    // fileId 格式 = receiver_ts_rand_1, 接收者从锚串自取
+    var anchor = imageFileId || videoFileId || voiceFileId || fileUploadFileId || "";
+    var receiver = anchor.split("_")[0] || "";
+    if (v3CndOff === null) {
+        v3CndOff = v3LocateCndOffsets(x2, expected, receiver);
+    }
+    if (!v3CndOff) return;
+    const currentFileId = v3ReadStr(x2, v3CndOff.fileId);
+    var kind = expected[currentFileId];
+    if (!kind) return; // 非我们发起的 CDN 任务
+    const cdnKey = v3ReadStr(x2, v3CndOff.cdn);
+    const aesKey = v3ReadStr(x2, v3CndOff.aes);
+    const md5Key = v3ReadStr(x2, v3CndOff.md5);
+    const targetId = v3ReadStr(x2, v3CndOff.target);
+    // videoId 字段 4.1.12 已消失, 4.1.13 未观测; proto3 空 bytes 省略, 服务端
+    // ack 实证(4.1.12)。videoId || "" 兜底防 Go panic
+    const videoId = "";
+
+    console.log("cndOnComplete(V3) x2: " + x2 + " kind=" + kind + " cdnKey: " + cdnKey +
+        " aesKey: " + aesKey + " md5Key: " + md5Key + " targetId: " + targetId);
+
+    if (cdnKey !== "" && cdnKey != null && aesKey !== "" && aesKey != null) {
+        if (kind === "voice") {
+            send({ type: "upload_voice_finish", target_id: targetId, cdn_key: cdnKey, aes_key: aesKey,
+                voice_duration: voiceDurationGlobal, silk_data_len: voiceSilkDataLenGlobal });
+        } else if (kind === "fileUpload") {
+            send({ type: "upload_file_finish", target_id: targetId, cdn_key: cdnKey, aes_key: aesKey,
+                md5_key: md5Key, attach_id: "@cdn_" + cdnKey + "_" + aesKey + "_1",
+                file_upload_token: "", overwrite_msg_id: "" });
+        } else if (kind === "video") {
+            cdnVideoKeyCache[cdnKey] = { aesKey: aesKey, md5Key: md5Key, videoId: videoId || "" };
+            send({ type: "upload_video_finish", target_id: targetId, cdn_key: cdnKey, aes_key: aesKey,
+                md5_key: md5Key, video_id: videoId || "" });
+        } else {
+            send({ type: "upload_image_finish", target_id: targetId, cdn_key: cdnKey,
+                aes_key: aesKey, md5_key: md5Key });
+        }
+    } else if (kind === "video" && cdnKey !== "" && cdnKey != null && cdnVideoKeyCache[cdnKey]) {
+        // CDN 秒传去重: 响应不带 aesKey, 按 cdnKey 回填缓存钥匙(2026-08-27 实锤)
+        var cached = cdnVideoKeyCache[cdnKey];
+        console.log("[+] cndOnComplete(V3) 秒传命中, 回填缓存钥匙 cdnKey: " + cdnKey);
+        send({ type: "upload_video_finish", target_id: targetId, cdn_key: cdnKey,
+            aes_key: cached.aesKey, md5_key: cached.md5Key, video_id: cached.videoId || "" });
+    } else {
+        console.error("cdnKey or aesKey 为空(V3)");
+    }
+}
+
 function patchCdnOnComplete() {
     Interceptor.attach(cndOnCompleteAddr, {
         onEnter: function (args) {
 
             try {
                 const x2 = this.context.x2;
+                if (structVer === "3") {
+                    cndOnCompleteV3(x2);
+                    return;
+                }
                 // 4.1.12(structVer=2): 完成结构整体 +0x08 (DIAG 实证: fileId 0x20→0x28,
                 // cdnKey 0x60→0x68, aesKey 0x78→0x80, md5Key 0x90→0x98, targetId 0x40→0x48);
                 // 且 videoId 字段整个消失(宽扫 0x00-0x260 无候选, 见 docs/version-upgrade.md
@@ -1300,6 +1948,11 @@ function setupDownloadFileDynamic() {
 
 
 function setReceiver() {
+	try {
+	// 4.1.13(structVer=3): 0x430783c 身份换位已死(零触发实证), 收发统一由 respDispatchAddr 接管
+	if (structVer === "3") {
+		console.log("[+] V3: 跳过 buf2RespAddr hook(由 resp-dispatch 接管)");
+	} else {
 	Interceptor.attach(buf2RespAddr, {
 		onEnter: function (args) {
 			// 通过 SP+0x140 读取当前 buf2resp 对应的 taskId
@@ -1373,7 +2026,12 @@ function setReceiver() {
             })
         },
     });
+	}
+	} catch (e) {
+		console.error("[!] buf2Resp hook 挂载失败(ack转发不可用): " + e);
+	}
 
+    try {
     Interceptor.attach(startDownloadMedia, {
         onEnter: function (args) {
             downloadGlobalX0 = this.context.x0;
@@ -1398,15 +2056,24 @@ function setReceiver() {
             }
         }
     })
+    } catch (e) {
+        console.error("[!] startDownloadMedia hook 挂载失败: " + e);
+    }
 
     // 4.1.12(structVer=2) 下载链路漂移(DIAG 实证, 详见 docs/version-upgrade.md):
     // - file/imag 数据寄存器 x22→x21 (寄存器分配漂移, JSON hook 点即 mov x1,xN 指令)
     // - 任务结构 +0x18: fileId 0x2E0→0x2F8, cdnUrl 0x2F8→0x310
     // - 视频数据变为 libc++ std::string(x20+0x178), 长度必须读结构体(4.1.12 x23=0)
-    var dlIsV2 = (structVer === "2");
+    // 4.1.13(structVer=3): 静态实证 addrfind 给的 file 0x581a028 / imag 0x587ac9c
+    // 落在 bl 上(frida 挂不上, 异常还会中断后续 hook), JSON 改挂前一条
+    // mov(x1,x21); 调用形态 memcpy(dst=x19+x23, src=x21, len=x2) 与 4.1.12
+    // 同源, 任务结构 info 仍在 +0x2b8 未再涨 ⇒ 寄存器/偏移沿用 4.1.12 一套。
+    var dlIsV2 = (structVer === "2" || structVer === "3");
     var dlFileIdOff = dlIsV2 ? 0x2F8 : 0x2E0;
     var dlCdnUrlOff = dlIsV2 ? 0x310 : 0x2F8;
 
+    // 每个 attach 单独 try/catch: 一个点挂不上不能中断其余 hook
+    try {
     Interceptor.attach(downloadFileAddr, {
         onEnter: function (args) {
 			var dataPtr = dlIsV2 ? this.context.x21 : this.context.x22;
@@ -1417,7 +2084,11 @@ function setReceiver() {
             sendDownloadChunks(dataPtr, dataLen, fileId, cdnUrl);
         }
     });
+    } catch (e) {
+        console.error("[!] downloadFile hook 挂载失败: " + e);
+    }
 
+    try {
     Interceptor.attach(downloadImagAddr, {
         onEnter: function (args) {
             var dataPtr = dlIsV2 ? this.context.x21 : this.context.x22;
@@ -1428,7 +2099,11 @@ function setReceiver() {
             sendDownloadChunks(dataPtr, dataLen, fileId, cdnUrl);
         }
     });
+    } catch (e) {
+        console.error("[!] downloadImag hook 挂载失败: " + e);
+    }
 
+    try {
     Interceptor.attach(downloadVideoAddr, {
         onEnter: function (args) {
             var dataPtr, dataLen;
@@ -1456,6 +2131,9 @@ function setReceiver() {
             sendDownloadChunks(dataPtr, dataLen, fileId, cdnUrl);
         }
     });
+    } catch (e) {
+        console.error("[!] downloadVideo hook 挂载失败: " + e);
+    }
 }
 
 

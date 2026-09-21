@@ -154,7 +154,9 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 				})
 				return
 			}
-		case <-time.After(10 * time.Second):
+		// 必须大于 worker 的 35s 任务窗口(4.1.13 V3 异步出队, 见 worker.go),
+		// 否则 worker 尚在等出队 HTTP 层先放弃, 又变假超时
+		case <-time.After(36 * time.Second):
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusGatewayTimeout)
 			json.NewEncoder(w).Encode(map[string]any{
