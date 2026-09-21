@@ -226,7 +226,8 @@ curl -X POST -H "Content-Type:application/json" \
   静默 → 三短链出队点零事件 → 30s 保质放弃(测试号有 ambient 流量, 纯间隙
   饿死; 生产号无 ambient = 必死)。修复 = 出队泵 v3c 常驻(7 syscall × 合法tid)
   + OnPush 长链第 4 出队点 + 保质 85s/Go 90s/HTTP 91s; 当夜 round 验证
-  32s 深等待存活。两条新铁律: **hook 只挂不拆**(detach 蹦床竞态 23:07 崩,
+  32s 深等待存活; **通宵终局(09-22)**: 42 轮×8 出队超时 0/崩溃 0, 客户端
+  3 次 timed out 60s 均为假失败(60s<91s 链, ack 已命中)。两条新铁律: **hook 只挂不拆**(detach 蹦床竞态 23:07 崩,
   crash-history H 类) + **泵边界**(parked 线程不可见)。TLS 线程亲和未根因,
   正解 = UI→网络线程投递原语, 技术债见细档 §8.5。
 

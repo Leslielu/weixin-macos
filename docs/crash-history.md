@@ -54,6 +54,8 @@ NULL+0x10，cdn worker 线程，疑似下载路径。与注入发送无关，未
 倒霉的执行者，但机制完全不同：G 是 frida 内部拆除 bug，H 是我们主动 detach
 自己挂的 hook。**铁律： hook 只挂不拆**——任何热路径 hook（syscall/高频函数）
 挂上后常驻到进程死亡；空闲开销用 onEnter 快路径/tid 门控制，绝不用 detach 省。
+（回归验证： 2026-09-22 通宵 42 轮压测，泵 v3c 7 个 syscall hook 常驻 7.5h+，
+H 类零复发。）
 
 ## 崩溃/事件时间线
 
