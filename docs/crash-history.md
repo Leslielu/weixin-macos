@@ -1,7 +1,7 @@
 # 微信 Bot 崩溃档案与排查手册
 
 > 排查任何崩溃/发送异常前**先读本文**。记录历次崩溃的指纹、根因分析、已上线的修复和遗留问题。
-> 最后更新：2026-09-07
+> 最后更新：2026-09-21
 
 ## 速查：排查动作清单
 
@@ -39,6 +39,21 @@ NULL+0x10，cdn worker 线程，疑似下载路径。与注入发送无关，未
 ### C 类（非崩溃）：CDN 秒传去重导致发送静默失败
 
 不算崩溃但表现为"发送失败"。见下文 2026-08-27 条目。
+
+### H 类：Interceptor.detach 拆热路径蹦床竞态（2026-09-21 23:07 实锤）
+
+```
+线程名:  frida-gadget-tcp-27042 (gadget 自己的线程, 与 G 类同线程名但机制不同)
+异常:    SIGSEGV, 跳转地址 = 被撕裂的 syscall 蹦床(0x125184038)
+时序:    detach 定时器到期 → forEach l.detach() ×7 syscall hook → ~1s 内崩
+```
+
+本质：对**正在被执行的** syscall 入口蹦床做 detach（恢复原始指令），与正在
+蹦床里运行的线程存在天然竞态——指令恢复窗口期内有线程跳进半恢复的蹦床即崩。
+与 G 类（kill onebot 会话拆除竞态）同线程名是因为 gadget 线程恰好是那个
+倒霉的执行者，但机制完全不同：G 是 frida 内部拆除 bug，H 是我们主动 detach
+自己挂的 hook。**铁律： hook 只挂不拆**——任何热路径 hook（syscall/高频函数）
+挂上后常驻到进程死亡；空闲开销用 onEnter 快路径/tid 门控制，绝不用 detach 省。
 
 ## 崩溃/事件时间线
 
@@ -146,7 +161,6 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 **F. gadget 会话耗尽（运维约束）**：反复重启 onebot（一个下午 4-5 次）会耗尽 gadget 内部会话资源 → 控制通道整体卡死（frida-ps 都 hang）→ 只能重启微信进程恢复。**改 script.js 要批量改完再重启，别改一处重启一次。**另外 macOS 按 bundle ID 单例激活：日常 4.1.13 在跑时 `open` 4.1.12 是空操作，必须 `open -n`。（2026-09-21 实测预算 ~9 次/微信生命周期。）
 
 **G. gadget 会话拆除竞态崩宿主（2026-09-21 08:48 实锤，新铁律）**：
-
 ```
 触发:    kill onebot(优雅退出也算) → ~8s 后微信 SIGSEGV
 线程名:  frida-gadget-tcp-27042 (gadget 自己的 TCP 控制线程)
@@ -156,6 +170,22 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 
 本质：kill onebot = gadget 会话拆除，拆除路径本身有竞态（同样的 kill 08:46 活了、08:48 崩了，概率性）。与 F 同族（gadget 会话生命周期脆弱）。
 **修复 = 规程**：换 script.js 必须**微信+onebot 同步重启**（先重启微信再起新 onebot），永不单独 kill 存活微信上的 onebot。
+
+### 2026-09-21 23:07:56 —— H 类：detach 拆 syscall 蹦床竞态崩微信
+
+**时序**：出队泵 v3b 的"懒拆卸"设计（60s 队列空则 detach 7 个 syscall hook）——
+23:07:55 拆卸定时器到期执行 `forEach l.detach()` → 23:07:56 微信 SIGSEGV。
+崩溃报告 `WeChat-2026-09-21-230802.ips`：crashedThread = `frida-gadget-tcp-27042`，
+跳转地址 0x125184038 = 被撕裂的蹦床。当日第三次重启（23:09）后泵改**首挂常驻**
+（v3c），`v3SchedulePumpDisarm()` 变 no-op，复跑至今未复发。
+
+**根因**：detach 恢复原始指令的窗口期内，正有线程在半恢复的 syscall 蹦床里运行。
+**铁律：hook 只挂不拆**（热路径尤其）；空闲开销用 onEnter 快路径 + tid 门，不用 detach 省。
+
+**同夜关联修复（短链/长链间隙饿死）**：22:50 实锤 45s 全 CGI 静默 → 三个短链
+出队点零事件 → 30s 保质期放弃 → Go 504。修复 = 出队泵 v3c 常驻（7 syscall ×
+合法 tid 门）+ 保质期 30s→85s + Go ctx 90s + HTTP 91s + OnPush 第 4 出队点。
+详见 docs/4.1.13-submitcgi-analysis.md §8。
 
 
 

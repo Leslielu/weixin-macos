@@ -72,11 +72,11 @@ func SendWechatMsg(m *SendMsg) {
 	}
 
 	// 4.1.13(structVer=3) SubmitCgi 异步出队: 提交后要等下一个原生 CGI 事件
-	// (SubmitCgi入口/resp-dispatch/mgr-capture 三个出队点)才真正发送, 空闲期
-	// 事件间隔实测 0~21s, 队列保质期 30s。5s 会在出队前误报 "send timeout"
-	// 而消息实际送达(2026-09-21 两发实证)。35s = 30s 保质 + 网络余量;
-	// 旧版直发路径 ack ~1s 到达, 提前命中不受影响
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	// (SubmitCgi入口/resp-dispatch/mgr-capture 三个事件出队点 + syscall 出队泵)
+	// 才真正发送。事件出队点间隔实测 0~45s(2026-09-21 22:50 45s 静默饿死实锤,
+	// 35s 窗口会误杀), 出队泵(按需挂载)让合法线程阻塞唤醒即出队, 正常 <1s。
+	// 90s = JS 侧 85s 保质期 + 网络余量; 旧版直发路径 ack ~1s 到达, 提前命中不受影响
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	// ExportsCallWithContext 用同一个 ctx, 微信崩时 RPC 也能 fail-fast

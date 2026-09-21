@@ -879,11 +879,12 @@ function applyV3MsgLayout(msgAddr, cgiBuf, uriLen) {
 // 两次实锤(20:24 AV@0x4, 21:00 AV@0xa): 从 frida JS 线程直调, 输入布局已逐字节
 // 验证正确仍然崩, 且崩点地址随运行时变化 = 线程局部状态(TLS)依赖; 原生 UI 发送
 // 走同一 SubmitCgi 全程无恙。
-// 出队点 ×2(谁先触发谁执行): SubmitCgi 入口 hook(微信自提交 newsync/心跳/上报,
-// 线程正处原生 SubmitCgi 上下文, TLS 必然齐备) + resp-dispatch(H 解锁后网络线程)。
-// 空闲期 CGI 事件间隔实测可达 20-45s, 保质期 30s(22:06 实测 21s 间隔, 8s 太短误杀)。
+// 出队点 ×4(谁先触发谁执行): SubmitCgi 入口 hook + resp-dispatch(H 解锁后网络线程)
+// + mgr-capture + 出队泵(见 setupV3DrainPump, 2026-09-21 22:50 45s 全 CGI 静默
+// 饿死实锤后启用——三个事件出队点在静默期零事件, 只能蹭合法线程阻塞的 syscall)。
+// 空闲期 CGI 事件间隔实测 0~45s, 保质期 85s(Go 侧窗口 90s, 见 worker.go)。
 var v3PendingSubmit = null;
-var V3_SUBMIT_STALE_MS = 30 * 1000;
+var V3_SUBMIT_STALE_MS = 85 * 1000;
 // 毒锁标记: SubmitCgi 中途 AV 会跳过 unlock → mgr+0x80 永久死锁, 本轮微信
 // 生命周期内所有 CGI(收发)全灭只能重启。置位后禁发(fail-fast), 绝不再碰 SubmitCgi
 var v3SubmitPoisoned = false;
@@ -894,6 +895,7 @@ function drainPendingSubmitNative() {
     }
     var job = v3PendingSubmit;
     v3PendingSubmit = null; // 先取走: 单次尝试, AV/异常绝不重试(防连环毒锁)
+    v3SchedulePumpDisarm(); // no-op(泵常驻不拆, 见函数注释), 保留调用点
     if (Date.now() - job.ts > V3_SUBMIT_STALE_MS) {
         console.log("[!] " + job.msgType + ": 原生线程提交出队超时, 放弃(Go 侧已超时)");
         return;
@@ -947,21 +949,28 @@ function v3SymAddr(name) {
     if (!addr) { try { addr = Process.getModuleByName("libsystem_kernel.dylib").getExportByName(name); } catch (e3) {} }
     return (addr && !addr.isNull()) ? addr : null;
 }
-// 出队泵默认关闭(2026-09-21 评审结论): 全程验收零命中(三个原生出队点已够),
-// 7 个热 syscall 全进程挂钩的蹦床开销不值得常驻, 且 read/recvfrom 与 frida
-// 自身线程有重入风险。若空闲期出队卡死复现, 改 true 并同步重启微信+onebot
-var V3_DRAIN_PUMP_ENABLED = false;
+// 出队泵 v3(2026-09-21 22:50 饿死实锤后启用): 首次任务入队时挂 7 个 syscall
+// hook, **挂后常驻不拆**(23:07 实锤: detach 拆 syscall 蹦床竞态崩微信, 见
+// v3SchedulePumpDisarm 注释)。空闲开销 = onEnter 空队列快路径, 可忽略。
+// 合法线程集合 = 三个原生事件点实际观测的 tid(实证可安全跑 SubmitCgi);
+// frida 自身线程的 read/recvfrom 被 tid 门挡住不重入。递归安全:
+// drainPendingSubmitNative 先取走 v3PendingSubmit 再调 submitCgi, SubmitCgi
+// 内部再触发被 hook 的 syscall 时 re-entry 见 null 直接跳过。
+var V3_DRAIN_PUMP_ENABLED = true;
+var v3PumpListeners = null;      // 挂载句柄; null=当前未挂
+var v3PumpDisarmTimer = null;
 
 function setupV3DrainPump() {
     if (!V3_DRAIN_PUMP_ENABLED) return;
     if (v3PumpArmed) return;
     v3PumpArmed = true;
     var armed = [];
+    v3PumpListeners = [];
     ["select", "poll", "kevent", "kevent64", "kevent_qos", "recvfrom", "read"].forEach(function(name) {
         var addr = v3SymAddr(name);
         if (!addr) return;
         try {
-            Interceptor.attach(addr, {
+            v3PumpListeners.push(Interceptor.attach(addr, {
                 onEnter: function() {
                     if (v3PendingSubmit !== null && v3ValidTids[this.threadId]) {
                         if (!v3PumpHitLog[name]) {
@@ -971,12 +980,21 @@ function setupV3DrainPump() {
                         drainPendingSubmitNative();
                     }
                 }
-            });
+            }));
             armed.push(name);
         } catch (eAttach) { /* 该符号挂不上就跳过 */ }
     });
-    console.log("[+] V3 出队泵v2已挂载: " + armed.join(",") +
+    console.log("[+] V3 出队泵v3已挂载(按需): " + armed.join(",") +
         " 合法tid=" + Object.keys(v3ValidTids).join("/"));
+}
+
+// [废弃 2026-09-21 23:07 实锤] 懒拆卸方案: Interceptor.detach 拆 syscall 热路径
+// 蹦床存在竞态 → timer 到期 1s 内 frida-gadget 线程 SIGSEGV 崩微信(崩溃报告
+// 230802, crashedThread=frida-gadget-tcp-27042, 跳转地址=被撕裂的蹦床)。
+// 铁律: hook 只挂不拆。出队泵改为首挂常驻——onEnter 第一行空队列快路径 +
+// tid 门使空闲开销可忽略, 稳定性 >> 常驻开销。本函数保留 no-op 兼容调用点。
+function v3SchedulePumpDisarm() {
+    // 常驻不拆卸(见上), no-op
 }
 
 // structVer=3 发送主路径: 交给微信原生建 Task/insert/StartTask。
@@ -1014,7 +1032,10 @@ function submitViaSubmitCgi(info, msgType, protoHex, taskId) {
         return "fail";
     }
     v3PendingSubmit = { info: info, msgType: msgType, taskId: taskId, ts: Date.now() };
-    console.log("[+] " + msgType + ": 已入队原生线程提交(等下一次 resp-dispatch 出队)");
+    // 出队泵按需挂载: 入队即挂(若拆卸 timer 在等则取消, 轮内保持挂载)
+    if (v3PumpDisarmTimer !== null) { clearTimeout(v3PumpDisarmTimer); v3PumpDisarmTimer = null; }
+    setupV3DrainPump();
+    console.log("[+] " + msgType + ": 已入队原生线程提交(事件出队点+出队泵)");
     return "1";
 }
 // ---------------------4.1.13 SubmitCgi 零伪造发送分区---------------------
@@ -1110,7 +1131,6 @@ function attachRespDispatchV3() {
                         });
                         console.log("[D] netbt " + frames.join(" <- "));
                     } catch (eBt) {}
-                    setImmediate(setupV3DrainPump);
                 }
                 var msg = this.context.x22;
                 var ab = this.context.x1;
