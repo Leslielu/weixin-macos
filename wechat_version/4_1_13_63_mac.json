@@ -5,6 +5,7 @@
   "req2bufExitAddr": "0x42e39c0",
   "mgrCaptureAddr": "0x42e4c2c",
   "respDispatchAddr": "0x42e5044",
+  "onPushAddr": "0x59b0e94",
   "buf2RespAddr": "0x430783c",
   "blrX8Addr": "0x42e3540",
   "autoBufferWriteFunc": "0x4308c58",

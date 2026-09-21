@@ -128,6 +128,7 @@ type VideoInfo struct {
 
 type Buf2RespData struct {
 	MsgType string
+	TaskId  string // 发送任务的 Go taskId; 空串 = 旧版 JS 未携带, 消费时宽松放行
 	Data    []byte
 	Err     error
 }

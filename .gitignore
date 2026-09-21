@@ -6,7 +6,7 @@ diaphora_batch*
 data
 .venv
 go_al/*.go
-onebot/onebot
+onebot/onebot*
 *.tar.gz
 release
 onebot/audio
@@ -28,3 +28,4 @@ frida-gadget-*.dylib
 # 各版本 wechat.dylib arm64 切片（addrfind 工具用，勿提交）
 version_bin/
 __pycache__/
+/test-assets/

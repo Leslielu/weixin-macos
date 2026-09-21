@@ -409,20 +409,33 @@ func SendWechatMsg(m *SendMsg) {
 		}
 	}
 
-	select {
-	case <-ctx.Done():
-		Error("任务执行超时！", "taskId", currTaskId)
-		sendErr = errors.New("send timeout")
-	case <-wechatDead:
-		Error("微信 session 已断开, 任务中止", "taskId", currTaskId)
-		sendErr = errors.New("wechat crashed")
-	case resp := <-buf2RespChan:
-		if resp.Err != nil {
-			Error("收到buf2resp失败信号", "taskId", currTaskId, "msg_type", resp.MsgType, "err", resp.Err)
-			sendErr = resp.Err
-			return
+	// 收 ack 必须按 taskId 关联校验: V3 异步出队(最长 30s)让"迟到 ack"变常态,
+	// JS 侧超时后仍保留 entry 30s 转发; 不校验会把上个任务的迟到 ack 当本任务
+	// 成功收下(级联误报, 2026-09-21 评审发现)。空 TaskId(旧版 JS)宽松放行
+ackWait:
+	for {
+		select {
+		case <-ctx.Done():
+			Error("任务执行超时！", "taskId", currTaskId)
+			sendErr = errors.New("send timeout")
+			break ackWait
+		case <-wechatDead:
+			Error("微信 session 已断开, 任务中止", "taskId", currTaskId)
+			sendErr = errors.New("wechat crashed")
+			break ackWait
+		case resp := <-buf2RespChan:
+			if resp.TaskId != "" && resp.TaskId != strconv.FormatInt(currTaskId, 10) {
+				Warn("丢弃过期的 buf2resp 迟到 ack", "taskId", currTaskId, "stale_task_id", resp.TaskId, "msg_type", resp.MsgType)
+				continue
+			}
+			if resp.Err != nil {
+				Error("收到buf2resp失败信号", "taskId", currTaskId, "msg_type", resp.MsgType, "err", resp.Err)
+				sendErr = resp.Err
+				break ackWait
+			}
+			Info("收到buf2resp完成信号，任务完成", "taskId", currTaskId, "msg_type", resp.MsgType, "data_len", len(resp.Data))
+			break ackWait
 		}
-		Info("收到buf2resp完成信号，任务完成", "taskId", currTaskId, "msg_type", resp.MsgType, "data_len", len(resp.Data))
 	}
 }
 
@@ -599,13 +612,15 @@ func GetDownloadPath(cdnUrl, aesKeyStr, extHint string, totalLen int) (string, e
 }
 
 // HandleBuf2Resp 处理所有消息类型的buf2resp响应
-func HandleBuf2Resp(msgType string, data []byte) {
-	Info("收到buf2resp响应", "msg_type", msgType, "data_len", len(data))
+// taskId = JS 侧登记的 Go 任务号(用于 worker 关联校验), 空串 = 旧版脚本未携带
+func HandleBuf2Resp(msgType string, taskId string, data []byte) {
+	Info("收到buf2resp响应", "msg_type", msgType, "task_id", taskId, "data_len", len(data))
 
 	if len(data) == 0 {
 		Error("buf2resp响应数据为空", "msg_type", msgType)
 		buf2RespChan <- &Buf2RespData{
 			MsgType: msgType,
+			TaskId:  taskId,
 			Data:    data,
 			Err:     errors.New("response data is empty"),
 		}
@@ -629,6 +644,7 @@ func HandleBuf2Resp(msgType string, data []byte) {
 		Error("buf2resp响应错误", "msg_type", msgType, "ret", ret, "errMsg", errMsg)
 		buf2RespChan <- &Buf2RespData{
 			MsgType: msgType,
+			TaskId:  taskId,
 			Data:    data,
 			Err:     fmt.Errorf("response error, ret=%d, errMsg=%s", ret, errMsg),
 		}
@@ -638,6 +654,7 @@ func HandleBuf2Resp(msgType string, data []byte) {
 	Info("buf2resp响应成功", "msg_type", msgType)
 	buf2RespChan <- &Buf2RespData{
 		MsgType: msgType,
+		TaskId:  taskId,
 		Data:    data,
 	}
 }

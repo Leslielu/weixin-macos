@@ -240,6 +240,12 @@ func loadJs() {
 								if mt, ok := pMap["msg_type"]; ok {
 									msgType = mt.(string)
 								}
+								taskId := ""
+								if tidInter, ok := pMap["task_id"]; ok {
+									if tidStr, ok := tidInter.(string); ok {
+										taskId = tidStr
+									}
+								}
 								if dataInter, ok := pMap["data"]; ok {
 									if dataArr, ok := dataInter.([]interface{}); ok {
 										rawBytes := make([]byte, len(dataArr))
@@ -248,7 +254,7 @@ func loadJs() {
 												rawBytes[i] = byte(int(f))
 											}
 										}
-										HandleBuf2Resp(msgType, rawBytes)
+										HandleBuf2Resp(msgType, taskId, rawBytes)
 									}
 								}
 							}()

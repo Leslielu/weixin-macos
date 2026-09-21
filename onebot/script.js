@@ -120,6 +120,9 @@ function initAddresses() {
     // 4.1.13(structVer=3) H 尾部响应分发点(可选键): resp(msg=x22, ab=x1) 前的 mov,
     // 收消息(protobuf_msg)与发送 ack(buf2resp)统一走这里, 取代 4.1.11 的 buf2RespAddr
     {{if .respDispatchAddr}}respDispatchAddr = baseAddr.add({{.respDispatchAddr}});{{end}}
+    // 4.1.13(structVer=3) 长链 push 入口(可选键): stn.cc __OnPush 函数头。稳态
+    // (登录后短链 CGI 窗口关闭) newsync 全以长链 push 到达, 此处=收消息主路+第4出队点
+    {{if .onPushAddr}}onPushAddr = baseAddr.add({{.onPushAddr}});{{end}}
 
     uploadGetCallbackWrapperAddr = baseAddr.add({{.uploadGetCallbackWrapperAddr}});
     uploadGetCallbackWrapperFuncAddr = baseAddr.add({{.uploadGetCallbackWrapperFuncAddr}});
@@ -398,6 +401,7 @@ var cdnManagerGetterAddr = ptr(0);   // 按类型名 "N4mars3cdn10CdnManagerE" �
 var msgMapMgrGlobal = ptr(0);        // 4.1.13: msg-map manager this, 捕获点 hook 顺手捕获
 var mgrCaptureAddr = ptr(0);         // 4.1.13: manager 捕获 hook 点(0x42e4c2c, H found 路径)
 var respDispatchAddr = ptr(0);       // 4.1.13: H 尾部响应分发点(0x42e5044, mov x0,x22)
+var onPushAddr = ptr(0);             // 4.1.13: 长链 push 入口(stn.cc __OnPush 头 0x59b0e94)
 var cndOnCompleteAddr;
 var imgMessageCallbackFunc;
 var videoMessageCallbackFunc;
@@ -899,7 +903,7 @@ function drainPendingSubmitNative() {
         v3Send.submitCgi(msgMapMgrGlobal, job.info.messageAddr);
         var nativeTaskId = job.info.messageAddr.add(0x08).readU32();
         if (nativeTaskId) {
-            armPendingBuf2RespTask(nativeTaskId, ptr(0), job.msgType, ptr(0));
+            armPendingBuf2RespTask(nativeTaskId, ptr(0), job.msgType, ptr(0), job.taskId);
             console.log("[+] V3 SubmitCgi 原生线程提交: msgType=" + job.msgType + " nativeTaskId=" + nativeTaskId);
         } else {
             console.error("[!] " + job.msgType + ": SubmitCgi 后 msg+8 无 taskid(本地拒绝)");
@@ -943,7 +947,13 @@ function v3SymAddr(name) {
     if (!addr) { try { addr = Process.getModuleByName("libsystem_kernel.dylib").getExportByName(name); } catch (e3) {} }
     return (addr && !addr.isNull()) ? addr : null;
 }
+// 出队泵默认关闭(2026-09-21 评审结论): 全程验收零命中(三个原生出队点已够),
+// 7 个热 syscall 全进程挂钩的蹦床开销不值得常驻, 且 read/recvfrom 与 frida
+// 自身线程有重入风险。若空闲期出队卡死复现, 改 true 并同步重启微信+onebot
+var V3_DRAIN_PUMP_ENABLED = false;
+
 function setupV3DrainPump() {
+    if (!V3_DRAIN_PUMP_ENABLED) return;
     if (v3PumpArmed) return;
     v3PumpArmed = true;
     var armed = [];
@@ -971,7 +981,7 @@ function setupV3DrainPump() {
 
 // structVer=3 发送主路径: 交给微信原生建 Task/insert/StartTask。
 // 返回 "1" 后 Go 侧照旧走 channel 等 ack(0x430783c 主路 + respCapture 兜底)。
-function submitViaSubmitCgi(info, msgType, protoHex) {
+function submitViaSubmitCgi(info, msgType, protoHex, taskId) {
     if (v3Send === null) {
         console.error("[!] " + msgType + ": V3 回调未初始化");
         return "fail";
@@ -1003,7 +1013,7 @@ function submitViaSubmitCgi(info, msgType, protoHex) {
         console.error("[!] " + msgType + ": AutoBuffer 预检失败, 放弃 SubmitCgi(防毒锁)");
         return "fail";
     }
-    v3PendingSubmit = { info: info, msgType: msgType, ts: Date.now() };
+    v3PendingSubmit = { info: info, msgType: msgType, taskId: taskId, ts: Date.now() };
     console.log("[+] " + msgType + ": 已入队原生线程提交(等下一次 resp-dispatch 出队)");
     return "1";
 }
@@ -1065,6 +1075,11 @@ function ensureFakeCallbackObj() {
 // 收消息(首字节 0x08 → protobuf_msg)与我们的发送 ack(pending 表命中 → buf2resp)
 // 在此合流, 取代 4.1.11 的 buf2RespAddr(该点 4.1.13 身份换位已死, 零触发实证)。
 // read-only: 原生 resp 虚调用在 hook 返回后照常执行。热路径零日志(铁律8)。
+// 60s 心跳 DIAG(2026-09-21 短链/长链窗口根因排查): 登录后短链窗口期 hits 应为高,
+// 窗口关闭后应归零——归零即实锤"收发死=窗口关闭", 稳态收消息由 OnPush 接管。
+// 窗口假说验证完成后此 DIAG 可删(同铁律: 只删日志不动逻辑)。
+var v3RespHeartbeatN = 0;
+var v3RespHeartbeatTs = Date.now();
 function attachRespDispatchV3() {
     if (respDispatchAddr.equals(ptr(0))) {
         console.error("[!] JSON 缺 respDispatchAddr, V3 收消息/ack 不可用");
@@ -1074,6 +1089,13 @@ function attachRespDispatchV3() {
     Interceptor.attach(respDispatchAddr, {
         onEnter: function (args) {
             try {
+                v3RespHeartbeatN++;
+                var hbNow = Date.now();
+                if (hbNow - v3RespHeartbeatTs > 60 * 1000) {
+                    console.log("[D] resp-dispatch 60s心跳: hits=" + v3RespHeartbeatN);
+                    v3RespHeartbeatTs = hbNow;
+                    v3RespHeartbeatN = 0;
+                }
                 // 原生线程出队(H 解锁后网络线程, 见 v3PendingSubmit 注释)
                 drainPendingSubmitNative();
                 v3NoteValidTid(this.threadId);
@@ -1095,8 +1117,23 @@ function attachRespDispatchV3() {
                 // tid 先行: 命中我们任务的 ack 才走裸读分支
                 var tid = 0;
                 try { tid = msg.add(0x08).readU32(); } catch (eTid) { return; }
-                var entry = finishPendingBuf2RespTask(tid);
+                // 墓碑机制: ack 命中不删登记只打标, mars 用同 taskid 重试的重复响应
+                // 会被墓碑拦截静默丢弃——否则落入下方收消息分支(首字节 0x08 极常见)
+                // 变幽灵来消息, bot 可能对自己的发送 ack 触发自动回复(评审发现)
+                var entry = pendingBuf2RespTasks[tid];
+                if (entry && entry.acked) {
+                    return;
+                }
                 if (entry) {
+                    entry.acked = true;
+                    if (entry.timerId !== null) {
+                        clearTimeout(entry.timerId);
+                        entry.timerId = null;
+                    }
+                    // 墓碑保留 30s 吸收重试响应(与兜底路径保留窗口一致), 到期清除
+                    setTimeout(function () {
+                        if (pendingBuf2RespTasks[tid] === entry) delete pendingBuf2RespTasks[tid];
+                    }, 30 * 1000);
                     // ack 数据必须裸读: 响应结构所在 malloc zone(0x33_...)对
                     // findRangeByAddress 不可见, 门控读全数误报空 → ack 被静默
                     // 吞掉(2026-09-21 实证: 文本两发+图片一发全部送达但 Go 侧
@@ -1118,6 +1155,7 @@ function attachRespDispatchV3() {
                         send({
                             type: "buf2resp",
                             msg_type: entry.msgType,
+                            task_id: (entry.goTaskId !== undefined && entry.goTaskId !== null) ? String(entry.goTaskId) : "",   // Go 侧按 taskId 校验丢弃过期 ack; 空串=宽松放行
                             data: Array.from(new Uint8Array(ackData)),
                         });
                     } else {
@@ -1128,22 +1166,27 @@ function attachRespDispatchV3() {
                         send({
                             type: "buf2resp",
                             msg_type: entry.msgType,
+                            task_id: (entry.goTaskId !== undefined && entry.goTaskId !== null) ? String(entry.goTaskId) : "",
                             data: [],
                         });
                     }
                     return;
                 }
-                // 非我们任务 → 收消息路径(门控读, 收消息链路已实证可用)
-                var D = readPointerIfReadable(ab);
-                var dataPtr = readPointerIfReadable(D);
-                var dataLen = 0;
-                if (!D.equals(ptr(0))) {
+                // 非我们任务 → 收消息路径。必须裸读+try/catch, 不能走 IfReadable
+                // 门控助手: 响应结构所在 0x33 malloc zone 对 findRangeByAddress
+                // 不可见, 门控读全数误报空 → 收消息被静默吞掉(与 ack 分支/cnd
+                // 完成结构同一坑, 2026-09-21 铁律; 门控版曾让稳态收发死诊断失真)
+                var D = ptr(0), dataPtr = ptr(0), dataLen = 0;
+                try {
+                    D = ab.readPointer();        // D = ab[0]
+                    dataPtr = D.readPointer();   // data = D[0]
                     dataLen = D.add(0xc).readU32();
-                }
+                } catch (eD) { return; }
                 if (dataLen < 4 || dataLen > MAX_FRIDA_MESSAGE_BYTES) {
                     return;
                 }
-                var mem = readByteArrayIfReadable(dataPtr, dataLen);
+                var mem = null;
+                try { mem = dataPtr.readByteArray(dataLen); } catch (eR) {}
                 if (!mem) {
                     return;
                 }
@@ -1166,11 +1209,14 @@ function attachRespDispatchV3() {
 // req2bufExit后登记待ack任务: 命中buf2resp时清理指针并取消timer;
 // 超时未命中则复原X24+0x60的原始指针(而不是清零/留着伪造结构体),
 // 任务回到未注入的合法状态, mars无论重试重序列化还是超时回收delete都安全
-function armPendingBuf2RespTask(taskId, addr, msgType, originalPtr) {
+// goTaskId = Go 侧任务号(V3 的登记键是 mars 分配的 nativeTaskId, 与 Go taskId
+// 不同, 必须单独穿线), ack 转发时带给 Go 做关联校验, 丢弃迟到的过期 ack
+function armPendingBuf2RespTask(taskId, addr, msgType, originalPtr, goTaskId) {
     pendingBuf2RespTasks[taskId] = {
         addr: addr,
         msgType: msgType,
         originalPtr: originalPtr || ptr(0),
+        goTaskId: goTaskId,
         timerId: setTimeout(function () {
             fallbackCleanupPendingTask(taskId);
         }, PENDING_CLEANUP_TIMEOUT_MS),
@@ -1204,7 +1250,9 @@ function fallbackCleanupPendingTask(taskId) {
         // 4.1.13(structVer=3): 节点已由 mars 原生 erase+delete, 没有需要复原的
         // 指针。entry 再保留 30s, 迟到的 ack 仍能匹配并把响应转发给 Go
         setTimeout(function () {
-            delete pendingBuf2RespTasks[taskId];
+            // 已 acked 的墓碑由 resp-dispatch 自己的定时器到期清除, 别提前拆墓碑
+            var e = pendingBuf2RespTasks[taskId];
+            if (e && !e.acked) delete pendingBuf2RespTasks[taskId];
         }, 30 * 1000);
         return;
     }
@@ -1290,6 +1338,62 @@ function attachSubmitCgiDrainV3() {
     console.log("[+] Hooking SubmitCgi 入口出队点(read-only)");
 }
 
+// 4.1.13(structVer=3) 长链 push 分发入口: mars/stn/stn.cc __OnPush(函数头 0x59b0e94,
+// 字符串锚定 "task push name:%_, seq:%_, cmdid:%_, len:%_" @0x941e9d7 反查定位;
+// 函数尾 ret@0x59b1188 六对寄存器存取与头完全对应, 边界已验证)。
+// 签名(寄存器实证): (x0=ctx, x1=name std::string&, x2=seq, x3=cmdid,
+// x4=body AutoBuffer&, x5=ext AutoBuffer&)。作用 ×2:
+//   1) 收消息: 登录后短链 CGI 窗口关闭, newsync 全部以长链 push 到达——此处是
+//      稳态唯一收消息口(2026-09-21 短链/长链窗口根因, 三个短链出队点全饿死的原因)
+//   2) 第 4 出队点: push 到达=网络线程事件, 线程身份与 A/B 回溯链同源(TLS 齐备)
+// 入口 hook(函数第一条 stp), read-only, 不碰 push 派发对象; body 裸读(0x33 zone 铁律)。
+var v3PushLogN = 0;
+function attachOnPushV3() {
+    if (onPushAddr.equals(ptr(0))) {
+        console.error("[!] JSON 缺 onPushAddr, V3 稳态收消息不可用(仅短链窗口期收发可用)");
+        return;
+    }
+    console.log("[+] Hooking OnPush V3 at: " + onPushAddr);
+    Interceptor.attach(onPushAddr, {
+        onEnter: function (args) {
+            // 长链 push 到达 = 网络线程事件, 第 4 出队点(稳态出队主泵)
+            drainPendingSubmitNative();
+            v3NoteValidTid(this.threadId);
+            // push body = x4 (AutoBuffer&): D=ab[0], data=D[0], len=D+0xc(u32)
+            // 与 resp-dispatch ack 分支同款裸读
+            try {
+                var ab = this.context.x4;
+                var D = ab.readPointer();
+                var dataPtr = D.readPointer();
+                var dataLen = D.add(0xc).readU32();
+                if (dataLen < 4 || dataLen > MAX_FRIDA_MESSAGE_BYTES) {
+                    return;
+                }
+                if (v3PushLogN < 5) {
+                    v3PushLogN++;
+                    console.log("[+] V3 OnPush 命中: cmdid=" + this.context.x3 + " len=" + dataLen);
+                }
+                var mem = null;
+                try { mem = dataPtr.readByteArray(dataLen); } catch (eR) { return; }
+                if (!mem) {
+                    return;
+                }
+                var uint8Array = new Uint8Array(mem);
+                if (uint8Array[0] !== 0x08) {
+                    return;
+                }
+                incomingTrafficSeen = true;
+                send({
+                    type: "protobuf_msg",
+                    data: Array.from(uint8Array),
+                });
+            } catch (e) {
+                // 热路径静默容错: 单条异常不能影响原生 push 分发
+            }
+        }
+    });
+}
+
 // [已废弃] cmdid 注册表分发探针(0x4320b40): 收消息候选路由排查期探针,
 // resp-dispatch(0x42e5044) 实证为收发统一分发点后删除(2026-09-21)。
 
@@ -1298,6 +1402,7 @@ function attachReq2buf() {
         attachMgrCaptureV3();
         attachRespDispatchV3();
         attachSubmitCgiDrainV3();
+        attachOnPushV3();
         return;
     }
     Interceptor.attach(req2bufEnterAddr, {
@@ -1357,7 +1462,7 @@ function attachReq2buf() {
             // 不立即清除insertMsgAddr，让mars能路由buf2resp回调
             // 用fakeVtable保护结构体，防止中间被访问时崩溃
             // 登记任务并挂超时兜底timer: ack超时则复原X24+0x60原始指针
-            armPendingBuf2RespTask(taskIdGlobal, insertMsgAddr, sendMsgType, originalInsertMsgPtr);
+            armPendingBuf2RespTask(taskIdGlobal, insertMsgAddr, sendMsgType, originalInsertMsgPtr, taskIdGlobal);
             taskIdGlobal = 0;
         }
     });
@@ -1490,7 +1595,7 @@ function triggerSendMediaMessage(taskId, sender, receiver, protoHex, payloadHex,
 
     // 4.1.13(structVer=3): SubmitCgi 零伪造路径, 微信自建 Task/insert/StartTask
     if (structVer === "3") {
-        return submitViaSubmitCgi(info, msgType, protoHex);
+        return submitViaSubmitCgi(info, msgType, protoHex, taskId);
     }
 
     if (!triggerX0 || !triggerX1Payload) {
@@ -1644,14 +1749,20 @@ function v3ReadStr(base, off) {
     try { var sc = slot.readUtf8String(); if (sc && sc.length > 0) return sc; } catch (e3) {}
     return "";
 }
-function v3LocateCndOffsets(x2, expected, receiver) {
+function v3LocateCndOffsets(x2, expected) {
     var fidOff = -1;
+    var matchedFid = "";
     for (var off = 0x00; off <= 0x160; off += 8) {
         var s = v3ReadStr(x2, off);
         if (!s || s.length === 0) continue;
-        if (fidOff < 0 && expected[s]) fidOff = off;
+        if (fidOff < 0 && expected[s]) { fidOff = off; matchedFid = s; }
     }
     if (fidOff < 0) return null;
+    // receiver 从命中的完整 fileId 剥后缀得出(格式 receiver_<ts>_<rand>_1)。
+    // 不能用 split("_")[0]: wxid_ 前缀的接收者自带下划线会被截成 "wxid",
+    // tgt===receiver 永远 false → wxid 个人会话媒体发送全灭(2026-09-21 评审发现;
+    // 验收期目标是 ludaohe/群, 无下划线恰好不触发)
+    var receiver = matchedFid.replace(/_\d+_\d+_1$/, "");
     var delta = fidOff - 0x20;
     var cand = { fileId: fidOff, target: 0x40 + delta, cdn: 0x60 + delta, aes: 0x78 + delta, md5: 0x90 + delta };
     var tgt = v3ReadStr(x2, cand.target);
@@ -1674,11 +1785,8 @@ function cndOnCompleteV3(x2) {
     if (videoFileId) expected[videoFileId] = "video";
     if (voiceFileId) expected[voiceFileId] = "voice";
     if (fileUploadFileId && fileUploadFileId !== "file_upload_not_init") expected[fileUploadFileId] = "fileUpload";
-    // fileId 格式 = receiver_ts_rand_1, 接收者从锚串自取
-    var anchor = imageFileId || videoFileId || voiceFileId || fileUploadFileId || "";
-    var receiver = anchor.split("_")[0] || "";
     if (v3CndOff === null) {
-        v3CndOff = v3LocateCndOffsets(x2, expected, receiver);
+        v3CndOff = v3LocateCndOffsets(x2, expected);
     }
     if (!v3CndOff) return;
     const currentFileId = v3ReadStr(x2, v3CndOff.fileId);
@@ -2000,6 +2108,7 @@ function setReceiver() {
 					send({
 						type: "buf2resp",
 						msg_type: pendingEntry.msgType,
+						task_id: (pendingEntry.goTaskId !== undefined && pendingEntry.goTaskId !== null) ? String(pendingEntry.goTaskId) : "",
 						data: Array.from(bytes),
 					});
 				}
