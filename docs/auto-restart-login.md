@@ -1,5 +1,28 @@
 # 微信全自动重启登录方案
 
+## 2026-09-22 已查明未处理：本机(Sequoia 15.6.1)微信每次启动重弹"想访问其他App的数据"
+
+**现象**：验证机(本机, macOS 15.6.1)每次启动微信都弹 `"微信"想访问其他App的数据`（不允许/允许），
+点过允许下次照弹。**与安装位置无关**（`~/Applications` 是标准位置；同 app 的下载文件夹/麦克风
+授权都正常持久化）。
+
+**根因链**（TCC.db + 双机对比实锤）：
+1. gadget 注入 `FridaGadget.dylib` 进 `Contents/Frameworks/` → 原腾讯签名必然破坏 → 只能 **adhoc 重签**（无 Team ID/公证身份）
+2. 该弹窗 = `kTCCServiceSystemPolicyAppData`（微信登录时扫别的 app 数据触发，非 hook 所致）
+3. **Sequoia 15 对无稳定签名身份的 app 不给持久 AppData 授权**：点允许只写一条临时授权
+   （TCC 行 auth_value=5，每次点击都更新 last_modified，下轮启动照弹）——Sequoia 出名的重弹毛病
+4. 对照：mac-m1 同样 adhoc 微信 + 同值 auth_value=5，但跑 **Tahoe 26.2**，09-19 12:40 点过一次后
+   TCC 行再未更新 = 不再弹。**mac-m1 暂无此问题，先不处理**（除非重新注入/换包，届时 Tahoe 上应也能一次点掉）
+
+**风险**：本机若依赖无人值守自动重启（崩溃→看门狗拉起），未点的 TCC 弹窗会排队阻塞 `open()`
+/登录窗（同 2026-09-07 事故机制），过夜自愈会卡死。
+
+**修法（按序，均未做）**：
+1. 零成本先试：`tccutil reset SystemPolicyAppData com.tencent.xinWeChat` → 下次启动点一次允许
+2. 根治：`wxgate-signer` 固定证书重签微信（先 `codesign -d --entitlements :-` 导出带上；identifier
+   不变）——onebot/wxgate"固定证书签名"铁律的微信本体版；代价 = 所有授权重弹一轮 + 每次重注入后要重签
+3. 兜底：启动链加"检测 TCC 弹窗前台 → 像素定位点允许"分支
+
 ## 2026-09-07 TCC 弹窗队列饿死微信启动（第七层：部署即触发的授权回归）
 
 **事故**：11:12 微信 SIGSEGV 崩（已知家族）→ 看门狗 11:34/11:50 两次拉起 → 微信永远停在前窗口期，
