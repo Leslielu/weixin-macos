@@ -966,7 +966,10 @@ function setupV3DrainPump() {
     v3PumpArmed = true;
     var armed = [];
     v3PumpListeners = [];
-    ["select", "poll", "kevent", "kevent64", "kevent_qos", "recvfrom", "read"].forEach(function(name) {
+    // gettimeofday 扩容(2026-09-22 本机探针实锤): 空闲稳态网络线程以 ~636/s
+    // 查时钟(mars 事件循环非纯阻塞, 1.5ms 间隔自旋), 现有7符号空闲期零命中;
+    //蹭此点出队延迟 15-45s → 毫秒级。纯只读查询无锁, tid 门+先取走防重入不变。
+    ["select", "poll", "kevent", "kevent64", "kevent_qos", "recvfrom", "read", "gettimeofday"].forEach(function(name) {
         var addr = v3SymAddr(name);
         if (!addr) return;
         try {
