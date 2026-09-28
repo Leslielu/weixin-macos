@@ -16,8 +16,9 @@
 # OCR 点允许(2026-09-28): click_allow() = 现截屏 → ocr_allow.py 定位「允许」文字按钮
 #           → 点它; 用 88 张历史截图验收(26 张含弹窗全部命中/零误报), 同时修复两个
 #           旧缺口: ① 弹窗加高变体固定坐标点偏(逻辑 y 实测漂移 334~411) ② 开机窗口
-#           主屏=内置 Retina 时只能放弃点击。OCR 不可用/没找到 → 退回固定坐标+
-#           main_is_dummy 原逻辑, 行为不劣化。
+#           主屏=内置 Retina 时只能放弃点击。OCR 确认无弹窗时不盲点, 且连续 3 次确认
+#           无弹窗 + UNC 进程仍在 → 判僵尸 UNC 直接杀掉(否则前台被卡死→登录躺尸,
+#           2026-09-28 演练实锤)。OCR 不可用/没找到 → 退回固定坐标+main_is_dummy。
 # 升级弹窗: 不做主动点击(误点"立即更新"=版本升级=hook地址全废, 宁可它挡着);
 #           防线 = 拉起前杀更新器残留 + 源头禁更新检查(SUEnableAutomaticCheck(s))
 #           + 回车只在引导循环/开机窗口内按有限预算发(检查已禁, 暴露窗口极低)
@@ -143,8 +144,11 @@ snap_new() {
 
 # 点掉当前 TCC 弹窗的「允许」: snap_new → ocr_allow.py → 点 OCR 坐标。
 # OCR 已按截图 scale 折算成逻辑点(Retina /2), 坐标即 clicclick 全局坐标(弹窗
-# 出现在主屏, 主屏原点=(0,0))。OCR 不可用/没找到 → 固定坐标 + main_is_dummy
-# 原逻辑。返回 0=已发点击, 非 0=未点(调用方只管烧预算/记日志)。
+# 出现在主屏, 主屏原点=(0,0))。返回码:
+#   0 = 已发点击(OCR 定位, 或 OCR 不可用时的固定坐标兜底)
+#   2 = OCR 跑过且确认屏上没有弹窗(MISS) — 调用方绝不能再盲点固定坐标
+#       (2026-09-28 演练实锤: 弹窗清完后盲点打在 clash 窗口上), 应记 MISS 连击
+#   1 = OCR 不可用/输出异常且兜底也没点成(非 dummy 屏跳过等)
 click_allow() {
     local f line rest x y
     if [ -x "$OCR_PY" ] && [ -f "$OCR_ALLOW" ]; then
@@ -163,7 +167,11 @@ click_allow() {
                 fi
                 return 1   # clicclick 失败(辅助功能问题), 不再退坐标盲点
             fi
-            log "OCR未命中(${line}), 走固定坐标兜底"
+            if [ "${line%% *}" = "MISS" ]; then
+                log "OCR确认屏上无弹窗(${line}), 不盲点"
+                return 2
+            fi
+            log "OCR输出异常(${line}), 走固定坐标兜底"
         else
             log "OCR点允许: 截屏未落盘, 走固定坐标兜底"
         fi
@@ -180,6 +188,32 @@ click_allow() {
         log "主屏非1920x1080 dummy 且 OCR 未定位, 跳过点允许 (人工切回dummy后kill微信可走原恢复路径)"
     fi
     return 1
+}
+
+# OCR 连续确认无弹窗(rc=2)但 tcc_up 恒真 → UNC 是僵尸: 弹窗已被点掉、进程残留
+# 数分钟, 前台判定被它卡死(前台翻到别的 App 也会被 BID 覆盖逻辑按住), 引导循环
+# 空转到上限, 微信站登录窗躺尸(2026-09-28 演练 + 2026-09-27 开机两次实锤)。
+# 对策: 连续 3 次 MISS(引导循环≈30s / 2.5节≈3min)直接杀 UNC 解锁前台;
+# 真弹窗若还在排队(TCC 全局队列), 30s 内必然已上屏被 OCR 看见, 不会误杀。
+# 状态存 /tmp 文件: 看门狗每轮是新进程, 循环内/2.5节跨轮都要共用这个计数。
+MISS_FILE="/tmp/wechat_watchdog.ocrmiss"
+note_ocr_miss() {  # $1=0 重置连击(点到了弹窗); $1=1 记一次 MISS, 满3杀僵尸
+    local n
+    n=$(cat "$MISS_FILE" 2>/dev/null)
+    n=${n:-0}
+    if [ "$1" = "0" ]; then
+        [ "$n" != "0" ] && echo 0 > "$MISS_FILE"
+        return 0
+    fi
+    n=$((n + 1))
+    echo "$n" > "$MISS_FILE"
+    if [ "$n" -ge 3 ]; then
+        echo 0 > "$MISS_FILE"
+        if pkill -9 -f "UserNotificationCenter.app/Contents/MacOS/UserNotificationCenter" 2>/dev/null; then
+            log "OCR连续${n}次确认无弹窗, 已杀僵尸UNC解锁前台(等激活微信+回车)"
+        fi
+    fi
+    return 0
 }
 
 # ⚠️ 教训(2026-09-27 重启实测): wxid_* 目录可见 ≠ 已登录 — 会话恢复启动时目录从
@@ -308,11 +342,19 @@ if [ -z "$(wx_pid)" ]; then
                     fi
                     if [ "$ALLOW_BUDGET" -gt 0 ]; then
                         # 每次点击前现截现认: 第二个弹窗几何可能与第一个不同(加高
-                        # 变体), OCR 每轮拿最新坐标; 失败自动退固定坐标(仅dummy)
-                        ALLOW_BUDGET=$((ALLOW_BUDGET-1))
-                        if click_allow; then
+                        # 变体), OCR 每轮拿最新坐标。OCR 确认无弹窗(rc=2)不烧预算,
+                        # 只累计 MISS 连击(满3杀僵尸UNC); 其余情况才算一次点击尝试
+                        click_allow
+                        rc=$?
+                        if [ "$rc" = "0" ]; then
+                            ALLOW_BUDGET=$((ALLOW_BUDGET-1))
+                            note_ocr_miss 0
                             log "点允许完成 (轮$i, 余${ALLOW_BUDGET})"
                             sleep 2
+                        elif [ "$rc" = "2" ]; then
+                            note_ocr_miss 1
+                        else
+                            ALLOW_BUDGET=$((ALLOW_BUDGET-1))
                         fi
                     fi
                     ;;
@@ -418,8 +460,15 @@ if [ "$UPTIME" -lt 1500 ]; then
         if tcc_up; then
             if [ -n "$CLICCLICK" ]; then
                 # OCR 现场定位(2026-09-28): 开机窗口主屏常是内置 Retina, 固定坐标
-                # 失效的正是这个场景; click_allow 内部失败自动退固定坐标+dummy门禁
-                click_allow && log "开机兜底: TCC弹窗在屏(进程探测), 已点允许"
+                # 失效的正是这个场景; rc=2 是 OCR 确认无弹窗(僵尸UNC), 记连击满3杀之
+                click_allow
+                rc=$?
+                if [ "$rc" = "0" ]; then
+                    note_ocr_miss 0
+                    log "开机兜底: TCC弹窗在屏(进程探测), 已点允许"
+                elif [ "$rc" = "2" ]; then
+                    note_ocr_miss 1
+                fi
             fi
         else
             BID2="$(frontmost_bundle)"
