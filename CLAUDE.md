@@ -24,6 +24,12 @@ WeChat macOS reverse engineering project. Hooks WeChat's underlying message send
 - `wechat_version/` - Memory address configs for different WeChat versions (JSON)
 - `frida-gadget/` - Alternative approach for systems without SIP disabled
 - `hook/` - Additional hook scripts
+- `watchdog/` - 看门狗（权威副本在本仓库，生产运行在 mac-m1 `~/Prog/wxgate/`）:
+  - `wechat-watchdog.sh` - 微信 bot 全链路看门狗（LaunchAgent `com.user.wechat_watchdog` 30s 一轮）
+  - `ocr_allow.py` - TCC 弹窗「允许」按钮 OCR 定位（rapidocr/mumble venv），2026-09-28 起为点允许主路径
+  - `ocr_selftest.sh` - 链路自检（launchd 上下文跑，只截屏+定位不点击）
+
+**watchdog 改动部署流程**（改仓库版 → 部署 mac-m1）：远端先 `cp` 出 `.bak.日期` 备份，`bash -n` 过后 `mv` 原子替换（不打断正在跑的实例），`wechat-watchdog.sh` + `ocr_allow.py` 两件套一起放 `~/Prog/wxgate/`，md5 与仓库版核对。clicclick 只在 launchd 上下文有效，ssh 里测点击要借 `com.user.clicclick_test` LaunchAgent kickstart（其 /tmp runner 脚本会被定期清理，用前重建）。
 
 ## Common Commands
 
