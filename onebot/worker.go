@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/aes"
+	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -284,10 +285,20 @@ func SendWechatMsg(m *SendMsg) {
 			return
 		}
 
+		// 2026-10-06 原生校准: 桌面版原生语音上传抓包(UPSTRUCTDBG tag=native)证实
+		// 4.1.13 语音走内存缓冲式(0x100=ptr/0x108=len/0x110=cap), 与老模板同构;
+		// 之前的文件式实验作废。三处关键修正: fileId 用 alita_1_<silkmd5>_15_0_<seq>
+		// 格式(CDN分块账本按它索引, 老的 receiver_ts_rand_1 导致大文件续块丢失),
+		// 0x7F=receiver字节长度(动态), payload 延伸到 0x1C0([0x1BC]=01)。
+		// [2026-10-06 破案] 原生 alita id 的 32hex = md5(发送者自己的wxid) —
+		// 三次原生录音恒为 f92061633bba739436923586fa31402b == md5(wxid_4erh8rirquu921),
+		// CDN 按它归属上传账号; 之前误用 silk 内容 md5(每次都变) → CDN 视为陌生
+		// 会话, 首包放行后续块全丢(1.5KB 截断的根因)
+		selfIdMd5 := fmt.Sprintf("%x", md5.Sum([]byte(myWechatId)))
 		audioHex := hex.EncodeToString(silkData)
 
 		uploadPayloadHex := BuildVoiceUploadPayload()
-		result, err := safeExportsCall(callCtx, "triggerUploadVoice", targetId, targetPath, uploadPayloadHex, audioHex, voiceDurationMs)
+		result, err := safeExportsCall(callCtx, "triggerUploadVoice", targetId, targetPath, uploadPayloadHex, audioHex, voiceDurationMs, selfIdMd5)
 		if err != nil {
 			Error("上传语音中止", "target_id", targetId, "err", err)
 			sendErr = err

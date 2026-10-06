@@ -149,6 +149,7 @@ function initAddresses() {
     setImmediate(attachReq2buf);
     setImmediate(setupSendImgMessageDynamic);
     setImmediate(attachUploadMedia);
+    setImmediate(attachUploadStructDbg);
     setImmediate(patchCdnOnComplete);
     setImmediate(attachGetCallbackFromWrapper);
     setImmediate(setupSendReplyMessageDynamic);
@@ -452,6 +453,7 @@ var voicePathAddr1 = ptr(0);
 var voiceProtoHexGlobal = "";
 var voiceDurationGlobal = 0;
 var voiceSilkDataLenGlobal = 0;
+var voiceUploadSeq = 0; // [2026-10-06] alita fileId 尾部序号(原生为递增计数器)
 var voiceAudioDataAddr = ptr(0);
 
 
@@ -1671,7 +1673,7 @@ function triggerUploadVideo(receiver, md5, videoPath, payloadHex) {
     return fillUploadX1AndStart(videoIdAddr, videoPathAddr1, uploadVideoX1, receiver, md5, videoPath, payloadHex);
 }
 
-function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durationMs) {
+function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durationMs, silkMd5) {
     if (uploadGlobalX0.equals(ptr(0))) {
         ensureCdnManagerX0();
     }
@@ -1689,7 +1691,11 @@ function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durat
     voiceSilkDataLenGlobal = audioLen;
     voiceAudioDataAddr.writeByteArray(audioBytes);
 
-    const voiceIdStr = receiver + "_" + String(Math.floor(Date.now() / 1000)) + "_" + Math.floor(Math.random() * 1001) + "_1";
+    // [2026-10-06 破案] 原生三份录音(2s/13s/19s)的 alita id 32hex 恒为
+    // md5(发送者wxid) — CDN 按它归属上传账号; silkMd5 参数实为 selfIdMd5。
+    // 序号原生为递增计数器(619/620/621), 用会话内递增计数器模拟。
+    voiceUploadSeq = (voiceUploadSeq || 0) + 1;
+    const voiceIdStr = "alita_1_" + silkMd5 + "_15_0_" + voiceUploadSeq;
     patchString(voiceIdAddr, voiceIdStr);
     patchString(voicePathAddr1, voicePath);
 
@@ -1700,14 +1706,87 @@ function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durat
     uploadVoiceX1.add(0x50).writeU64(voiceIdStr.length);
     uploadVoiceX1.add(0x58).writeU64(uint64("0x8000000000000000").add(voiceIdStr.length + 1));
     uploadVoiceX1.add(0x68).writeUtf8String(receiver);
-    // 音频二进制数据: 0x100=指针, 0x108=长度, 0x110=容量(长度+1)|高位
+    uploadVoiceX1.add(0x7F).writeU8(receiver.length);
+    // 音频二进制数据: 0x100=指针, 0x108=长度, 0x110=容量(len取整16)|高位
     uploadVoiceX1.add(0x100).writePointer(voiceAudioDataAddr);
     uploadVoiceX1.add(0x108).writeU64(audioLen);
-    uploadVoiceX1.add(0x110).writeU64(uint64("0x8000000000000000").add(audioLen + 1));
+    uploadVoiceX1.add(0x110).writeU64(uint64("0x8000000000000000").add(Math.ceil(audioLen / 16) * 16));
 
     const startUploadMedia = new NativeFunction(uploadImageAddr, 'int64', ['pointer', 'pointer']);
 
-    return startUploadMedia(uploadGlobalX0, uploadVoiceX1);
+    voiceUploadSelfTest = true;
+    try {
+        return startUploadMedia(uploadGlobalX0, uploadVoiceX1);
+    } finally {
+        voiceUploadSelfTest = false;
+    }
+}
+
+// [2026-10-06] 文件路径式语音上传(实验): 与 img/video 共用同一套路径槽填充
+// (0xe8/0x118/0x148=silk路径, 0xa8=md5, 0x200=aes), payload 模板用 Go 侧
+// BuildUploadPayload("voice")(0x9C=0x0F, 0x1BC=07)。4.1.13 内存缓冲注入疑似
+// 布局漂移(语音1s/无声), img/video 的文件式链路是好的, 故改走文件式验证。
+function triggerUploadVoiceFile(receiver, silkPath, md5hex, payloadHex, durationMs, silkLen) {
+    voiceDurationGlobal = durationMs;
+    voiceSilkDataLenGlobal = silkLen;
+    // [2026-10-06 实验H已废] img类型伪装上传被接收端完全拒绝(CDN key按类型隔离),
+    // 且原生dump证实语音本就是内存缓冲式。此函数保留仅供对照, 不再被调用。
+    voiceUploadSelfTest = true;
+    try {
+        return fillUploadX1AndStart(voiceIdAddr, voicePathAddr1, uploadVoiceX1, receiver, md5hex, silkPath, payloadHex);
+    } finally {
+        voiceUploadSelfTest = false;
+    }
+}
+
+// [UPSTRUCTDBG 2026-10-06] 语音上传结构 4.1.13 校准: dump 上传入口 x1 任务结构。
+// 背景: 语音内存缓冲注入(0x100/0x108/0x110 槽)是 4.1.10 逆向的, 4.1.13 疑似布局漂移
+// (同一 silk 两次发送分别出现"放1s"/"无声", 野指针特征)。img/video 走文件路径式是好的。
+// 本 hook 在上传入口 dump 任务结构, 我们注入的(tag=ours)与原生 UI 发的(tag=native)都抓,
+// 拿到原生语音上传结构后对比校准偏移。只读不改行为。
+var voiceUploadSelfTest = false;
+var upStructDumpCount = {};
+function dumpUploadStruct(x1, kind) {
+    try {
+        var tag = voiceUploadSelfTest ? "ours" : "native";
+        var out = [];
+        for (var off = 0x00; off < 0x2A0; off += 8) {
+            var raw = "";
+            try {
+                var arr = new Uint8Array(x1.add(off).readByteArray(8));
+                for (var i = 0; i < arr.length; i++) { var t = arr[i].toString(16); raw += (t.length < 2 ? "0" + t : t); }
+            } catch (e0) {}
+            var note = "";
+            try {
+                var p = x1.add(off).readPointer();
+                if (!p.isNull() && isReadablePointer(p)) {
+                    try { var s = p.readUtf8String(); if (s && s.length > 0 && s.length < 200) note = " ->str:" + s; } catch (e1) {}
+                }
+            } catch (e2) {}
+            if (note === "") {
+                try { var s2 = x1.add(off).readUtf8String(); if (s2 && s2.length > 2 && s2.length < 200) note = " inline:" + s2; } catch (e3) {}
+            }
+            if (raw !== "") out.push("+0x" + off.toString(16) + ": " + raw + note);
+        }
+        console.log("[UPSTRUCTDBG] tag=" + tag + " kind=" + kind + "\n" + out.join("\n"));
+    } catch (e) { console.error("[UPSTRUCTDBG] err: " + e); }
+}
+function attachUploadStructDbg() {
+    Interceptor.attach(uploadImageAddr, {
+        onEnter: function (args) {
+            try {
+                var x1 = args[1];
+                var t = x1.add(0x9C).readU8();
+                var kind = (t === 0x0F) ? "voice" : (t === 0x01) ? "img" : (t === 0x04) ? "video" : "other";
+                var limit = (kind === "voice") ? 6 : 1;
+                upStructDumpCount[kind] = upStructDumpCount[kind] || 0;
+                if (upStructDumpCount[kind] < limit) {
+                    upStructDumpCount[kind]++;
+                    dumpUploadStruct(x1, kind);
+                }
+            } catch (e) {}
+        }
+    });
 }
 
 function attachUploadMedia() {
@@ -1793,11 +1872,40 @@ function v3LocateCndOffsets(x2, expected) {
     var aes = v3ReadStr(x2, cand.aes);
     var md5 = v3ReadStr(x2, cand.md5);
     var hexish = function (t) { return t && /^[0-9a-f]{16,64}$/.test(t); };
-    var ok = tgt === receiver && cdn && cdn.length >= 8 && hexish(aes) && hexish(md5);
+    // [2026-10-06] alita语音id(alita_1_<md5>_15_0_<seq>)不含receiver, 上面的
+    // 后缀剥离正则推不出receiver — 语音任务改只验证target槽非空, 其余校验不变
+    var alitaVoice = /^alita_1_[0-9a-f]{32}_15_0_\d+$/.test(matchedFid);
+    var ok = (alitaVoice ? (tgt && tgt.length > 0) : tgt === receiver) && cdn && cdn.length >= 8 && hexish(aes) && hexish(md5);
     console.log((ok ? "[+] cnd定位成功(全槽验证通过): " : "[!] cnd定位验证失败: ") +
         "delta=0x" + delta.toString(16) + " target=" + tgt + " cdn=" + cdn + " aes=" + aes + " md5=" + md5);
     return ok ? cand : null;
 }
+// [VOICEDUMP 诊断 2026-10-06] 语音接收方静音排障: dump CDN 完成结构原始内容,
+// 对比 img(钥匙可用)与 voice(疑似读错槽)的布局差异。限次防刷屏, 只读不影响行为。
+var cndDumpCount = {};
+function dumpCompleteStruct(x2, kind) {
+    try {
+        var out = [];
+        for (var off = 0x00; off < 0x2A0; off += 8) {
+            var raw = "";
+            try {
+                var arr = new Uint8Array(x2.add(off).readByteArray(8));
+                for (var i = 0; i < arr.length; i++) {
+                    var t = arr[i].toString(16);
+                    raw += (t.length < 2 ? "0" + t : t);
+                }
+            } catch (e0) {}
+            var s = v3ReadStr(x2, off);
+            if (raw !== "" || (s && s.length > 0)) {
+                out.push("+0x" + off.toString(16) + ": " + raw + (s && s.length > 0 ? "  str=" + s : ""));
+            }
+        }
+        console.log("[VOICEDUMP] kind=" + kind + " slots=" + out.length + "\n" + out.join("\n"));
+    } catch (e) {
+        console.error("[VOICEDUMP] err: " + e);
+    }
+}
+
 function cndOnCompleteV3(x2) {
     const imageFileId = imageIdAddr.readUtf8String();
     const videoFileId = videoIdAddr.readUtf8String();
@@ -1810,11 +1918,24 @@ function cndOnCompleteV3(x2) {
     if (fileUploadFileId && fileUploadFileId !== "file_upload_not_init") expected[fileUploadFileId] = "fileUpload";
     if (v3CndOff === null) {
         v3CndOff = v3LocateCndOffsets(x2, expected);
+        if (!v3CndOff) {
+            // [VOICEDBG 2026-10-06] 定位失败也dump(限2次): 0x1D8/0x1E0 标志改变了
+            // 完成结构布局, 需要观察新的 aes/md5 槽位
+            if ((cndDumpCount.locatefail = (cndDumpCount.locatefail || 0) + 1) <= 2) {
+                dumpCompleteStruct(x2, "locate-fail");
+            }
+            return;
+        }
     }
     if (!v3CndOff) return;
     const currentFileId = v3ReadStr(x2, v3CndOff.fileId);
     var kind = expected[currentFileId];
     if (!kind) return; // 非我们发起的 CDN 任务
+    // [VOICEDUMP] voice 每次都 dump(<=3), img 首次做校准参照
+    if ((kind === "voice" && (cndDumpCount.voice = (cndDumpCount.voice || 0) + 1) <= 3) ||
+        (kind === "img" && (cndDumpCount.img = (cndDumpCount.img || 0) + 1) <= 1)) {
+        dumpCompleteStruct(x2, kind);
+    }
     const cdnKey = v3ReadStr(x2, v3CndOff.cdn);
     const aesKey = v3ReadStr(x2, v3CndOff.aes);
     const md5Key = v3ReadStr(x2, v3CndOff.md5);
@@ -2058,6 +2179,7 @@ rpc.exports = {
     triggerSendVideoMessage: triggerSendVideoMessage,
     triggerSendReplyMessage: triggerSendReplyMessage,
     triggerUploadVoice: triggerUploadVoice,
+    triggerUploadVoiceFile: triggerUploadVoiceFile,
     triggerSendVoiceMessage: triggerSendVoiceMessage,
     triggerSendFileMessage: triggerSendFileMessage,
     triggerSendFileUploadMessage: triggerSendFileUploadMessage,

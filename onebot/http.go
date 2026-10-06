@@ -172,6 +172,53 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// downloadCdnHandler 排障用：按 cdnKey+aesKey 把 CDN 对象下载回本地文件。
+// POST /download_cdn {"cdn_url":"...","aes_key":"...","file_path":"/abs/path","file_type":2}
+// 下载是异步的：返回 ok 仅表示任务已触发，文件稍后落盘，调用方自行轮询。
+func downloadCdnHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "仅支持 POST", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		CdnUrl   string `json:"cdn_url"`
+		AesKey   string `json:"aes_key"`
+		FilePath string `json:"file_path"`
+		FileType int    `json:"file_type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "无效的 JSON", http.StatusBadRequest)
+		return
+	}
+	if req.CdnUrl == "" || req.AesKey == "" || req.FilePath == "" {
+		http.Error(w, "参数缺失", http.StatusBadRequest)
+		return
+	}
+	ch := make(chan error, 1)
+	msgChan <- &SendMsg{
+		UserId:     "dbg",
+		Type:       "download",
+		FIleCdnUrl: req.CdnUrl,
+		AesKey:     req.AesKey,
+		FilePath:   req.FilePath,
+		FileType:   req.FileType,
+		ResultChan: ch,
+	}
+	select {
+	case err := <-ch:
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"status": "failed", "error": err.Error()})
+			return
+		}
+	case <-time.After(91 * time.Second):
+		w.WriteHeader(http.StatusGatewayTimeout)
+		json.NewEncoder(w).Encode(map[string]any{"status": "failed", "error": "download timeout"})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+}
+
 func SendHttpReq(jsonData []byte) {
 	defer func() {
 		if r := recover(); r != nil {

@@ -32,6 +32,7 @@ func main() {
 
 	http.HandleFunc("/send_private_msg", sendHandler)
 	http.HandleFunc("/send_group_msg", sendHandler)
+	http.HandleFunc("/download_cdn", downloadCdnHandler)
 
 	http.HandleFunc("/ws", handleWebSocket)
 	http.HandleFunc("/test_ws", testWebSocket)
