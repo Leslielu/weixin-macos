@@ -15,6 +15,8 @@ var rigProbe = null;          // {T, CB, vtable, ringPtr, headPtr, cm}
 var rigRingTail = 0;
 var rigProbeHistory = [];     // 历史探针保活(引擎异步完成链可能仍持引用, 释放=UAF)
 var rigProbeCount = 0;
+var rigProbeP2 = null;        // 嵌套队列保活引用(严格模式须先声明)
+var rigProbeP3 = null;
 var rigRingTimer = null;
 
 function rigLog(s) {
@@ -276,18 +278,29 @@ function rigBuildProbe() {
     // 回到第五轮形态: 旧路同步上传完成 → completion 直发(2-5s)跑赢泵崩溃(~18s 后)。
     // [T+0x188] 保持全零(0x400 分配区内), 泵 0x248aaac 保留原生实现。
     CB.add(0x20).writePointer(T);
-    // [2026-10-07 泵契约镜像] [T+0x188] 空队列 P: 合法互斥量×2 + 空链表。
-    // 生产实证 worker 泵会抓本任务(rig 不抓 = 无并发 CDN 流量), 空指针锁 = SEGV。
+    // [2026-10-07 泵契约镜像] 三阶段泵拓扑, 与 script.js 同构:
+    //   阶段1 [T+0x188]=P / 阶段2 [P+0x28]=P2 (wrapper=P+0x20) / 阶段3 [P+0x118]=P3。
+    //   每队列: +0x00 mutex, +0x40 recursive, +0x80=0 空。
     var P = null;
     rigStep("P", function () {
-        P = Memory.alloc(0x100);
-        rigZero(P, 0x100);
-        rigPthreadInit(P, false);
-        rigPthreadInit(P.add(0x40), true);
+        P = Memory.alloc(0x200);
+        rigZero(P, 0x200);
+        var P2 = Memory.alloc(0x100);
+        rigZero(P2, 0x100);
+        var P3 = Memory.alloc(0x100);
+        rigZero(P3, 0x100);
+        [P, P2, P3].forEach(function (q) {
+            rigPthreadInit(q, false);
+            rigPthreadInit(q.add(0x40), true);
+        });
+        P.add(0x28).writePointer(P2);
+        P.add(0x118).writePointer(P3);
         T.add(0x188).writePointer(P);
+        rigProbeP2 = P2; rigProbeP3 = P3;   // 保活引用
     });
     rigProbeHistory.push(rigProbe);            // 旧探针保活(引擎可能仍持引用)
-    rigProbe = { T: T, CB: CB, cm: cm, ringPtr: ringPtr, headPtr: headPtr, Treal: Treal, P: P };
+    rigProbe = { T: T, CB: CB, cm: cm, ringPtr: ringPtr, headPtr: headPtr, Treal: Treal,
+        P: P, P2: rigProbeP2, P3: rigProbeP3 }; // P2/P3 随探针保活(Memory.alloc 无 JS 引用会被回收)
     rigRingTail = 0;                           // 新探针新 ring, 回读游标归零
     rigLog("probe built(#" + rigProbeCount + "): T=" + T + " CB=" + CB + " vtable=" + vtable +
         " vtable2=" + vtable2 + " ring=" + ringPtr);

@@ -1831,16 +1831,31 @@ function buildVoiceProbe() {
     headPtr.writeU64(0);
     T.add(0x40).writePointer(ringPtr);
     T.add(0x48).writePointer(headPtr);
-    // [2026-10-07 泵契约] 空 P: 两个合法递归互斥量 + 空链表(P+0x80=0) → 泵锁上后
-    // 出队读空表干净退出。[T+0x188] 不能再留全零: 生产 bot worker 热循环会抓到
-    // 本任务去锁 [P+0x40], 空指针锁 = 18:14:41 SIGSEGV(0x248ab0c←0x42a1d98)。
-    var P = Memory.alloc(0x100);
-    voiceZero(P, 0x100);
-    voicePthreadInit(P, false);            // P+0x00: 出队路径锁(0x62d11e4)
-    voicePthreadInit(P.add(0x40), true);   // P+0x40: 泵递归锁(0x6d963ac/.ips recursive_mutex 实证)
+    // [2026-10-07 泵契约] worker F 三阶段泵, 统一模式 wrapper={+8:队列指针}:
+    //   阶段1 wrapper=T+0x180 → 队列 [T+0x188]=P (F 头 0x42a1d94 直调)
+    //   阶段2 wrapper=P+0x20  → 队列 [P+0x28]   (0x42a3140→0x42a3254, 18:28 崩点)
+    //   阶段3 wrapper=P+0x110 → 队列 [P+0x118]  (0x42a20ec→0x248aaac)
+    // 队列形态: +0x00 mutex(出队 0x6d9658c), +0x40 recursive mutex(泵入口
+    // 0x6d963ac), +0x80=0 空链表(0x62d11e4 干净退出), +0x90 tick 槽留零。
+    // v3.4 教训: 互斥量必须是真 pthread init(sig 0x32AAABA7 族), 魔数=EINVAL。
+    var P = Memory.alloc(0x200);           // 容器: +0x20/+0x110 两个子 wrapper 槽
+    voiceZero(P, 0x200);
+    var P2 = Memory.alloc(0x100);
+    voiceZero(P2, 0x100);
+    var P3 = Memory.alloc(0x100);
+    voiceZero(P3, 0x100);
+    voicePthreadInit(P, false);
+    voicePthreadInit(P.add(0x40), true);
+    voicePthreadInit(P2, false);
+    voicePthreadInit(P2.add(0x40), true);
+    voicePthreadInit(P3, false);
+    voicePthreadInit(P3.add(0x40), true);
+    P.add(0x28).writePointer(P2);          // 阶段2 队列
+    P.add(0x118).writePointer(P3);         // 阶段3 队列
     T.add(0x188).writePointer(P);
     CB.add(0x20).writePointer(T);      // CB 的 T* 槽
-    var probe = { T: T, CB: CB, Treal: Treal, ring: ringPtr, head: headPtr, cm: cm, P: P };
+    var probe = { T: T, CB: CB, Treal: Treal, ring: ringPtr, head: headPtr, cm: cm,
+        P: P, P2: P2, P3: P3 }; // P2/P3 随探针保活(Memory.alloc 无 JS 引用会被 GC 回收→生产悬空雷)
     voiceProbes.push(probe);
     voiceProbe = probe;
     console.log("[+] voice probe built(#" + voiceProbes.length + "): T=" + T + " CB=" + CB +
