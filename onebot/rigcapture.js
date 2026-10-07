@@ -105,7 +105,7 @@ function rigArmBinderHook() {
                 // v3.3: 全量 T(0x3F8) + 数据队列 P([T+0x190] 指向对象 0x100)
                 try {
                     console.log("[RIGCAP3] T-full[0x3F8]=" + rigHex(f1, 0x3F8));
-                    var P = f1.add(0x190).readPointer();
+                    var P = f1.add(0x188).readPointer();
                     if (!P.isNull()) console.log("[RIGCAP3] P=" + P + " P[0x100]=" + rigHex(P, 0x100));
                 } catch (e5) {}
                 rigVoiceWindow = true;
@@ -199,6 +199,19 @@ function rigBuildProbe() {
     headPtr.writeU64(0);
     T.add(0x40).writePointer(ringPtr);
     T.add(0x48).writePointer(headPtr);
+    // v3.4: 数据队列 P(原生 [T+0x188] 指向; mars 标签同步对象 0x60 快照照抄)
+    // +0x00 MUTZ | +0x0c cursorA | +0x20 MUTZ | +0x30 -1 | +0x38 {0x9c1a267f,-2}
+    // +0x40 MUTX(0x6d963ac 锁/校验对象) | +0x54 cursorB | +0x58 MUTX
+    var P = Memory.alloc(0x100);
+    rigZero(P, 0x100);
+    P.writeU32(0x4d55545a);              // MUTZ @+0x00
+    P.add(0x20).writeU32(0x4d55545a);    // MUTZ @+0x20
+    P.add(0x30).writeU64(uint64("0xffffffffffffffff"));
+    P.add(0x38).writeU32(0x9c1a267f);
+    P.add(0x3c).writeU32(0xfffffffe);
+    P.add(0x40).writeU32(0x4d555458);    // MUTX @+0x40
+    P.add(0x58).writeU32(0x4d555458);    // MUTX @+0x58
+    T.add(0x188).writePointer(P);        // ★ 原生同位: [T+0x188] = P
     CB.add(0x20).writePointer(T);
     rigProbe = { T: T, CB: CB, cm: cm, ringPtr: ringPtr, headPtr: headPtr, Treal: Treal };
     rigLog("probe built: T=" + T + " CB=" + CB + " vtable=" + vtable + " ring=" + ringPtr);
@@ -283,6 +296,13 @@ function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durat
 
     // probe serve 参数 (engine 线程的 C stub 直接读)
     probe.T.add(0x50).writeU64(mode);
+    // v3.4: P 游标置全长 (泵的 have>=need 检查直接通过)
+    var probeP = probe.T.add(0x188).readPointer();
+    if (!probeP.isNull()) {
+        probeP.add(0x0c).writeU32(audioLen);
+        probeP.add(0x54).writeU32(audioLen);
+        rigLog("P cursors set to " + audioLen + " @ " + probeP);
+    }
     probe.T.add(0x58).writePointer(voiceAudioDataAddr);
     probe.T.add(0x60).writeU64(audioLen);
     probe.T.add(0x68).writeU64(0);
