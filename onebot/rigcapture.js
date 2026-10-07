@@ -4,6 +4,7 @@
 // v3 新增: CModule probe 数据源对象(环形日志, 零 C 全局写) + triggerUploadVoice 接管
 // (worker.go 已改为传 silk hex 的内存式签名)。会话内参数控制走 /tmp/rig_probe_cmd.json
 // (JS 每次发送前读, {mode:N}); shell 改文件即可换模式, 无需重载脚本。
+// v3.8 路径A: 假 P + 泵 no-op 移除, 跑赢竞态(见 docs/VOICE-BATTLE-STATUS.md §7)。
 // 铁律: 引擎 mmap 闭包池只读不 hook (v1 SIGBUS 教训); 一切 native 回调 = CModule (铁律4)。
 
 var rigVoiceWindow = false;
@@ -215,28 +216,11 @@ function rigBuildProbe() {
         T.add(0x40).writePointer(ringPtr);
         T.add(0x48).writePointer(headPtr);
     });
-    rigStep("P", function () {
-    // v3.4: 数据队列 P(原生 [T+0x188] 指向; mars 标签同步对象 0x60 快照照抄)
-    // +0x00 MUTZ | +0x0c cursorA | +0x20 MUTZ | +0x30 -1 | +0x38 {0x9c1a267f,-2}
-    // +0x40 MUTX(0x6d963ac 锁/校验对象) | +0x54 cursorB | +0x58 MUTX
-    var P = Memory.alloc(0x100);
-    rigZero(P, 0x100);
-    P.writeU32(0x4d55545a);              // MUTZ @+0x00
-    P.add(0x20).writeU32(0x4d55545a);    // MUTZ @+0x20
-    P.add(0x30).writeU64(uint64("0xffffffffffffffff"));
-    P.add(0x38).writeU32(0x9c1a267f);
-    P.add(0x3c).writeU32(0xfffffffe);
-    P.add(0x40).writeU32(0x4d555458);    // MUTX @+0x40
-    P.add(0x58).writeU32(0x4d555458);    // MUTX @+0x58
-    T.add(0x188).writePointer(P);        // ★ 原生同位: [T+0x188] = P
-    });
+    // v3.8 路径A「跑赢竞态」: 假 P(v3.4) 与泵 no-op(v3.7) 已移除 —
+    // v3.7 泵 no-op 生效但崩点转移进 gadget 内部(替换蹦床/回调链新问题);
+    // 回到第五轮形态: 旧路同步上传完成 → completion 直发(2-5s)跑赢泵崩溃(~18s 后)。
+    // [T+0x188] 保持全零(0x400 分配区内), 泵 0x248aaac 保留原生实现。
     CB.add(0x20).writePointer(T);
-    // v3.7: force-legacy 时泵 no-op(旧路上传在调用线程同步完成, 泵是死重且等不到数据必炸)
-    if (rigForceLegacy && !rigPumpNopDone) {
-        Interceptor.replace(baseAddr.add(0x248aaac), cm.pump_nop);
-        rigPumpNopDone = true;
-        rigLog("pump 0x248aaac replaced with no-op (forceLegacy)");
-    }
     rigProbe = { T: T, CB: CB, cm: cm, ringPtr: ringPtr, headPtr: headPtr, Treal: Treal };
     rigLog("probe built: T=" + T + " CB=" + CB + " vtable=" + vtable + " ring=" + ringPtr);
     return rigProbe;
@@ -302,7 +286,7 @@ function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durat
     patchString(voiceIdAddr, voiceIdStr);
 
     uploadVoiceX1.writeByteArray(payload);
-    // ★ 回调对选择: forceLegacy=true(实验) → 假 T/CB + 泵 no-op + legacy 完成直发;
+    // ★ 回调对选择: forceLegacy=true(实验) → 假 T/CB + legacy 完成直发(v3.8: 泵保留原生);
     //   false(默认/日常) → 空回调对 = 昨天的稳定绿泡泡路径(引擎自降级 3600B, 从不崩)
     if (cmd.forceLegacy) {
         uploadVoiceX1.writePointer(probe.T);
@@ -326,13 +310,6 @@ function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durat
 
     // probe serve 参数 (engine 线程的 C stub 直接读)
     probe.T.add(0x50).writeU64(mode);
-    // v3.4: P 游标置全长 (泵的 have>=need 检查直接通过)
-    var probeP = probe.T.add(0x188).readPointer();
-    if (!probeP.isNull()) {
-        probeP.add(0x0c).writeU32(audioLen);
-        probeP.add(0x54).writeU32(audioLen);
-        rigLog("P cursors set to " + audioLen + " @ " + probeP);
-    }
     probe.T.add(0x58).writePointer(voiceAudioDataAddr);
     probe.T.add(0x60).writeU64(audioLen);
     probe.T.add(0x68).writeU64(0);
@@ -436,7 +413,6 @@ function rigArmForceLegacy() {
 // 未命中（fidOff<0，原因未明），这里叠加第二 hook 按固定布局直读直发。
 // 门: fileId 精确等于 voiceIdAddr 当前内容 + alita 格式 + 每 id 只发一次。
 var rigLegacyFired = "";
-var rigPumpNopDone = false;
 var rigLegacyHookArmed = false;
 
 function rigArmLegacyCompletion() {
