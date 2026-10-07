@@ -3,13 +3,14 @@
 > **本文是战役唯一入口文档。** 历史逐轮记录见
 > `docs/voice-upload-investigation-2026-10-06.md`（第一~六轮全程实验、崩溃报告、教训）。
 > 本文件回答："现在到哪一步了、下一步做什么、所有地址/文件/命令在哪"。
-> 更新于 2026-10-07 晚。
+> 更新于 2026-10-07 晚（第八轮：rig 环境全链路胜利）。
 
 ## 0. 一句话状态
 
 **目标**：OneBot 发语音 >3600B（≈1.5s）不再截断，接收端完整播放。
-**当前**：上传协议已贯通（force-legacy 旧路 CGI 上传 result=0 + 钥匙全返回），
-剩余 = 一个尚未验证的会话（v3.7 全栈就绪未跑）+ 两个待确认项。
+**当前**：✅ **rig 环境全链路打通（2026-10-07 16:10，v3.8 路径A）**——
+19438B/10s 语音经旧路 CGI 直传，接收端（手机 filehelper）**完整播放**，
+微信零崩溃、泵零调用。剩余 = 生产移植（§4 落地清单）。
 **保底**：生产 mac-m1 走 record→file 降级，全程未受影响。
 
 ## 1. 机制全景（全部实证，本地/生产同址）
@@ -140,11 +141,11 @@ A/B（未启用）；forceLegacy 控制泵 no-op 与 TryMultiphase 强制。
 
 ## 5. 待解清单（按优先级）
 
-1. **v3.7 会话未跑**——全栈第一验证（泵 no-op 是否让链路完整走通）
-2. 对象完整性：completion +0x110=10377 ≠ silk 19448，字段语义未定；播放是终极验证
-3. v3 locator 锚扫描为何在 legacy 完成结构上未命中（不阻塞——已用固定布局绕过）
-4. P 游标/字段语义精确定义（若泵 no-op 引入回归则必须回头做）
-5. img/video 回归：泵 no-op 对路径类媒体是否无副作用（生产部署前必测）
+~~1. v3.7 会话未跑~~ → **第八轮 v3.8 全链路胜利（见 §8）**
+~~2. 对象完整性：+0x110=10377 ≠ silk 19448，播放是终极验证~~ → **手机完整播放 10s，终极验证通过**
+~~3. v3 locator 锚扫描为何在 legacy 完成结构上未命中~~ → **干净状态（无假P/无泵干扰）下直接命中 delta=0x8**
+~~4. P 游标/字段语义精确定义~~ → **不需要：旧路任务根本不启动 worker 泵，假 P 整条线撤销**
+5. img/video 回归：force-legacy 只对 0x9C==0x0F 生效，理论上零影响（生产部署时顺手回归）
 
 ## 6. 铁律速查（战役专属，通用铁律见 AGENTS.md / 调查文档）
 
@@ -185,3 +186,38 @@ A/B（未启用）；forceLegacy 控制泵 no-op 与 TryMultiphase 强制。
 - P+0x40 的 MUTX 标签在原生任务下锁定成功、在假 P 下抛 system_error，
   二者字节相同 → 差异不在标签，在其后段读取的队列状态字段（空列表/游标）。
 - 0x6d963ac 真身 = GOT 0x9696638（auth-fixup 编码，未解码）→ libc++ throw 族。
+
+## 8. 2026-10-07 16:10 第八轮：v3.8 路径A — 全链路胜利 🏁
+
+**改动**（`onebot/rigcapture.js` v3.8）：删三处——假 P 构造（v3.4）、泵 no-op replace
+（v3.7）、发送时 P 游标写入。假 T 保持 v3.6 形态（0x400 全零），泵 0x248aaac 保留
+原生实现只 attach 观察。force-legacy + LEGACY handler 观察点 + completion 直发全保留。
+
+**实测时序（ludaohe → filehelper，19438B silk / 10s）**：
+
+| 时刻 | 事件 |
+|---|---|
+| 16:10:34 | triggerUploadVoice → bp 全 ok（无 P 段）→ LEGACY handler 0x58c3b44 entered |
+| 16:10:36 | `startUploadMedia rv=0`（旧路同步 CGI 直传完成）；引擎经假 T vtable 调 GetCallbackWrapper（freshT=引擎重建）正常 |
+| 16:10:36 | **script.js 原有 v3 locator 命中**：`cnd定位成功(全槽验证通过) delta=0x8`，cdn(202hex)/aes/md5 全返回 |
+| 16:10:36 | Go `混合式语音上传结果 duration_ms=10000 result=0` |
+| 16:10:37 | Go `send_voice 发送语音任务执行结果 result=1` |
+| 之后 | **手机 filehelper 收到语音，完整播放 10s**（用户确认）；微信存活零崩溃，发送后 80s+ 无 .ips |
+
+**三个推翻旧假设的发现**：
+
+1. **回钥匙的是 script.js 原有 v3 locator，不是 rigcapture 的 completion 直发**
+   （`upload_voice_finish` 0 次触发，locator 直接命中 delta=0x8）。
+   第五轮时代 locator 不命中 = 假 P / 泵 no-op 干扰所致；干净状态下旧路完成结构
+   与 c2c 同族，locator 全槽验证直接过。→ completion 直发（v3.2）可整段删除。
+2. **旧路（同步 CGI 直传）根本不启动 worker 泵**——泵对假 T 与引擎重建 freshT
+   均 0 次调用（sync trace 证实）。第五轮"~18s 后泵炸"是 v3.4 假 P / 0x80 假 T
+   时代畸形状态的产物，v3.6+v3.8 形态下不存在。→ 路径 B（静态啃泵）永久关闭。
+3. **全链 <2s 完成**（34→36→37s 三跳全在同一秒级内），无竞态窗口可言。
+
+**生产移植面（比预想小得多）**：rig 链路复用了 script.js 全部既有组件
+（locator 抓钥匙、Go 混合式两段任务、CdnManager 互回填），需要移植的只有：
+- rigcapture 的 **force-legacy hook**（TryMultiphase onLeave retval.replace(0)，约 20 行）
+- **假 T/CB/vtable CModule 对象**（0x400 假 T + 10 槽 vtable + ring，约 80 行）
+- **triggerUploadVoice 接管**（内存式签名 + task 字段组装，约 60 行）
+worker.go 内存式签名改动已在仓库。
