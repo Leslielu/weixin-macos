@@ -295,18 +295,27 @@ func SendWechatMsg(m *SendMsg) {
 		// CDN 按它归属上传账号; 之前误用 silk 内容 md5(每次都变) → CDN 视为陌生
 		// 会话, 首包放行后续块全丢(1.5KB 截断的根因)
 		selfIdMd5 := fmt.Sprintf("%x", md5.Sum([]byte(myWechatId)))
-		audioHex := hex.EncodeToString(silkData)
 
+		// [2026-10-06 混合式] 内存式回调上限 ~3600B(图片回调)/~1200B(原生回调)都
+		// 喂不饱伪造任务; 而图片式(路径槽+图片回调)任意大小畅通。组合: 语音类型
+		// 字节 + alita id + 全部原生校准字段 + 路径槽(0xe8/0x118/0x148)喂数据。
+		silkPath := targetPath + ".silk"
+		if werr := os.WriteFile(silkPath, silkData, 0666); werr != nil {
+			Error("写silk文件失败", "err", werr)
+			sendErr = werr
+			return
+		}
+		silkMd5 := fmt.Sprintf("%x", md5.Sum(silkData))
 		uploadPayloadHex := BuildVoiceUploadPayload()
-		result, err := safeExportsCall(callCtx, "triggerUploadVoice", targetId, targetPath, uploadPayloadHex, audioHex, voiceDurationMs, selfIdMd5)
+		result, err := safeExportsCall(callCtx, "triggerUploadVoiceFile2", targetId, silkPath, silkMd5, uploadPayloadHex, voiceDurationMs, int32(len(silkData)), selfIdMd5)
 		if err != nil {
-			Error("上传语音中止", "target_id", targetId, "err", err)
+			Error("混合式语音上传中止", "target_id", targetId, "err", err)
 			sendErr = err
 			return
 		}
-		Info("📩 上传语音任务执行结果", "result", result, "target_id", targetId, "path", targetPath, "silk_len", len(silkData), "duration_ms", voiceDurationMs)
+		Info("📩 混合式语音上传结果", "result", result, "target_id", targetId, "path", silkPath, "silk_len", len(silkData), "duration_ms", voiceDurationMs, "md5", silkMd5)
 		if result != "0" {
-			Error("上传语音失败", "target_id", targetId, "result", result)
+			Error("混合式语音上传失败", "target_id", targetId, "result", result)
 			sendErr = errors.New("upload voice failed")
 			return
 		}

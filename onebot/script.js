@@ -454,6 +454,10 @@ var voiceProtoHexGlobal = "";
 var voiceDurationGlobal = 0;
 var voiceSilkDataLenGlobal = 0;
 var voiceUploadSeq = 0; // [2026-10-06] alita fileId 尾部序号(原生为递增计数器)
+// [2026-10-06] 原生语音上传回调对(0x0/0x8 槽): 会话内恒定, 首次由原生录音刷新;
+// 下面的值来自 2026-10-06 微信会话(12:25 启动)的三份原生 dump, 微信重启后失效
+var voiceNativeFunc1Addr = ptr("0x819a75420");
+var voiceNativeFunc2Addr = ptr("0x819a75400");
 var voiceAudioDataAddr = ptr(0);
 
 
@@ -1700,13 +1704,22 @@ function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durat
     patchString(voicePathAddr1, voicePath);
 
     uploadVoiceX1.writeByteArray(payload);
-    uploadVoiceX1.writePointer(uploadFunc1Addr);
-    uploadVoiceX1.add(0x08).writePointer(uploadFunc2Addr);
+    // [2026-10-06 回调对实验] 原生语音的 0x0/0x8 恒为 0x819a75420/0x819a75400(会话内
+    // 稳定), 与图片的 uploadFunc1/2 不同 — 语音数据回调可能就是 3600B 截断的来源。
+    // 优先用原生回调(本会话硬编码 + 未来原生录音自动刷新), 回退图片回调。
+    uploadVoiceX1.writePointer(voiceNativeFunc1Addr || uploadFunc1Addr);
+    uploadVoiceX1.add(0x08).writePointer(voiceNativeFunc2Addr || uploadFunc2Addr);
     uploadVoiceX1.add(0x48).writePointer(voiceIdAddr);
     uploadVoiceX1.add(0x50).writeU64(voiceIdStr.length);
     uploadVoiceX1.add(0x58).writeU64(uint64("0x8000000000000000").add(voiceIdStr.length + 1));
     uploadVoiceX1.add(0x68).writeUtf8String(receiver);
     uploadVoiceX1.add(0x7F).writeU8(receiver.length);
+    // [2026-10-06 3600截断修复] 模板 0xD8=(3600,1800) 恒定值在我们路径里表现为
+    // 字节上限(全部测试精确截在~3600B≈1.5s; 原生同值但另有会话续传)。改为动态
+    // 写入实际 silk 长度(len, len/2 保持原生 2:1 比例)。
+    uploadVoiceX1.add(0xD8).writeU64(0);
+    uploadVoiceX1.add(0xD8).writeU32(audioLen);
+    uploadVoiceX1.add(0xDC).writeU32(Math.ceil(audioLen / 2));
     // 音频二进制数据: 0x100=指针, 0x108=长度, 0x110=容量(len取整16)|高位
     uploadVoiceX1.add(0x100).writePointer(voiceAudioDataAddr);
     uploadVoiceX1.add(0x108).writeU64(audioLen);
@@ -1726,17 +1739,61 @@ function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durat
 // (0xe8/0x118/0x148=silk路径, 0xa8=md5, 0x200=aes), payload 模板用 Go 侧
 // BuildUploadPayload("voice")(0x9C=0x0F, 0x1BC=07)。4.1.13 内存缓冲注入疑似
 // 布局漂移(语音1s/无声), img/video 的文件式链路是好的, 故改走文件式验证。
-function triggerUploadVoiceFile(receiver, silkPath, md5hex, payloadHex, durationMs, silkLen) {
+// [2026-10-06 混合式] 语音类型 + alita id + 原生校准模板 + 路径槽喂数据 + 图片回调。
+// 内存式两条回调路线上限 3600B/1200B(任务注册态缺失), 图片式路径数据源任意大小畅通。
+function triggerUploadVoiceFile2(receiver, silkPath, silkMd5hex, payloadHex, durationMs, silkLen, selfIdMd5) {
+    if (uploadGlobalX0.equals(ptr(0))) {
+        ensureCdnManagerX0();
+    }
+    if (uploadGlobalX0.equals(ptr(0))) {
+        console.error("[!] uploadGlobalX0 尚未初始化，请等待 hook 捕获");
+        return "fail";
+    }
     voiceDurationGlobal = durationMs;
     voiceSilkDataLenGlobal = silkLen;
-    // [2026-10-06 实验H已废] img类型伪装上传被接收端完全拒绝(CDN key按类型隔离),
-    // 且原生dump证实语音本就是内存缓冲式。此函数保留仅供对照, 不再被调用。
+    voiceUploadSeq = voiceUploadSeq + 1;
+    var voiceIdStr = "alita_1_" + selfIdMd5 + "_15_0_" + voiceUploadSeq;
+    patchString(voiceIdAddr, voiceIdStr);
+    patchString(voicePathAddr1, silkPath);
+
+    const payload = hexToByteArray(payloadHex);
+    uploadVoiceX1.writeByteArray(payload);
+    // 图片回调(路径数据源, 任意大小); 原生语音回调对已实测更短(1200B), 弃用
+    uploadVoiceX1.writePointer(uploadFunc1Addr);
+    uploadVoiceX1.add(0x08).writePointer(uploadFunc2Addr);
+    uploadVoiceX1.add(0x48).writePointer(voiceIdAddr);
+    uploadVoiceX1.add(0x50).writeU64(voiceIdStr.length);
+    uploadVoiceX1.add(0x58).writeU64(uint64("0x8000000000000000").add(voiceIdStr.length + 1));
+    uploadVoiceX1.add(0x68).writeUtf8String(receiver);
+    uploadVoiceX1.add(0x7F).writeU8(receiver.length);
+    // 路径槽三连(img 式喂数据核心) + 长度/容量
+    uploadVoiceX1.add(0xe8).writePointer(voicePathAddr1);
+    uploadVoiceX1.add(0xf0).writeU64(silkPath.length);
+    uploadVoiceX1.add(0xf8).writeU64(uint64("0x8000000000000000").add(silkPath.length + 1));
+    uploadVoiceX1.add(0x118).writePointer(voicePathAddr1);
+    uploadVoiceX1.add(0x120).writeU64(silkPath.length);
+    uploadVoiceX1.add(0x128).writeU64(uint64("0x8000000000000000").add(silkPath.length + 1));
+    uploadVoiceX1.add(0x148).writePointer(voicePathAddr1);
+    uploadVoiceX1.add(0x150).writeU64(silkPath.length);
+    uploadVoiceX1.add(0x158).writeU64(uint64("0x8000000000000000").add(silkPath.length + 1));
+    // 0xD8 写实际大小(3600 恒定值疑似上限语义)
+    uploadVoiceX1.add(0xD8).writeU32(silkLen);
+    uploadVoiceX1.add(0xDC).writeU32(Math.ceil(silkLen / 2));
+
+    const startUploadMedia = new NativeFunction(uploadImageAddr, 'int64', ['pointer', 'pointer']);
     voiceUploadSelfTest = true;
     try {
-        return fillUploadX1AndStart(voiceIdAddr, voicePathAddr1, uploadVoiceX1, receiver, md5hex, silkPath, payloadHex);
+        return startUploadMedia(uploadGlobalX0, uploadVoiceX1);
     } finally {
         voiceUploadSelfTest = false;
     }
+}
+
+function triggerUploadVoiceFile(receiver, silkPath, md5hex, payloadHex, durationMs, silkLen) {
+    // [2026-10-06] 旧文件式(img模板+receiver式id)已废弃, 保留签名供历史对照。
+    voiceDurationGlobal = durationMs;
+    voiceSilkDataLenGlobal = silkLen;
+    return "fail";
 }
 
 // [UPSTRUCTDBG 2026-10-06] 语音上传结构 4.1.13 校准: dump 上传入口 x1 任务结构。
@@ -1778,6 +1835,18 @@ function attachUploadStructDbg() {
                 var x1 = args[1];
                 var t = x1.add(0x9C).readU8();
                 var kind = (t === 0x0F) ? "voice" : (t === 0x01) ? "img" : (t === 0x04) ? "video" : "other";
+                if (kind === "voice" && !voiceUploadSelfTest) {
+                    // 原生语音上传: 刷新回调对 + 记录模块信息(微信重启后地址会变, 见此即自愈)
+                    var f1 = x1.add(0x0).readPointer();
+                    var f2 = x1.add(0x8).readPointer();
+                    if (!f1.isNull() && !f2.isNull()) {
+                        voiceNativeFunc1Addr = f1;
+                        voiceNativeFunc2Addr = f2;
+                        var m = Process.findModuleByAddress(f1);
+                        console.log("[+] 原生语音回调对已捕获: 0x" + f1 + " / 0x" + f2 +
+                            (m ? " module=" + m.name + " base=" + m.base : " (无模块,裸mmap)"));
+                    }
+                }
                 var limit = (kind === "voice") ? 6 : 1;
                 upStructDumpCount[kind] = upStructDumpCount[kind] || 0;
                 if (upStructDumpCount[kind] < limit) {
@@ -2180,6 +2249,7 @@ rpc.exports = {
     triggerSendReplyMessage: triggerSendReplyMessage,
     triggerUploadVoice: triggerUploadVoice,
     triggerUploadVoiceFile: triggerUploadVoiceFile,
+    triggerUploadVoiceFile2: triggerUploadVoiceFile2,
     triggerSendVoiceMessage: triggerSendVoiceMessage,
     triggerSendFileMessage: triggerSendFileMessage,
     triggerSendFileUploadMessage: triggerSendFileUploadMessage,

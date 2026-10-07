@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/md5"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -211,6 +212,12 @@ func ConvertToSilk(audioData []byte) ([]byte, int32, error) {
 	}
 
 	pcmBytes := out.Bytes()
+
+	// 2026-10-06 微型帧修复: 数字静音经 SILK 编码产生 11-12B 微型帧, 微信 CDN
+	// 语音层在这类帧处断流(接收端只放~0.5s/无声/转圈不死——所有含停顿内容全灭,
+	// 只有连续纯音幸存; 真人麦克风录音有底噪天然无微型帧)。混入 σ≈80(-52dBFS)
+	// 高斯白噪抬升最小帧到 ≥20B, 听感不可闻, 实测 180 帧全过 16B 线。
+	mixNoiseFloor(pcmBytes)
 	// 时长(ms) = pcm字节数 * 1000 / (采样率 * 通道数 * 每样本字节数)
 	durationMs := int32(int64(len(pcmBytes)) * 1000 / (16000 * 2))
 
@@ -225,6 +232,25 @@ func ConvertToSilk(audioData []byte) ([]byte, int32, error) {
 	}
 
 	return silkData, durationMs, nil
+}
+
+// mixNoiseFloor 就地向 PCM(s16le) 混入 -52dBFS 高斯白噪, 防止数字静音产生
+// 微型 silk 帧(微信 CDN 语音层断流根因, 见 ConvertToSilk 注释)。
+func mixNoiseFloor(pcm []byte) {
+	if len(pcm) < 2 {
+		return
+	}
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := 0; i+1 < len(pcm); i += 2 {
+		s := int16(binary.LittleEndian.Uint16(pcm[i : i+2]))
+		v := int32(s) + int32(rnd.NormFloat64()*80.0)
+		if v > 32767 {
+			v = 32767
+		} else if v < -32768 {
+			v = -32768
+		}
+		binary.LittleEndian.PutUint16(pcm[i:i+2], uint16(int16(v)))
+	}
 }
 
 // encodeSilkExternal 使用外部pilk(Python)工具编码pcm->silk(和微信兼容)
