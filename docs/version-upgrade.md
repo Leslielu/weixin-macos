@@ -152,7 +152,35 @@ trio 无任何静态引用)——回调在运行时注册进堆对象, IDA 静�
     合成 + 每次重编码改参数 = 可靠测试材料; 视频和图片一样走 SaveBase64Image,
     API 传 `base64://...`, `-image_path` 必须传(否则上传 -20003)。
 
-## 本地验证环境(4.1.12, 本机)
+## 语音上传路径依赖(2026-10-07 语音战役, 详见 docs/VOICE-BATTLE-STATUS.md)
+
+语音 >3600B 全量上传 = **force-legacy**: TryMultiphase onLeave 对语音任务
+(`task+0x9C==0x0F`) `retval.replace(0)`, 把引擎从 multiphase 流式路(依赖录音
+会话状态机, 合成任务复刻不出, 即 3600B 截断根因)拨回 **4.1.10 时代 uploadvoice
+CGI (cmdid 19) 短链直传**(自包含, 无会话依赖)。
+
+**新增地址键 = 仅 1 个**: `tryMultiphaseAddr` (4.1.13 = 0x574c0c4, appconfig.cc)。
+生产 script.js 应从 JSON 读此键(勿 hardcode); 缺键时语音自动降级, 不影响其它媒体。
+
+- 定位: 用 4.1.13 函数体签名匹配(判定树特征: `ldrb [task+0x9C]` 后跟常量
+  7/9/0x4EEA/0x4F4E 比较序列, +0x178 向量 26MB(0x1900000)上限, apptype load)。
+- 语义验证: hook 后发一条 >3600B 语音, 日志须见旧路 handler
+  (0x58c3b44 @4.1.13)进入 + `startUploadMedia rv=0` + locator `cnd定位成功`。
+- 其余地址全部复用现有键(cndOnCompleteAddr/uploadImageAddr/CdnManager 三件套)。
+  战役诊断地址(旧路三函数/0x248aaac 泵/0x31df8ac binder, 本地生产已验同址)
+  仅实验用, 不进生产, 升级无需定位。
+
+**⚠ 升级特有风险**: 旧路是遗留协议, 微信任何版本都可能真删(mars 路由表移除
+`<cgi reqid="19">uploadvoice</cgi>` 或服务端拒收)。升级后语音若失败,
+**第一查旧路是否被砍**(grep dylib 字符串 uploadvoice + 实测), 第二才是地址漂移。
+旧路死 = 回退 record→file 降级, 另开战役(multiphase 注册态复刻或移动端 senddata)。
+
+### 语音验收标准(验收期媒体链路追加)
+
+12. **语音必须用 >3600B 物料验收**(10s+ TTS, 参考 mac-m1 `~/Prog/wxgate/botmedia/`)。
+    只播前 ~1.5s = force-legacy 未生效(查 tryMultiphaseAddr); 完全无声/死转圈 =
+    任务结构问题。验收含: 三轮连发(seq 递增) + 手机端完整播放确认。
+    img/video 必须同批回归(force-legacy 只对 0x9C==0x0F 生效, 理论零影响须实证)。
 
 ```bash
 # onebot(gadget 模式, 用候选 JSON 试跑)
@@ -230,6 +258,15 @@ curl -X POST -H "Content-Type:application/json" \
   3 次 timed out 60s 均为假失败(60s<91s 链, ack 已命中)。两条新铁律: **hook 只挂不拆**(detach 蹦床竞态 23:07 崩,
   crash-history H 类) + **泵边界**(parked 线程不可见)。TLS 线程亲和未根因,
   正解 = UI→网络线程投递原语, 技术债见细档 §8.5。
+- **✅ 语音 >3600B 截断根治(2026-10-07, 两日战役)**: 根因 = multiphase 流式路
+  依赖录音会话状态机(合成任务复刻不出, 伪造任务只出 3600B); 解法 = force-legacy
+  hook 拨回 4.1.10 旧路 uploadvoice CGI 直传(新增 1 键 `tryMultiphaseAddr`,
+  见上文「语音上传路径依赖」节)。rig 三轮连发(19438B×2 + 26712B TTS 13.8s)
+  手机完整播放零崩溃。**完整战报+复盘见 docs/VOICE-BATTLE-STATUS.md**,
+  逐轮实验录见 docs/voice-upload-investigation-2026-10-06.md。
+  战役教训: ①卡住先找旁路(旧版实现/协议开关)再啃正路; ②伪造对象必须按
+  ground truth 尺寸(0x80 vs 0x3F8 制造两轮次生崩溃); ③JSON 地址落地必校验
+  函数序言(中段地址伪象浪费半天)。
 
 ## 维护约定
 
