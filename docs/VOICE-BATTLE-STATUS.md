@@ -195,6 +195,12 @@ A/B（未启用）；forceLegacy 控制泵 no-op 与 TryMultiphase 强制。
 
 **实测时序（ludaohe → filehelper，19438B silk / 10s）**：
 
+**可重复性验证（16:18 / 16:22 追加两轮）**：同物料重发 + 13.8s/26712B 真人 TTS
+（mac-m1 `~/Prog/wxgate/botmedia/58_1791292141.wav`，≈7.4× 截断阈值）三轮连发
+全部 result=1、手机完整播放、微信零崩溃；第三轮日志链更深一层：
+`SubmitCgi 原生线程提交 → V3 ack 命中 → buf2resp 响应成功 → 任务完成`
+（服务端受理回包确认）。seq 递增（1/2/3）无冲突。**结论：稳定可复现。**
+
 | 时刻 | 事件 |
 |---|---|
 | 16:10:34 | triggerUploadVoice → bp 全 ok（无 P 段）→ LEGACY handler 0x58c3b44 entered |
