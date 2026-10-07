@@ -320,3 +320,63 @@ onEnter dump this/+8/+10/+18。看门狗全链拉起后（约 16:55 稳定）再
 body 头 8 字节 = vptr（0x13d680f00 族=我们的桩表；0x99cbd00 族=原生表=引擎重建体）；
 [+18] 的值直接揭示垃圾来源。VOICERING 的 s200+ 段 = 引擎调过主虚表位桩。
 若 16 槽/主虚表桩破坏上传流（rig 里 keys 不返回）→ 回退项=仅保留#1（每发新建）。
+
+## 11. 2026-10-07 深夜：生产三轮试验 — 完成链崩已修，崩点推进至 worker 泵嵌套队列
+
+**v3.9 部署与验证（18:10-18:14）**：rsync script.js → pkill WeChat → 看门狗全链恢复
+（~2.5min）→ 本地 rig 先行一发回归通过（result=1、keys 全返回、零崩溃）。
+
+**18:14 生产崩（第二层进展）**：
+- **完成链 ldadd 崩确认修复**：GCW dispatch this=Treal 且 [+8]=我们 vtable、
+  [+10]=Treal 自引用、[+18]=我们 CB —— 与原生布局同构，canary 吸收 ldadd，
+  keys 照常返回。v3.9 每发新建探针起效（引擎原地重建/脏内存问题消失）。
+- **VOICERING head=0 全程**：引擎**从不经我们 vtable 槽调用**（它用 bind 时捕获的
+  原生函数指针直调，x0=我们的对象）→ 假 T 的字段内容才是决定性的，虚表内容几乎无关。
+- **崩点 = worker 泵复活**：`0x248ab0c ← 0x42a1d98 ← 0x62c9ee0`，
+  recursive_mutex::lock(0x40) SEGV —— [T+0x188]=null，accessor 0xdb84d8=P+0x40 字面加法。
+
+**泵契约反汇编全解（本轮最重要的静态成果）**：
+```
+0x248aaac(T+0x180, x1, x2=need, x3=have):
+  P = [T+0x188]; bl 0xdb84d8        // 字面 add x0,#0x40 → P+0x40
+  bl 0x6d963ac                      // std::recursive_mutex::lock(P+0x40)  ← 18:14 崩点
+  bl 0x62d0f9c                      // P+0x90 vs tick(0x6d97e4c)，不同→继续
+  bl 0x62d11e4                      // 出队: lock(P+0x00)@0x6d9658c; node=[P+0x80]
+                                    //   空(null)→0x62d12c0 干净退出
+  空队列出口 0x248aef4: 0x62d0fd8(通知) + 0x6d963b8 unlock(P+0x40) → 返回
+```
+- **v3.4 时代假 P 崩因平反**：当年把 MUTX 魔数(0x4d555458)放在 P+0x40 当互斥量 ——
+  pthread sig 必须是 0x32AAABA7 族 → lock EINVAL → std::system_error → terminate。
+  "队列状态字段不满足"的旧假设不成立。
+- **rig 不崩/生产崩的根源**：rig worker 线程无并发 CDN 流量，任务同步完成即出队；
+  生产 bot worker 热循环立刻抓到本任务要数据块。
+
+**v3.9.1（commit 778b4eb）**：buildVoiceProbe 新建空 P(0x100)，
+pthread_mutex_init ×2（P+0x00 默认锁=出队路径；P+0x40 递归锁=Darwin type **2**，
+非 Linux 的 1），P+0x80=0，写 [T+0x188]。
+
+**18:28 生产崩（第三层进展）**：泵一通过（P+0x40 锁上、tick 检查、空表出队全走通），
+**keys 返回 + cndOnComplete(V3) 完成**，崩点再后移：
+```
+__throw_system_error ← recursive_mutex::lock ← 0x42a32ac ← 0x42a317c ← 0x42a3140
+  ← 0x62c9ee0(worker) — 线程21
+```
+- **0x42a3254 = 泵的克隆体**（同构：accessor+recursive lock+0x62d0f9c+0x62d11e4），
+  但它操作**嵌套队列**：调用参数 x0 = **P+0x20**，读 `[(P+0x20)+8] = [P+0x28]`
+  为下一个队列指针，锁 `[P+0x28]+0x40` —— 我们 P 里该槽为零 → 锁 0x40 → throw。
+- 0x42a3140（调用者）先查 `[wrapper+0x10]`（=T+0x190）非空才调第二段泵；
+  wrapper 是引擎重建的 freshT（+0x190 引擎自填非空），**T+0x190 是 we 无法经
+  假 T 控制的开关**（第六轮已标注 +0x188/+0x190 = mutex/condvar/future 族）。
+
+**下一步候选（按成本排序）**：
+1. **P+0x28 补嵌套队列 P2**（P2+0x00 mutex、P2+0x40 recursive、P2+0x80=0，同 P 形态）。
+   风险：0x42a3254 的 pop 走 wrapper=P+0x20，其 [+0x10]=[P+0x30] 可能再嵌套/再查字段
+   —— 需先把 0x42a3254 剩余体（0x42a3330 之后）与 0x6d964c0/[T+0x190] 语义解完再动手。
+2. **原生 ground truth 重采**：10-06 的原生 T[0x3F8]/P[0x100] dump 随 /tmp 轮转丢失
+   （本地日志只余今日）。本地 rig 用户原生录一条语音重采 T+0x180..0x1a8 真值
+   + P 体结构，按原生字节构造假 P（指针槽换自建）。
+3. 若嵌套深度失控 → 回到 0x42a1d98（worker F）找"任务不需要泵"的豁免条件
+   （原生旧路任务如何让 worker 跳过它）。
+
+**生产当前状态**：v3.9.1 在跑，语音必崩（链推进到第三层），文本/图正常，
+看门狗每次 ~2.5min 自动恢复。回滚开关不变：删 JSON tryMultiphaseAddr 键+重启。
