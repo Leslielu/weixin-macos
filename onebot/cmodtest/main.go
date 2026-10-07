@@ -62,7 +62,7 @@ func main() {
 	// 3. 编译 CModule 并调用一个 export 验证
 	scriptSrc := `
 function step(n, fn) { try { fn(); console.log("step " + n + " ok"); } catch (e) { console.log("step " + n + " FAIL: " + e); } }
-var cm = null, f = null, T = null, ring = null, head = null, data = null, dst = null;
+var cm = null, f = null, T = null, ring = null, head = null, data = null, dst = null, P = null;
 step(1, function(){ cm = new CModule(SRC_PLACEHOLDER); });
 step(2, function(){ f = new NativeFunction(cm.rs3, 'uint64', ['pointer', 'pointer', 'pointer', 'uint64', 'uint64']); });
 step(3, function(){ T = Memory.alloc(0x80); ring = Memory.alloc(64 * 48); head = Memory.alloc(8); data = Memory.alloc(16); dst = Memory.alloc(64); });
@@ -71,6 +71,19 @@ step(5, function(){ T.add(0x40).writePointer(ring); T.add(0x48).writePointer(hea
 step(6, function(){ var dst2 = Memory.alloc(8); var rv = f(T, dst, dst2, uint64(0), uint64(0)); console.log("rv=" + rv + " writtenLen=" + dst2.readU64()); });
 step(7, function(){ console.log("dst=" + Array.from(new Uint8Array(dst.readByteArray(8))).join(",") + " head=" + head.readU64()); });
 step(8, function(){ var g = new NativeFunction(cm.rdtor, 'void', ['pointer']); g(T); console.log("rdtor ok, head=" + head.readU64()); });
+step(9, function(){ P = Memory.alloc(0x100); rigZeroTest(P); console.log("P zero ok"); });
+step(10, function(){ P.writeU32(0x4d55545a); P.add(0x20).writeU32(0x4d55545a); console.log("MUTZ ok"); });
+step(11, function(){ P.add(0x30).writeU64(uint64("0xffffffffffffffff")); console.log("-1 ok"); });
+step(12, function(){ P.add(0x38).writeU32(0x9c1a267f); console.log("0x9c1a267f ok"); });
+step(13, function(){ P.add(0x3c).writeU32(0xfffffffe); console.log("0xfffffffe ok"); });
+step(14, function(){ P.add(0x40).writeU32(0x4d555458); P.add(0x58).writeU32(0x4d555458); console.log("MUTX ok"); });
+step(15, function(){ T.add(0x188).writePointer(P); console.log("T+0x188=P ok"); });
+step(16, function(){ P.add(0x0c).writeU32(19496); P.add(0x54).writeU32(19496); console.log("cursors ok"); });
+step(17, function(){ var vt2 = Memory.alloc(0x50); for (var i = 0; i < 10; i++) { vt2.add(i * 8).writePointer(cm["rs" + i]); } console.log("vtable loop ok vt2=" + vt2); });
+step(18, function(){ var dv = Memory.alloc(0x20); dv.add(0x10).writePointer(cm.rdtor); console.log("dtorvt ok"); });
+step(19, function(){ var CB2 = Memory.alloc(0x28); CB2.add(0x08).writeU64(1); CB2.add(0x10).writeU64(777); CB2.add(0x18).writePointer(cm.rdtor); console.log("CB ok"); });
+step(20, function(){ var Tr = Memory.alloc(0x80); var Tt = Tr.add(8); Tt.writePointer(vt2); Tt.add(0x08).writePointer(Tr); Tt.add(0x10).writePointer(CB2); Tt.add(0x28).writeU64(0x32aaaba7); Tt.add(0x188).writePointer(P); console.log("T ok " + Tt); });
+function rigZeroTest(addr) { var z = []; for (var i = 0; i < 0x100; i++) z.push(0); addr.writeByteArray(z); }
 `
 	scriptSrc = strings.ReplaceAll(scriptSrc, "SRC_PLACEHOLDER", fmt.Sprintf("%q", cSource))
 

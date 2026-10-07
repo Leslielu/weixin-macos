@@ -169,36 +169,52 @@ function rigZero(addr, n) {
     addr.writeByteArray(z);
 }
 
+function rigStep(n, fn) { try { fn(); rigLog("bp " + n + " ok"); } catch (e) { rigLog("bp " + n + " FAIL: " + e); throw e; } }
 function rigBuildProbe() {
     if (rigProbe) return rigProbe;
-    var cm = new CModule(RIG_PROBE_C);
-    var vtable = Memory.alloc(0x50);
-    rigZero(vtable, 0x50);
-    for (var i = 0; i < 10; i++) {
-        vtable.add(i * 8).writePointer(cm["rs" + i]);
-    }
-    var dtorVt = Memory.alloc(0x20);
-    rigZero(dtorVt, 0x20);
-    dtorVt.add(0x10).writePointer(cm.rdtor);
-    var CB = Memory.alloc(0x28);
-    rigZero(CB, 0x28);
-    CB.writePointer(dtorVt);
-    CB.add(0x08).writeU64(1);          // refcount (binder 每次 ldadd+1)
-    CB.add(0x10).writeU64(777);        // counter 字段
-    CB.add(0x18).writePointer(cm.rdtor);
-    var Treal = Memory.alloc(0x80);
-    rigZero(Treal, 0x80);
-    var T = Treal.add(8);
-    T.writePointer(vtable);            // T+0x00 vptr
-    T.add(0x08).writePointer(Treal);   // T+0x08 = T-8 (原生同构)
-    T.add(0x10).writePointer(CB);      // T+0x10 = cb (原生同构)
-    T.add(0x28).writeU64(0x32aaaba7);  // 原生常量标记
-    var ringPtr = Memory.alloc(64 * 48);
-    rigZero(ringPtr, 64 * 48);
-    var headPtr = Memory.alloc(8);
-    headPtr.writeU64(0);
-    T.add(0x40).writePointer(ringPtr);
-    T.add(0x48).writePointer(headPtr);
+    rigStep("cm", function () { rigProbe = { cm: new CModule(RIG_PROBE_C) }; });
+    var cm = rigProbe.cm;
+    var vtable = null;
+    rigStep("vtable", function () {
+        vtable = Memory.alloc(0x50);
+        rigZero(vtable, 0x50);
+        for (var i = 0; i < 10; i++) {
+            vtable.add(i * 8).writePointer(cm["rs" + i]);
+        }
+    });
+    var dtorVt = null, CB = null, Treal = null, T = null;
+    rigStep("dtorVt+CB", function () {
+        dtorVt = Memory.alloc(0x20);
+        rigZero(dtorVt, 0x20);
+        dtorVt.add(0x10).writePointer(cm.rdtor);
+        CB = Memory.alloc(0x40);
+        rigZero(CB, 0x40);
+        CB.writePointer(dtorVt);
+        CB.add(0x08).writeU64(1);          // refcount (binder 每次 ldadd+1)
+        CB.add(0x10).writeU64(777);        // counter 字段
+        CB.add(0x18).writePointer(cm.rdtor);
+    });
+    rigStep("T", function () {
+        // ★ 原生对象实为 0x3F8 字节(析构常量实证); 0x80 分配导致引擎写 [T+0x188]
+        //   越界 0x110 字节, 踩坏 frida 分配器 → gadget 内部崩溃(15:38 实锤)
+        Treal = Memory.alloc(0x400);
+        rigZero(Treal, 0x400);
+        T = Treal.add(8);
+        T.writePointer(vtable);            // T+0x00 vptr
+        T.add(0x08).writePointer(Treal);   // T+0x08 = T-8 (原生同构)
+        T.add(0x10).writePointer(CB);      // T+0x10 = cb (原生同构)
+        T.add(0x28).writeU64(0x32aaaba7);  // 原生常量标记
+    });
+    var ringPtr = null, headPtr = null;
+    rigStep("ring", function () {
+        ringPtr = Memory.alloc(64 * 48);
+        rigZero(ringPtr, 64 * 48);
+        headPtr = Memory.alloc(8);
+        headPtr.writeU64(0);
+        T.add(0x40).writePointer(ringPtr);
+        T.add(0x48).writePointer(headPtr);
+    });
+    rigStep("P", function () {
     // v3.4: 数据队列 P(原生 [T+0x188] 指向; mars 标签同步对象 0x60 快照照抄)
     // +0x00 MUTZ | +0x0c cursorA | +0x20 MUTZ | +0x30 -1 | +0x38 {0x9c1a267f,-2}
     // +0x40 MUTX(0x6d963ac 锁/校验对象) | +0x54 cursorB | +0x58 MUTX
@@ -212,6 +228,7 @@ function rigBuildProbe() {
     P.add(0x40).writeU32(0x4d555458);    // MUTX @+0x40
     P.add(0x58).writeU32(0x4d555458);    // MUTX @+0x58
     T.add(0x188).writePointer(P);        // ★ 原生同位: [T+0x188] = P
+    });
     CB.add(0x20).writePointer(T);
     rigProbe = { T: T, CB: CB, cm: cm, ringPtr: ringPtr, headPtr: headPtr, Treal: Treal };
     rigLog("probe built: T=" + T + " CB=" + CB + " vtable=" + vtable + " ring=" + ringPtr);
