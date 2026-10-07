@@ -156,3 +156,123 @@ md5Key@0x98/0xb0/0xc8（引擎回填）、silk 总长@0x110。提交侧 id@0x48/
 2. CDN 语音全量上传的根治仍需"注册态复刻"（真入口反汇编 0x575bef4 起的 c2c 流程 +
    desc 对闭包来源）或移动端 senddata CGI 直传——均为大工程，单开战役。
 3. 本地实验台已就绪且校准（真入口+安全版 rig+持久化捕获），下一战役可直接开工。
+
+---
+
+## 2026-10-07 第三轮：闭包池机制全面破译（一次崩溃换来）
+
+### 崩溃事故与教训
+
+- 本地 rig 抓原生录音回调对时，给槽指向的裸 mmap 区挂了 Interceptor → frida 把该页
+  mprotect 成 r-x → 引擎 copy/binder `0x31df8ac` 对控制块 +8 做原子引用计数
+  `ldadd #1,[x8]` → **SIGBUS 写保护**（WeChat-2026-10-07-131329.ips，崩溃帧
+  0x31df8d4 ← 0x575c1d0 = start_c2c_upload 内 `bl 0x31df8ac` 返回址）。
+- **铁律追加：引擎的 mmap veneer/闭包池只可读不可 hook**——它是运行时数据+代码混合页，
+  每任务由 0x31df8ac 重写（引用计数、闭包字段、veneer 跳板）。
+  旧文档"岛链/x0=1/x2/x3 伪象"的终极解释：那些实验 hook 的就是这个池子。
+- hook 前后 dump 的"veneer 字节"(adrp x16+br x16) 实为 **frida 自己的 inline 跳板**，
+  不是引擎数据——对照 dump 时序可识别。
+
+### 机制定论（全部静态实证，本地 arm64 slice 379af337 + capstone）
+
+1. **task+0x0/+0x8 = std::shared_ptr<回调接口>{T*, 控制块*}**：
+   - 控制块 = {析构虚表@0x9962540(文件态 chained-fixup 编码，运行时解析), 引用计数@+8,
+     字段=7@+0x10, destroying-deleter fn@+0x18(0x99CB18)}；
+   - `0x31df8ac` = task copy 构造：拷 {T*,cb*} 后 `ldadd #1,[cb+8]`；
+   - `0x570a0e8` 区 = shared_ptr 调用器：`x3->0x40` 取 T → 调 `vt+0x10(T,x1,x2,x3)`，
+     用完 `ldaddal -1,[cb+8]`，归零调析构虚槽（→0x37afef4→[x0+0x18]→0x99CB18）。
+2. **T 的二级基类虚表 @0x99CBD00**（offset-to-top=-8，多继承 thunk `sub x0,#8`）：
+   vt+0x10=`0x429e890`→0x429e4fc (GetCallbackWrapper)、vt+0x30=`0x429fa14`→**0x429eff4
+   (cndOnComplete 本尊)**、vt+0x18→0x429ec3c、vt+0x20→0x42a01b8、vt+0x28→0x429ffd0、
+   vt+0x38→0x429e898、vt+0x40→0x429fa1c、vt+0x48=ret。
+   **upstream 的 fake uploadCallback(Memory.alloc(128)) 就是此接口的残缺复刻**
+   （只填 +0x10/+0x30 两槽；img/video 靠路径槽喂数据够用；语音没有路径槽——原生语音任务
+   0xe8/0x118/0x148 全零——数据必须从接口闭包链流出，缺槽=3600B 截断的最强候选根因）。
+3. T+0x10 里还有**第二层 shared_ptr**（真录音会话闭包）；GetCallbackWrapper(0x429e4fc)
+   对它 ++计数后包装。录音会话对象经此链挂进 CDN 任务。
+4. **上传协议 = mars::cdn c2c multiphase**（cdn_core.cc / upload_embed_delegate.cc /
+   multiphase_upload_task.h）：`c2c/upload_init` → `c2c/upload_part`(小片
+   `upload_part/small_fragment`) → `c2c/upload_part/finish` → `c2c/upload_complete`，
+   HTTP/Cronet 传输（非 CGI 短链）；`TryMultiphase`(appconfig.cc 0x574c0c4) 读
+   task+0x44 (apptype) 定路，模板 0x40/0x44={1,1} 与原生一致 → 我们已在 multiphase 路。
+   `cdntask %_ must serial upload.` = 分片串行约束。
+5. 入口双函数：本地 0x575bef4=`start_c2c_upload`(包装器: 校验路径/类型+图片25MB限制+
+   0x178向量非空时清空路径槽) → 尾调 0x575c75c=`_startUploadMedia`(=生产 uploadImageAddr)。
+6. 本地 partial JSON 无法渲染模板（13 处 <no value>）；本地 rig JSON = 生产
+   4_1_13_63_mac.json + uploadImageAddr→0x575bef4，全部键已在本地 slice 序言校验
+   （candidate-269628 全灭，生产函数头全过：req2bufEnter/onPush/autoBufferWrite/
+   cndOnComplete/startDownloadMedia/uploadImageAddr(=0x575c75c 本地是内层，也是函数头)）。
+
+### 下一步（rigcapture v2 已备好 /tmp/onebot-run/script.js，渲染+语法过）
+
+- 会话流程：重启微信(rig app)+登录 → 挂 rig → 用户录 ≥10s 原生语音一条。
+- v2 三路观察（零池子接触）：A) 0x31df8ac onLeave 重读新鲜 {T*,cb*} 并只读 dump
+  T[0x60]/CB[0x28]；B) hook 静态虚表成员 6 个（0x429e4fc/0x429e898/0x429ec3c/
+  0x42a01b8/0x429ffd0/0x429fa1c），x0==freshT 时记 x0-x3+rv+bt；C) cndOnComplete 沿用生产 hook。
+- 拿到数据拉取虚槽签名后：frida Memory.alloc 自建 T 对象（自建 vtable=CModule
+  函数指针，铁律4）服务自己的 silk 缓冲 → 合成任务全量上传。
+
+---
+
+## 2026-10-07 第四轮：probe 实战（对象被引擎真实消费，到同步原语处止步）
+
+### probe 设计与预验证
+
+- `onebot/rigcapture.js` v3：CModule probe 数据源对象（12→10 槽 vtable 全部接环形日志
+  stub + serve 契约 A/B 模式位），接管 `triggerUploadVoice`（worker.go 同步改为传 silk hex
+  的内存式签名）。会话内参数控制 = JS 每次发送前读 /tmp/rig_probe_cmd.json。
+- `onebot/cmodtest/main.go`：本地 CModule 编译验证器（frida spawn /tmp/dummy_target，
+  从 rigcapture.js 实时提取 C 源）。**验证结果：C 编译过、serve 拷贝语义正确
+  （rv=16/writtenLen=16/dst 内容逐字节正确）、ring 记账正常、rdtor 析构自证正常**。
+  教训：frida CModule(TCC 系)不认 `__sync_fetch_and_add`（implicit declaration）；本地
+  frida-go 运行时对 'uint64' 参数严格（NativeFunction 传指针需声明 'pointer'）——但引擎
+  原生调用不走 JS 编组，无影响。
+
+### probe 会话战果（2026-10-07 14:14，崩前 20 秒抓全）
+
+1. 引擎**真实消费**了假 pair：binder(0x31df8ac) 拷贝 {T=0x14edd9748, CB=0x14edc2410}，
+   startUploadMedia rv=0。
+2. **GetCallbackWrapper(vt+0x10) 被调且成功**：经 0x570a0e8 慢路径 → 对象 vtable 分发 →
+   原生 0x429e4fc(this=T-8) 读 [T+8]/[T+0x10]（自引用结构仿对了）→ **返回我们的 CB**
+   （rv=0x14edc2410）。参数 x3=0x4bd0=ceil16(silkLen)=19408 —— 引擎已按我们 silk 的
+   总长规划分片。
+3. 崩因（WeChat-2026-10-07-141424.ips，SIGSEGV→abort 链）：上传 worker 线程
+   （#16 0x62c9ee0）→ F 函数（0x42a1d60 区域）→ `0x248aaac(T+0x188, ...)` → 对
+   **T+0x190 的同步原语**操作失败 → `std::__throw_system_error` → 无捕获 → terminate。
+   0x6d963ac = __cxa_throw PLT；0xdb84d8 = 原语 getter。
+4. **定性**：task+0x0 指向的不是普通接口对象，而是**录音会话的上传侧状态机**
+   （原生对象 0x3F8 字节，dtor 常量 0x3f8 实证；+0x188/+0x190 = mutex/condvar/future 族）。
+   只仿 vtable+指针不够，需复刻同步状态机 = Route A 的正体。
+
+### 本轮新增结构知识
+
+- 元素 T 的 vtable 实有 **12 槽**（0x99CBD00，+0x50..+0x78 =
+  0x42a1264/0x42a0c84/0x42a1270/0x42a1278/0x42a1820/0x42a1824）。
+- **wrapper 类**：{vptr=0x99CBF88, T@+8, CB@+0x10}（引用计数在 cb+0x10，见 0x42a1c40
+  区域的构造代码）；F 的 x20 即此 wrapper；x2/x3 取自 wrapper+0x30/0x38。
+- F 函数体 0x42a1d60 区域：`0x248aaac(T+0x188, wrapper+0x18, [wrapper+0x30], [wrapper+0x38])`。
+- 原生 T[0x60] 布局（第二会话新鲜值）：{vt=0x99CBD00, T-8, CB, vt2=0x99CBE08, 堆ptr,
+  0x32aaaba7 常量}；CB={析构vt=0x9962540, refcount, counter, deleter=0x99CBC18, T*}。
+  deleter 0x99CBC18（此前文档笔误 0x99CB18）。
+- 类名混淆：typeinfo name = '_661ed966'（哈希后缀，无语义）。
+- rig 启动参数坑：缺 `-wechat_id` → selfIdMd5=md5("")=d41d8cd9...（probe fileId 错误但不致命）；
+  缺 `-image_path` → 图片保存相对路径 → 微信进程找不到文件 → 上传入口返回 -16355
+  (0xFFFFBFDD)（**生产配了此参数不受影响**； rig 补 -image_path=/tmp/onebot-run/img/）。
+
+### 下一战役的三条路（按今日地图重估）
+
+1. **会话状态机复刻**（原 Route A 的精确化）：从 F 全函数读出 T 的全部字段消费点
+   （+0x188/+0x190 之后还有多少未知），找到状态机构造器（可循 typeinfo/vtable 邻接
+   或 F 的调用链反推），在 JS 侧构造 0x3F8 布局：vtable 换 ours、同步原语用合法
+   零值（libc++ 无锁态 mutex/condvar = 全零）、数据指针指我们的 silk。地图已细到
+   字段级，但仍是多会话工程。
+2. **small_fragment 单分片路径**：URI 全局构造于 0xa00d3b8（init 段 0x574f950），
+   找它的消费者即"整文件单分片"的阈值判定；若阈值来自 clicfg 本地默认值，一次
+   Memory 写入（非 hook）即可让语音全量走单分片 —— **绕过流式状态机，性价比最高**。
+3. 生产维持 C（record→file 降级），不受本战役影响。
+
+### 今日会话消耗
+
+4 次 rig 会话（1 次池子 hook SIGBUS、1 次原生录音捕获、1 次编译失败、1 次 probe）。
+probe 会话崩于同步原语缺失，属预期内迭代代价。cmodtest 已能把 C 编译问题挡在
+会话外，后续迭代不再浪费会话在编译错误上。

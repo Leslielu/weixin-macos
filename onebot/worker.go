@@ -307,7 +307,8 @@ func SendWechatMsg(m *SendMsg) {
 		}
 		silkMd5 := fmt.Sprintf("%x", md5.Sum(silkData))
 		uploadPayloadHex := BuildVoiceUploadPayload()
-		result, err := safeExportsCall(callCtx, "triggerUploadVoiceFile2", targetId, silkPath, silkMd5, uploadPayloadHex, voiceDurationMs, int32(len(silkData)), selfIdMd5)
+		// [2026-10-07 probe] 内存式签名: 直接传 silk hex (probe 数据源需要内存缓冲)
+		result, err := safeExportsCall(callCtx, "triggerUploadVoice", targetId, silkPath, uploadPayloadHex, hex.EncodeToString(silkData), voiceDurationMs, selfIdMd5)
 		if err != nil {
 			Error("混合式语音上传中止", "target_id", targetId, "err", err)
 			sendErr = err

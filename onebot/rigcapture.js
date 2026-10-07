@@ -1,0 +1,313 @@
+
+// ================= RIGCAPTURE v3 (2026-10-07) 语音数据源 probe =================
+// v2 教训: 虚表槽经 thunk (sub x0,#8) 进入真身, 过滤须放行 freshT 和 freshT-8。
+// v3 新增: CModule probe 数据源对象(环形日志, 零 C 全局写) + triggerUploadVoice 接管
+// (worker.go 已改为传 silk hex 的内存式签名)。会话内参数控制走 /tmp/rig_probe_cmd.json
+// (JS 每次发送前读, {mode:N}); shell 改文件即可换模式, 无需重载脚本。
+// 铁律: 引擎 mmap 闭包池只读不 hook (v1 SIGBUS 教训); 一切 native 回调 = CModule (铁律4)。
+
+var rigVoiceWindow = false;
+var rigFreshT = null;
+var rigHookedStatic = {};
+var rigLogCount = 0;
+var rigProbe = null;          // {T, CB, vtable, ringPtr, headPtr, cm}
+var rigRingTail = 0;
+var rigRingTimer = null;
+
+function rigLog(s) {
+    rigLogCount++;
+    if (rigLogCount <= 500) console.log("[RIGCAP3] " + s);
+}
+
+function rigHex(addr, len) {
+    try {
+        var b = new Uint8Array(addr.readByteArray(len));
+        var s = "";
+        for (var i = 0; i < b.length; i++) { var t = b[i].toString(16); s += (t.length < 2 ? "0" : "") + t; }
+        return s;
+    } catch (e) { return "ERR:" + e; }
+}
+
+function rigModOff(a) {
+    try {
+        var m = Process.findModuleByAddress(a);
+        if (m) return m.name + "+0x" + a.sub(m.base).toString(16);
+    } catch (e) {}
+    return null;
+}
+
+// ---------- 静态虚表成员 hook (原生录音 ground truth; 过滤 x0 ∈ {T, T-8}) ----------
+var RIG_VTABLE_FNS = [
+    [0x429e4fc, "vt+0x10.GetCallbackWrapper"],
+    [0x429e898, "vt+0x38.primary"],
+    [0x429ec3c, "vt+0x18.real"],
+    [0x42a01b8, "vt+0x20.real"],
+    [0x429ffd0, "vt+0x28.real"],
+    [0x429fa1c, "vt+0x40.primary"],
+];
+
+function rigArmStaticVtableHooks() {
+    RIG_VTABLE_FNS.forEach(function (ent) {
+        var off = ent[0], tag = ent[1];
+        var key = "" + off;
+        if (rigHookedStatic[key]) return;
+        rigHookedStatic[key] = true;
+        try {
+            var addr = baseAddr.add(off);
+            Interceptor.attach(addr, {
+                onEnter: function (args) {
+                    if (!rigVoiceWindow || !rigFreshT) return;
+                    var s = args[0].toString();
+                    var hit = (s === "" + rigFreshT) || (s === "" + rigFreshT.sub(8));
+                    if (!hit) return;
+                    this._go = true;
+                    var bt = [];
+                    try {
+                        var fr = Thread.backtrace(this.context, Backtracer.ACCURATE).slice(0, 5);
+                        for (var i = 0; i < fr.length; i++) bt.push(rigModOff(fr[i]) || ("" + fr[i]));
+                    } catch (e1) {}
+                    rigLog("NATIVE " + tag + " this=" + args[0] + " x1=" + args[1] + " x2=" + args[2] +
+                        " x3=" + args[3] + " bt=[" + bt.join(", ") + "]");
+                    this._x2 = args[2];
+                    this._x3 = args[3];
+                },
+                onLeave: function (ret) {
+                    if (!this._go) return;
+                    var extra = "";
+                    try { extra += " x2[0x20]=" + rigHex(this._x2, 0x20); } catch (e2) {}
+                    try { extra += " x3[0x20]=" + rigHex(this._x3, 0x20); } catch (e3) {}
+                    rigLog("NATIVE " + tag + " ret rv=0x" + ret + extra);
+                }
+            });
+            rigLog("static hook armed " + tag + " @ " + addr);
+        } catch (e) {
+            rigLog("static hook FAIL " + tag + ": " + e);
+        }
+    });
+}
+
+function rigArmBinderHook() {
+    try {
+        var binder = baseAddr.add(0x31df8ac);
+        Interceptor.attach(binder, {
+            onEnter: function (args) {
+                this._task = args[1];
+                try { this._isVoice = this._task.add(0x9C).readU8() === 0x0F; } catch (e) { this._isVoice = false; }
+            },
+            onLeave: function (ret) {
+                if (!this._isVoice) return;
+                var t = this._task;
+                var f1 = t.add(0x0).readPointer();
+                var f2 = t.add(0x8).readPointer();
+                console.log("[RIGCAP3] binder onLeave: freshT=" + f1 + " freshCB=" + f2 +
+                    " T[0x60]=" + rigHex(f1, 0x60) + " CB[0x28]=" + rigHex(f2, 0x28));
+                rigFreshT = f1;
+                rigVoiceWindow = true;
+                setTimeout(function () { rigVoiceWindow = false; }, 90 * 1000);
+            }
+        });
+        rigLog("binder hook armed @ " + binder);
+    } catch (e) {
+        console.error("[RIGCAP3] binder hook fail: " + e);
+    }
+}
+
+// ---------- probe 数据源对象 ----------
+// self 布局(T): +0x00 vtable | +0x08 T-8 | +0x10 CB | +0x28 常量标记
+//   | +0x40 ringPtr | +0x48 headPtr | +0x50 mode | +0x58 silkPtr | +0x60 silkLen | +0x68 readPos
+// vtable: slot_i @ i*8 (i=0..9); 引擎虚分发 [T]->[vt+off]; thunk 后 x0=T(无调整, 我们自建无 thunk)。
+// serve 契约A (mode&1, slot3/vt+0x18): a1=destBuf, a2=writtenLenPtr → 复制 min(3600,剩余) 返回字节数
+// serve 契约B (mode&2, slot5/vt+0x28): a2=destBuf, a3=writtenLenPtr → 同上
+var RIG_PROBE_C = [
+    "typedef struct { unsigned long seq, slot, a0, a1, a2, a3; } RingEnt;",
+    "#define RING_N 64",
+    "static void rput(void *self, unsigned long slot, unsigned long a1, unsigned long a2, unsigned long a3) {",
+    "  RingEnt *ring = *(RingEnt **)((char *)self + 0x40);",
+    "  unsigned long *head = *(unsigned long **)((char *)self + 0x48);",
+    "  if (!ring || !head) return;",
+    "  unsigned long h = *head;",
+    "  *head = h + 1UL;",
+    "  RingEnt *e = &ring[h & (RING_N - 1)];",
+    "  e->seq = h; e->slot = slot; e->a0 = (unsigned long)self; e->a1 = a1; e->a2 = a2; e->a3 = a3;",
+    "}",
+    "static unsigned long serve(void *self, unsigned long dstPtr, unsigned long lenPtr) {",
+    "  unsigned long mode = *(unsigned long *)((char *)self + 0x50);",
+    "  if (!mode || !dstPtr) return 0;",
+    "  unsigned char *src = *(unsigned char **)((char *)self + 0x58);",
+    "  unsigned long len = *(unsigned long *)((char *)self + 0x60);",
+    "  unsigned long *pos = (unsigned long *)((char *)self + 0x68);",
+    "  unsigned long remain = (len > *pos) ? (len - *pos) : 0;",
+    "  unsigned long n = remain < 3600UL ? remain : 3600UL;",
+    "  unsigned char *dst = (unsigned char *)dstPtr;",
+    "  for (unsigned long i = 0; i < n; i++) dst[i] = src[*pos + i];",
+    "  *pos += n;",
+    "  if (lenPtr) *(unsigned long *)lenPtr = n;",
+    "  return n;",
+    "}",
+    "unsigned long rs0(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,0,a,b,c); return 0; }",
+    "unsigned long rs1(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,1,a,b,c); return 0; }",
+    "unsigned long rs2(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,2,a,b,c); return 0; }",
+    "unsigned long rs3(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,3,a,b,c); if (*(unsigned long *)((char *)s + 0x50) & 1UL) return serve(s, a, b); return 0; }",
+    "unsigned long rs4(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,4,a,b,c); return 0; }",
+    "unsigned long rs5(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,5,a,b,c); if (*(unsigned long *)((char *)s + 0x50) & 2UL) return serve(s, b, c); return 0; }",
+    "unsigned long rs6(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,6,a,b,c); return 0; }",
+    "unsigned long rs7(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,7,a,b,c); return 0; }",
+    "unsigned long rs8(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,8,a,b,c); return 0; }",
+    "unsigned long rs9(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,9,a,b,c); return 0; }",
+    "void rdtor(void *s) { rput(s, 99, 0, 0, 0); }",
+].join("\n");
+
+function rigZero(addr, n) {
+    var z = [];
+    for (var i = 0; i < n; i++) z.push(0);
+    addr.writeByteArray(z);
+}
+
+function rigBuildProbe() {
+    if (rigProbe) return rigProbe;
+    var cm = new CModule(RIG_PROBE_C);
+    var vtable = Memory.alloc(0x50);
+    rigZero(vtable, 0x50);
+    for (var i = 0; i < 10; i++) {
+        vtable.add(i * 8).writePointer(cm["rs" + i]);
+    }
+    var dtorVt = Memory.alloc(0x20);
+    rigZero(dtorVt, 0x20);
+    dtorVt.add(0x10).writePointer(cm.rdtor);
+    var CB = Memory.alloc(0x28);
+    rigZero(CB, 0x28);
+    CB.writePointer(dtorVt);
+    CB.add(0x08).writeU64(1);          // refcount (binder 每次 ldadd+1)
+    CB.add(0x10).writeU64(777);        // counter 字段
+    CB.add(0x18).writePointer(cm.rdtor);
+    var Treal = Memory.alloc(0x80);
+    rigZero(Treal, 0x80);
+    var T = Treal.add(8);
+    T.writePointer(vtable);            // T+0x00 vptr
+    T.add(0x08).writePointer(Treal);   // T+0x08 = T-8 (原生同构)
+    T.add(0x10).writePointer(CB);      // T+0x10 = cb (原生同构)
+    T.add(0x28).writeU64(0x32aaaba7);  // 原生常量标记
+    var ringPtr = Memory.alloc(64 * 48);
+    rigZero(ringPtr, 64 * 48);
+    var headPtr = Memory.alloc(8);
+    headPtr.writeU64(0);
+    T.add(0x40).writePointer(ringPtr);
+    T.add(0x48).writePointer(headPtr);
+    CB.add(0x20).writePointer(T);
+    rigProbe = { T: T, CB: CB, cm: cm, ringPtr: ringPtr, headPtr: headPtr, Treal: Treal };
+    rigLog("probe built: T=" + T + " CB=" + CB + " vtable=" + vtable + " ring=" + ringPtr);
+    return rigProbe;
+}
+
+function rigPollRing() {
+    if (!rigProbe) return;
+    try {
+        var head = Number(rigProbe.headPtr.readU64());
+        var guard = 0;
+        while (rigRingTail < head && guard < 80) {
+            guard++;
+            var idx = rigRingTail & 63;
+            var e = rigProbe.ringPtr.add(idx * 48);
+            var seq = Number(e.readU64());
+            if (seq !== rigRingTail) { rigRingTail = seq; continue; }
+            var slot = Number(e.add(8).readU64());
+            var a0 = e.add(16).readPointer();
+            var a1 = e.add(24).readPointer();
+            var a2 = e.add(32).readPointer();
+            var a3 = e.add(40).readPointer();
+            console.log("[RIGPROBE] slot=" + slot + " self=" + a0 + " a1=" + a1 + " a2=" + a2 + " a3=" + a3 +
+                (slot === 99 ? " (DESTROY)" : ""));
+            rigRingTail++;
+        }
+    } catch (e) {}
+}
+
+// 会话内参数控制: 每次发送前读 /tmp/rig_probe_cmd.json {mode:N}
+function rigReadCmd() {
+    try {
+        var f = new File("/tmp/rig_probe_cmd.json", "r");
+        var s = f.read();
+        f.close();
+        return JSON.parse(s);
+    } catch (e) { return { mode: 0 }; }
+}
+
+// ---------- triggerUploadVoice 接管 (worker.go 已改为内存式签名调它) ----------
+// 签名: (receiver, voicePath, payloadHex, audioDataHex, durationMs, selfIdMd5)
+function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durationMs, selfIdMd5) {
+    var cmd = rigReadCmd();
+    var mode = (cmd && cmd.mode) ? cmd.mode : 0;
+    rigLog("send invoked: receiver=" + receiver + " mode=" + mode +
+        " audioHexLen=" + (audioDataHex ? audioDataHex.length : 0));
+
+    if (uploadGlobalX0.equals(ptr(0))) { ensureCdnManagerX0(); }
+    if (uploadGlobalX0.equals(ptr(0))) {
+        console.error("[!] uploadGlobalX0 尚未初始化");
+        return "fail";
+    }
+    var probe = rigBuildProbe();
+
+    voiceDurationGlobal = durationMs;
+    var payload = hexToByteArray(payloadHex);
+    var audioBytes = hexToByteArray(audioDataHex);
+    var audioLen = audioBytes.length;
+    voiceSilkDataLenGlobal = audioLen;
+    voiceAudioDataAddr.writeByteArray(audioBytes);
+
+    voiceUploadSeq = voiceUploadSeq + 1;
+    var voiceIdStr = "alita_1_" + selfIdMd5 + "_15_0_" + voiceUploadSeq;
+    patchString(voiceIdAddr, voiceIdStr);
+
+    uploadVoiceX1.writeByteArray(payload);
+    // ★ probe pair: T + CB (替代 uploadFunc1/2 / 原生回调对)
+    uploadVoiceX1.writePointer(probe.T);
+    uploadVoiceX1.add(0x08).writePointer(probe.CB);
+    uploadVoiceX1.add(0x48).writePointer(voiceIdAddr);
+    uploadVoiceX1.add(0x50).writeU64(voiceIdStr.length);
+    uploadVoiceX1.add(0x58).writeU64(uint64("0x8000000000000000").add(voiceIdStr.length + 1));
+    uploadVoiceX1.add(0x68).writeUtf8String(receiver);
+    uploadVoiceX1.add(0x7F).writeU8(receiver.length);
+    // 0xD8 / 0x100 三连 (内存式原版同构)
+    uploadVoiceX1.add(0xD8).writeU64(0);
+    uploadVoiceX1.add(0xD8).writeU32(audioLen);
+    uploadVoiceX1.add(0xDC).writeU32(Math.ceil(audioLen / 2));
+    uploadVoiceX1.add(0x100).writePointer(voiceAudioDataAddr);
+    uploadVoiceX1.add(0x108).writeU64(audioLen);
+    uploadVoiceX1.add(0x110).writeU64(uint64("0x8000000000000000").add(Math.ceil(audioLen / 16) * 16));
+
+    // probe serve 参数 (engine 线程的 C stub 直接读)
+    probe.T.add(0x50).writeU64(mode);
+    probe.T.add(0x58).writePointer(voiceAudioDataAddr);
+    probe.T.add(0x60).writeU64(audioLen);
+    probe.T.add(0x68).writeU64(0);
+
+    var startUploadMedia = new NativeFunction(uploadImageAddr, 'int64', ['pointer', 'pointer']);
+    voiceUploadSelfTest = true;
+    rigRingTail = 0;
+    probe.headPtr.writeU64(0);
+    try {
+        var rv = startUploadMedia(uploadGlobalX0, uploadVoiceX1);
+        rigLog("startUploadMedia rv=" + rv + " fileId=" + voiceIdStr + " audioLen=" + audioLen);
+        return "0";
+    } catch (eSend) {
+        console.error("[!] startUploadMedia err: " + eSend);
+        return "fail";
+    } finally {
+        voiceUploadSelfTest = false;
+    }
+}
+
+// baseAddr 就绪后统一挂载 (ring 轮询单一定时器)
+(function rigWaitBase() {
+    if (baseAddr && !baseAddr.isNull()) {
+        rigArmStaticVtableHooks();
+        rigArmBinderHook();
+        if (!rigRingTimer) {
+            rigRingTimer = setInterval(rigPollRing, 250);
+        }
+        rigLog("v3 ready (probe lazy-build on first send)");
+    } else {
+        setTimeout(rigWaitBase, 50);
+    }
+})();
+// =================== RIGCAPTURE v3 END ===================
