@@ -323,3 +323,17 @@ probe 会话崩于同步原语缺失，属预期内迭代代价。cmodtest 已�
 - 对象完整性待验证：completion +0x110=0x2889(10377) ≠ silk 19423，字段语义未定；
   用 /download_cdn（需扩 voice 类型）或接收端播放验证。
 - 顺带：voiceUploadSeq 跨会话未清零（164），不影响功能但需知悉。
+
+### 2026-10-07 补充：本地/生产地址同址验证（mac-m1 部署就绪性）
+
+本地 rig 与 mac-m1 生产 dylib（74c5f6ac, fat, arm64 slice base 同为 0x0a9dc000）九个
+关键函数在相同地址逐字节比对全部一致：
+0x574c0c4(TryMultiphase)、0x58c3b44/0x58c9124/0x58c9940(三旧路)、0x248aaac(同步)、
+0x42a1d98(worker F 区)、0x575c75c(内层/生产 uploadImageAddr)、0x575bef4(包装器,
+生产也存在——生产 JSON 只因当年 addrfind 命中内层)、0x31df8ac(binder)。
+⇒ force-legacy 全套机制在 mac-m1 **无需新地址定位**，唯一待办 = 脚本改动
+（假 T 补零值同步原语 + legacy 布局 completion 事件）与按 AGENTS.md 流程部署
+（pause watchdog → 部署 → 验证 → 恢复）。
+账号策略（用户明示）：ludaohe = 主号（今日实验误打在其上，目标均为 filehelper
+且无限制迹象；此后禁止风险实验）；**bot 号 wxid_4erh8rirquu921 = 可接受风控的
+验证/部署目标**，voice 测试从 bot 号发出、用户手机收听验证。
