@@ -161,6 +161,7 @@ var RIG_PROBE_C = [
     "unsigned long rs8(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,8,a,b,c); return 0; }",
     "unsigned long rs9(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,9,a,b,c); return 0; }",
     "void rdtor(void *s) { rput(s, 99, 0, 0, 0); }",
+    "unsigned long pump_nop(unsigned long a, unsigned long b, unsigned long c, unsigned long d) { return 0; }",
 ].join("\n");
 
 function rigZero(addr, n) {
@@ -230,6 +231,12 @@ function rigBuildProbe() {
     T.add(0x188).writePointer(P);        // ★ 原生同位: [T+0x188] = P
     });
     CB.add(0x20).writePointer(T);
+    // v3.7: force-legacy 时泵 no-op(旧路上传在调用线程同步完成, 泵是死重且等不到数据必炸)
+    if (rigForceLegacy && !rigPumpNopDone) {
+        Interceptor.replace(baseAddr.add(0x248aaac), cm.pump_nop);
+        rigPumpNopDone = true;
+        rigLog("pump 0x248aaac replaced with no-op (forceLegacy)");
+    }
     rigProbe = { T: T, CB: CB, cm: cm, ringPtr: ringPtr, headPtr: headPtr, Treal: Treal };
     rigLog("probe built: T=" + T + " CB=" + CB + " vtable=" + vtable + " ring=" + ringPtr);
     return rigProbe;
@@ -423,6 +430,7 @@ function rigArmForceLegacy() {
 // 未命中（fidOff<0，原因未明），这里叠加第二 hook 按固定布局直读直发。
 // 门: fileId 精确等于 voiceIdAddr 当前内容 + alita 格式 + 每 id 只发一次。
 var rigLegacyFired = "";
+var rigPumpNopDone = false;
 var rigLegacyHookArmed = false;
 
 function rigArmLegacyCompletion() {
