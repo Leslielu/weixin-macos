@@ -302,9 +302,15 @@ function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durat
     patchString(voiceIdAddr, voiceIdStr);
 
     uploadVoiceX1.writeByteArray(payload);
-    // ★ probe pair: T + CB (替代 uploadFunc1/2 / 原生回调对)
-    uploadVoiceX1.writePointer(probe.T);
-    uploadVoiceX1.add(0x08).writePointer(probe.CB);
+    // ★ 回调对选择: forceLegacy=true(实验) → 假 T/CB + 泵 no-op + legacy 完成直发;
+    //   false(默认/日常) → 空回调对 = 昨天的稳定绿泡泡路径(引擎自降级 3600B, 从不崩)
+    if (cmd.forceLegacy) {
+        uploadVoiceX1.writePointer(probe.T);
+        uploadVoiceX1.add(0x08).writePointer(probe.CB);
+    } else {
+        uploadVoiceX1.writePointer(uploadFunc1Addr);
+        uploadVoiceX1.add(0x08).writePointer(uploadFunc2Addr);
+    }
     uploadVoiceX1.add(0x48).writePointer(voiceIdAddr);
     uploadVoiceX1.add(0x50).writeU64(voiceIdStr.length);
     uploadVoiceX1.add(0x58).writeU64(uint64("0x8000000000000000").add(voiceIdStr.length + 1));
@@ -442,6 +448,7 @@ function rigArmLegacyCompletion() {
                 try {
                     var x2 = args[2];
                     var fid = v3ReadStr(x2, 0x28);
+                    if (!rigForceLegacy) return;
                     if (!fid || fid === rigLegacyFired) return;
                     if (!/^alita_1_[0-9a-f]{32}_15_0_\d+$/.test(fid)) return;
                     if (fid !== voiceIdAddr.readUtf8String()) return;
