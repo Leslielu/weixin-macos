@@ -285,3 +285,38 @@ onEnter dump this/+8/+10/+18。看门狗全链拉起后（约 16:55 稳定）再
 
 **生产试验循环成本**：每发一次语音崩一次 → 看门狗全链恢复 ~2-3 分钟
 （微信启动+回车登录+TCC+onebot），试验节奏以此为准；试验期间 watchdog 勿长期挂起。
+
+## 10. 2026-10-07 晚：17:04 崩溃破译 + v3.9 修复捆绑包（待本地验证）
+
+**VPDBG 首战告捷，崩因定性**（四个 .ips + 反汇编 + GCW dump 三方印证）：
+
+| # | 崩点 | 指纹 |
+|---|---|---|
+| 16:41 | GCW+0x44 `ldadd` | KERN_PROTECTION(只读页) → ldadd 目标是 vtable 指针 |
+| 16:48 | 0x429f0c0 `ldadd` | 寄存器全零 |
+| 16:53:56 | FridaGadget 内部 | gum JS 线程, 另族 = 堆污染随机引爆 |
+| 17:04 | 0x429f0c0 `ldadd` | 目标 = ASCII"/re/frid"(0x646972662f65722f) = 字符串字节被当 CB |
+
+- `0x429f0c0`(cndOnComplete+0xCC) 与 GCW+0x44 同构：读第二层 shared_ptr
+  `[this+0x10]/{x21,[this+0x18]}`，非零则 `ldadd 1,[cb+0x10]`——崩 = 该槽是垃圾。
+- **GCW dispatch dump 实锤：this=Treal 但 [+8]/[+0x10]/[+0x18] 全非我们写入值**
+  → 引擎把 Treal 原地重建了。binder(0x31df8ac) 观察点全程未开火 → 重建在别处。
+  异步分发链（线程77）：0x5a4fxxx → 0x58ea300 → 0x57d2528 → 0x57d2ad8
+  （`x8=[mgr+0x2a8]`, `x2=x8+0x5b8`, `bl 0x570a44c`）。
+- **探针跨发送缓存**（`voiceProbe`）= 第二发把第一发已重建态的对象再喂给构造器；
+  16:58 成功 vs 17:04 崩 = 概率竞态（异步完成链读到的槽位时序不同）。
+- 假 T 结构性缺口（文档§9候选A/B坐实）：主虚表位 T+0x18 全零、堆指针位 T+0x20 全零、
+  vtable 仅 10 槽（原生二级虚表 0x99CBD00 实为 16 槽，+0x50..+0x78 落零=潜在跳零）。
+
+**v3.9 捆绑包（commit ca5eeb8，script.js + rigcapture.js 同构）**：
+1. 探针每发新建，历史探针永生保留（引擎异步完成链可能仍持引用，释放=UAF）
+2. vtable 扩 16 槽；新增 vtable2 补 T+0x18（全 rstub 桩）；T+0x20 补合法堆指针
+3. CB+0x10 弱计数 canary 777（引擎加减永不归零 → 永不触发析构释放）
+4. 观察：VOICERING（gcw/cnd/v3 三点回读 rput 槽位记录）、GCW body dump（0x40）、
+   cndOnComplete 入口崩点现场 dump（语音后 90s 窗口，含 this/第二层槽/0x30 body）
+5. 验证：cmodtest 编译过、rendercheck 4.1.13/4.1.11 双版本过（4.1.11 无键不激活）
+
+**判读指引**：再崩 → 看 `[VPDBG] cndOnComplete this=... [+18]=... body=...`：
+body 头 8 字节 = vptr（0x13d680f00 族=我们的桩表；0x99cbd00 族=原生表=引擎重建体）；
+[+18] 的值直接揭示垃圾来源。VOICERING 的 s200+ 段 = 引擎调过主虚表位桩。
+若 16 槽/主虚表桩破坏上传流（rig 里 keys 不返回）→ 回退项=仅保留#1（每发新建）。
