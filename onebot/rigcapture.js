@@ -102,6 +102,12 @@ function rigArmBinderHook() {
                 console.log("[RIGCAP3] binder onLeave: freshT=" + f1 + " freshCB=" + f2 +
                     " T[0x60]=" + rigHex(f1, 0x60) + " CB[0x28]=" + rigHex(f2, 0x28));
                 rigFreshT = f1;
+                // v3.3: 全量 T(0x3F8) + 数据队列 P([T+0x190] 指向对象 0x100)
+                try {
+                    console.log("[RIGCAP3] T-full[0x3F8]=" + rigHex(f1, 0x3F8));
+                    var P = f1.add(0x190).readPointer();
+                    if (!P.isNull()) console.log("[RIGCAP3] P=" + P + " P[0x100]=" + rigHex(P, 0x100));
+                } catch (e5) {}
                 rigVoiceWindow = true;
                 setTimeout(function () { rigVoiceWindow = false; }, 90 * 1000);
             }
@@ -371,5 +377,114 @@ function rigArmForceLegacy() {
         rigArmForceLegacy();
     } else {
         setTimeout(rigWaitBase2, 50);
+    }
+})();
+
+// ================= v3.2: legacy 完成事件直发（绕过锚扫描） =================
+// force-legacy 的完成结构布局已由 VOICEDUMP 抓实: fileId@0x28 / target@0x48 /
+// cdn@0x68 / aes@0x80 / md5@0x98（与 c2c 引擎侧布局同族）。v3 锚扫描在该结构上
+// 未命中（fidOff<0，原因未明），这里叠加第二 hook 按固定布局直读直发。
+// 门: fileId 精确等于 voiceIdAddr 当前内容 + alita 格式 + 每 id 只发一次。
+var rigLegacyFired = "";
+var rigLegacyHookArmed = false;
+
+function rigArmLegacyCompletion() {
+    if (rigLegacyHookArmed) return;
+    rigLegacyHookArmed = true;
+    try {
+        Interceptor.attach(cndOnCompleteAddr, {
+            onEnter: function (args) {
+                try {
+                    var x2 = args[2];
+                    var fid = v3ReadStr(x2, 0x28);
+                    if (!fid || fid === rigLegacyFired) return;
+                    if (!/^alita_1_[0-9a-f]{32}_15_0_\d+$/.test(fid)) return;
+                    if (fid !== voiceIdAddr.readUtf8String()) return;
+                    var target = v3ReadStr(x2, 0x48);
+                    var cdn = v3ReadStr(x2, 0x68);
+                    var aes = v3ReadStr(x2, 0x80);
+                    var md5 = v3ReadStr(x2, 0x98);
+                    if (!cdn || cdn.length < 8 || !aes || !/^[0-9a-f]{32}$/.test(aes)) {
+                        rigLog("LEGACY completion keys not ready: cdn=" + cdn + " aes=" + aes);
+                        return;
+                    }
+                    rigLegacyFired = fid;
+                    rigLog("LEGACY completion OK: fid=" + fid + " target=" + target +
+                        " cdn=" + cdn + " aes=" + aes + " md5=" + md5);
+                    send({
+                        type: "upload_voice_finish",
+                        target_id: target,
+                        cdn_key: cdn,
+                        aes_key: aes,
+                        voice_duration: voiceDurationGlobal,
+                        silk_data_len: voiceSilkDataLenGlobal
+                    });
+                    rigLog("upload_voice_finish sent to Go (legacy path)");
+                } catch (e) {
+                    console.error("[RIGCAP3] legacy completion err: " + e);
+                }
+            }
+        });
+        rigLog("legacy completion hook armed @ " + cndOnCompleteAddr);
+    } catch (e) {
+        console.error("[RIGCAP3] legacy completion arm fail: " + e);
+    }
+}
+
+(function rigWaitBase3() {
+    if (baseAddr && !baseAddr.isNull()) {
+        rigArmLegacyCompletion();
+    } else {
+        setTimeout(rigWaitBase3, 50);
+    }
+})();
+
+// ================= v3.3: 数据队列 P 全量捕获 =================
+// 理论: worker(0x62c9ee0 线程) = 上传泵; 0x248aaac(T+0x188,...) = 泵内"等下一片";
+// [T+0x190] = P(录音编码器→上传器数据队列), 0xdb84d8(P) = &P->0x40(锁)。
+// 崩因 = 假 T 的 [T+0x190]=0。本轮目标: 原生录音时抓全量 T(0x3F8) + P(0x100)
+// + 0x248aaac 的进出参数与 P 字段变化, 照抄构造假 P。
+var rigPDumped = false;
+
+var RIG_SYNC_C = [
+    "unsigned long rig_sync_probe(unsigned long a, unsigned long b, unsigned long c, unsigned long d) { return 0; }",
+].join("\n");
+
+function rigArmSyncTrace() {
+    try {
+        Interceptor.attach(baseAddr.add(0x248aaac), {
+            onEnter: function (args) {
+                var t = args[0].sub(0x188);   // 0x248aaac 的 x0 = T+0x188
+                var p = ptr(0);
+                try { p = t.add(0x190).readPointer(); } catch (e) {}
+                rigLog("SYNC enter T+0x188=" + args[0] + " T=" + t + " P=" + p +
+                    " x1=" + args[1] + " x2=" + args[2] + " x3=" + args[3]);
+                if (!p.isNull()) {
+                    try {
+                        rigLog("SYNC P[0x60]=" + rigHex(p, 0x60) +
+                            " lock40=" + rigHex(p.add(0x40), 8));
+                    } catch (e2) {}
+                }
+                this._p = p;
+                this._t = t;
+            },
+            onLeave: function (ret) {
+                rigLog("SYNC leave rv=0x" + ret);
+                try {
+                    if (!this._p.isNull()) rigLog("SYNC P after[0x60]=" + rigHex(this._p, 0x60));
+                } catch (e) {}
+            }
+        });
+        rigLog("sync trace armed @ 0x248aaac(+base)");
+    } catch (e) { console.error("[RIGCAP3] sync trace fail: " + e); }
+}
+
+(function rigWaitBase4() {
+    if (baseAddr && !baseAddr.isNull()) {
+        rigArmSyncTrace();
+        // binder onLeave 的 T dump 扩到 0x3F8 + P 顺藤(在原 binder hook 内已读 T+0x190)
+        rigLog("v3.3 ready");
+    } else {
+        setTimeout(rigWaitBase4, 50);
     }
 })();
