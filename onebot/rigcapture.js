@@ -311,3 +311,65 @@ function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durat
     }
 })();
 // =================== RIGCAPTURE v3 END ===================
+
+// ================= v3.1: TryMultiphase 强制旧路 =================
+// 依据: TryMultiphase(0x574c0c4) 语义 — type2→false / type8→true / 0x9C∈{7,9,0x4EEA,0x4F4E}→true /
+// 其余(voice 0x0F/img/video)落长判定树。强制对 0x9C==0x0F 返回 false:
+//   inner(0x575ce88)→0x575cf10: +0x40==1 → 0x575d210 → 0x58c3b44(mgr,task,1,flag) = 第三旧路
+//   wrapper(0x575c1b4)→0x575c36c = wrapper 级旧路
+// 目标: 走 4.1.10 时代 uploadvoice(cmdid 19) CGI 直传流(旁人旧版验证可用的自包含路径)。
+var rigForceLegacy = false;
+var rigForceLegacyArmed = false;
+
+function rigArmForceLegacy() {
+    if (rigForceLegacyArmed) return;
+    rigForceLegacyArmed = true;
+    try {
+        Interceptor.attach(baseAddr.add(0x574c0c4), {
+            onEnter: function (args) {
+                this._voice = false;
+                try { this._voice = args[0].add(0x9C).readU8() === 0x0F; } catch (e) {}
+            },
+            onLeave: function (ret) {
+                if (this._voice && rigForceLegacy) {
+                    rigLog("TryMultiphase voice → forced false (was " + ret + ")");
+                    ret.replace(0);
+                }
+            }
+        });
+        // 旧路 handler 观察点(只读): 确认引擎真的走进去了
+        Interceptor.attach(baseAddr.add(0x58c3b44), {
+            onEnter: function (args) {
+                rigLog("LEGACY handler 0x58c3b44 entered: mgr=" + args[0] + " task=" + args[1] +
+                    " w2=" + args[2] + " w3=" + args[3]);
+            }
+        });
+        Interceptor.attach(baseAddr.add(0x58c9124), {
+            onEnter: function (args) {
+                rigLog("LEGACY handler 0x58c9124 entered: mgr=" + args[0] + " task=" + args[1] + " w2=" + args[2]);
+            }
+        });
+        rigLog("force-legacy hooks armed");
+    } catch (e) {
+        console.error("[RIGCAP3] force-legacy arm fail: " + e);
+    }
+}
+
+// triggerUploadVoice 开头读 cmd.forceLegacy
+(function () {
+    var origReadCmd = rigReadCmd;
+    rigReadCmd = function () {
+        var c = origReadCmd();
+        rigForceLegacy = !!(c && c.forceLegacy);
+        return c;
+    };
+})();
+
+// baseAddr 就绪后补挂
+(function rigWaitBase2() {
+    if (baseAddr && !baseAddr.isNull()) {
+        rigArmForceLegacy();
+    } else {
+        setTimeout(rigWaitBase2, 50);
+    }
+})();

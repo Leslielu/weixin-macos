@@ -276,3 +276,50 @@ md5Key@0x98/0xb0/0xc8（引擎回填）、silk 总长@0x110。提交侧 id@0x48/
 4 次 rig 会话（1 次池子 hook SIGBUS、1 次原生录音捕获、1 次编译失败、1 次 probe）。
 probe 会话崩于同步原语缺失，属预期内迭代代价。cmodtest 已能把 C 编译问题挡在
 会话外，后续迭代不再浪费会话在编译错误上。
+
+---
+
+## 2026-10-07 第五轮：force-legacy 突破 — 旧路 CGI 上传全量成功（旁人总结的关键印证）
+
+### 用户提供的旁支实现总结（旧版本成功案例）带来决定性线索
+
+其流程 = triggerUploadVoice → 原生 UploadMedia → `/cgi-bin/micromsg-bin/uploadvoice`
+（短链 CGI 直传，cmdid 19）→ 回调 cdn_key/aes_key → BuildVoiceMsgProto(newsendmsg)。
+**该路径 = 自包含 CGI 上传，无录音会话状态机、无流式同步**。
+
+### 本轮实证（本地 rig，微信 4.1.13 同版）
+
+1. `uploadvoice` CGI 仍在 4.1.13 mars 路由表：`<cgi reqid="19" respid="1000000019" ...>uploadvoice</cgi>`。
+2. **TryMultiphase(0x574c0c4) 语义全解**：type2→false / type8→true / task[0x9C]∈{7,9,0x4EEA,0x4F4E}→true /
+   其余（voice 0x0F/img/video）落长判定树（+0x178 向量大小 26MB 上限、apptype 等）。
+   voice 默认 → multiphase 流式路。
+3. **force-legacy 实验**：Interceptor.attach(0x574c0c4) onLeave 对 0x9C==0x0F 的任务
+   `retval.replace(0)` → inner(0x575ce88) 走 0x575cf10 → (task+0x40==1) → **0x575d210 →
+   0x58c3b44(mgr, task, 1, flag) = 第三旧路上传例程**（另有 type2→0x58c9124、type3→
+   0x58c9940 两条，均含防篡改自检头）。
+4. **旧路上传成功**：LEGACY handler 进入（两次，wrapper+inner）→ startUploadMedia rv=0 →
+   **result=0** → VOICEDUMP 抓到完整钥匙：fileId@0x28（alita_1_6520ba91...=md5(ludaohe)）、
+   receiver@0x48、**cdnKey@0x68（202hex）、aesKey@0x80、md5Key@0x98**、CDN 服务器 IP
+   （116.31.98.244 / 61.141.173.69）@0x1c8/0x228。完成结构与 c2c 引擎侧布局同族。
+5. **遗留崩点**：上传完成后 worker（0x62c9ee0 线程 → 0x42a1d98 → 0x248ab0c）仍要同步
+   假 T 的会话原语（SIGSEGV @0x40 解引用）——**收尾段的会话同步与上传协议无关，
+   两条上传路（multiphase/legacy）共用同一收尾**。
+6. 消息未发出：v3 locator 的锚点扫描在 legacy 完成结构上未命中（fidOff<0，无
+   "[!] cnd定位验证失败"日志 → 是锚扫描失败而非槽验证失败；原因待查，dump 明示
+   fileId@0x28 可读）。upload_voice_finish 未触发 → send_voice 未执行。
+7. rig 运维补充：CdnManager 单例懒创建——新登录实例无媒体活动时 [ctx+0x40] 不可读，
+   需先有一次媒体收发（本次由用户手机发图触发下载 hook 回填解决）。
+
+### 结论与下一步（战役形态彻底改变）
+
+- **上传侧已通**：force-legacy + 现有模板 = 全量语音对象上传（旁人旧版验证的同一
+  条路在 4.1.13 复活）。3600B 截断的本质 = multiphase 流式路径的会话依赖，旧路无此依赖。
+- **收尾侧待解**（两个小改动，均可 cmodtest 预验证）：
+  a. 假 T 补合法同步原语（T+0x188/0x190 处放全零 libc++ mutex/condvar = 合法无锁态，
+     worker 等 60s 超时而非崩；或 hook 0x248ab0c 入口直接放行）；
+  b. completion 事件解耦：cndOnCompleteAddr 上加第二 hook（允许叠加），按 legacy
+     固定布局（cdn@0x68/aes@0x80/md5@0x98/target@0x48）直接 fire upload_voice_finish
+     （或经 /tmp/rig_probe_cmd.json 手工注入钥匙触发 send_voice）。
+- 对象完整性待验证：completion +0x110=0x2889(10377) ≠ silk 19423，字段语义未定；
+  用 /download_cdn（需扩 voice 类型）或接收端播放验证。
+- 顺带：voiceUploadSeq 跨会话未清零（164），不影响功能但需知悉。
