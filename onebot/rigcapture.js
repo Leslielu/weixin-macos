@@ -13,6 +13,8 @@ var rigHookedStatic = {};
 var rigLogCount = 0;
 var rigProbe = null;          // {T, CB, vtable, ringPtr, headPtr, cm}
 var rigRingTail = 0;
+var rigProbeHistory = [];     // 历史探针保活(引擎异步完成链可能仍持引用, 释放=UAF)
+var rigProbeCount = 0;
 var rigRingTimer = null;
 
 function rigLog(s) {
@@ -163,6 +165,24 @@ var RIG_PROBE_C = [
     "unsigned long rs9(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,9,a,b,c); return 0; }",
     "void rdtor(void *s) { rput(s, 99, 0, 0, 0); }",
     "unsigned long pump_nop(unsigned long a, unsigned long b, unsigned long c, unsigned long d) { return 0; }",
+    // [2026-10-07 生产排障镜像] 全 16 槽覆盖桩(原生二级虚表 0x99CBD00 实为 16 槽);
+    // 200+ = 桩段 id(主虚表位 vtable2 同名共用)。与 script.js VOICE_PROBE_C 保持同构。
+    "unsigned long rstub0(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,200,a,b,c); return 0; }",
+    "unsigned long rstub1(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,201,a,b,c); return 0; }",
+    "unsigned long rstub2(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,202,a,b,c); return 0; }",
+    "unsigned long rstub3(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,203,a,b,c); return 0; }",
+    "unsigned long rstub4(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,204,a,b,c); return 0; }",
+    "unsigned long rstub5(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,205,a,b,c); return 0; }",
+    "unsigned long rstub6(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,206,a,b,c); return 0; }",
+    "unsigned long rstub7(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,207,a,b,c); return 0; }",
+    "unsigned long rstub8(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,208,a,b,c); return 0; }",
+    "unsigned long rstub9(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,209,a,b,c); return 0; }",
+    "unsigned long rstub10(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,210,a,b,c); return 0; }",
+    "unsigned long rstub11(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,211,a,b,c); return 0; }",
+    "unsigned long rstub12(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,212,a,b,c); return 0; }",
+    "unsigned long rstub13(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,213,a,b,c); return 0; }",
+    "unsigned long rstub14(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,214,a,b,c); return 0; }",
+    "unsigned long rstub15(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,215,a,b,c); return 0; }",
 ].join("\n");
 
 function rigZero(addr, n) {
@@ -173,18 +193,29 @@ function rigZero(addr, n) {
 
 function rigStep(n, fn) { try { fn(); rigLog("bp " + n + " ok"); } catch (e) { rigLog("bp " + n + " FAIL: " + e); throw e; } }
 function rigBuildProbe() {
-    if (rigProbe) return rigProbe;
+    // [2026-10-07 崩因修复镜像] 不再缓存: 引擎在 Treal 原地重建对象(生产 GCW dump
+    // 实证), 第二发把已重建态再喂进去 = 构造器跑在脏内存上 → 完成分发读 UAF 垃圾。
+    // 每发新建 + 历史探针永不释放(rigProbe 换引用, 旧对象由 rigProbeHistory 保活)。
+    rigProbeCount = (rigProbeCount || 0) + 1;
     rigStep("cm", function () { rigProbe = { cm: new CModule(RIG_PROBE_C) }; });
     var cm = rigProbe.cm;
-    var vtable = null;
+    var vtable = null, vtable2 = null;
     rigStep("vtable", function () {
-        vtable = Memory.alloc(0x50);
-        rigZero(vtable, 0x50);
+        vtable = Memory.alloc(0x80);           // 16 槽(原生 0x99CBD00 实长)
+        rigZero(vtable, 0x80);
         for (var i = 0; i < 10; i++) {
             vtable.add(i * 8).writePointer(cm["rs" + i]);
         }
+        for (var i = 10; i < 16; i++) {
+            vtable.add(i * 8).writePointer(cm["rstub" + (i - 10)]);
+        }
+        vtable2 = Memory.alloc(0x80);          // 主虚表位(原生 0x99CBE08), 全桩
+        rigZero(vtable2, 0x80);
+        for (var i = 0; i < 16; i++) {
+            vtable2.add(i * 8).writePointer(cm["rstub" + i]);
+        }
     });
-    var dtorVt = null, CB = null, Treal = null, T = null;
+    var dtorVt = null, CB = null, Treal = null, T = null, heapSlot = null;
     rigStep("dtorVt+CB", function () {
         dtorVt = Memory.alloc(0x20);
         rigZero(dtorVt, 0x20);
@@ -193,7 +224,7 @@ function rigBuildProbe() {
         rigZero(CB, 0x40);
         CB.writePointer(dtorVt);
         CB.add(0x08).writeU64(1);          // refcount (binder 每次 ldadd+1)
-        CB.add(0x10).writeU64(777);        // counter 字段
+        CB.add(0x10).writeU64(777);        // 弱计数 canary: 引擎加减永不归零 → 永不析构释放
         CB.add(0x18).writePointer(cm.rdtor);
     });
     rigStep("T", function () {
@@ -201,10 +232,14 @@ function rigBuildProbe() {
         //   越界 0x110 字节, 踩坏 frida 分配器 → gadget 内部崩溃(15:38 实锤)
         Treal = Memory.alloc(0x400);
         rigZero(Treal, 0x400);
+        heapSlot = Memory.alloc(0x100);        // T+0x20 堆指针位(原生为状态机自有堆块)
+        rigZero(heapSlot, 0x100);
         T = Treal.add(8);
         T.writePointer(vtable);            // T+0x00 vptr
         T.add(0x08).writePointer(Treal);   // T+0x08 = T-8 (原生同构)
         T.add(0x10).writePointer(CB);      // T+0x10 = cb (原生同构)
+        T.add(0x18).writePointer(vtable2); // ★ 主虚表位补桩(原生 0x99CBE08; 曾全零, 生产§9候选A)
+        T.add(0x20).writePointer(heapSlot); // ★ 堆指针位补合法指针(曾全零, 候选B)
         T.add(0x28).writeU64(0x32aaaba7);  // 原生常量标记
     });
     var ringPtr = null, headPtr = null;
@@ -221,8 +256,11 @@ function rigBuildProbe() {
     // 回到第五轮形态: 旧路同步上传完成 → completion 直发(2-5s)跑赢泵崩溃(~18s 后)。
     // [T+0x188] 保持全零(0x400 分配区内), 泵 0x248aaac 保留原生实现。
     CB.add(0x20).writePointer(T);
+    rigProbeHistory.push(rigProbe);            // 旧探针保活(引擎可能仍持引用)
     rigProbe = { T: T, CB: CB, cm: cm, ringPtr: ringPtr, headPtr: headPtr, Treal: Treal };
-    rigLog("probe built: T=" + T + " CB=" + CB + " vtable=" + vtable + " ring=" + ringPtr);
+    rigRingTail = 0;                           // 新探针新 ring, 回读游标归零
+    rigLog("probe built(#" + rigProbeCount + "): T=" + T + " CB=" + CB + " vtable=" + vtable +
+        " vtable2=" + vtable2 + " ring=" + ringPtr);
     return rigProbe;
 }
 

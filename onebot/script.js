@@ -470,6 +470,8 @@ var voiceAudioDataAddr = ptr(0);
 var tryMultiphaseAddr = ptr(0);
 var voiceForceLegacyArmed = false;
 var voiceProbe = null; // 假 T/CB/vtable 数据源对象(旧路用, 惰性构建)
+var voiceLastSendAt = 0; // 最近一次语音发送时刻(ms) — cndOnComplete 观察点窗口
+var voiceProbes = [];
 
 
 // 发送消息的全局变量
@@ -1734,6 +1736,26 @@ var VOICE_PROBE_C = [
     "unsigned long rs8(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,8,a,b,c); return 0; }",
     "unsigned long rs9(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,9,a,b,c); return 0; }",
     "void rdtor(void *s) { rput(s, 99, 0, 0, 0); }",
+    // [2026-10-07 生产排障] 全 16 槽覆盖桩: 引擎对假 T 任何虚表槽的调用都进 ring(rput),
+    // 日志可判读引擎到底用了哪些槽(原生二级虚表 0x99CBD00 实为 16 槽, 原 10 槽版
+    // +0x50..+0x78 落零 = 潜在跳零崩溃)。200+ = 桩段 id(主虚表位 vtable2 同名共用)。
+    // 与 rigcapture.js RIG_PROBE_C 保持同构(cmodtest 从 rig 版提取编译验证)。
+    "unsigned long rstub0(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,200,a,b,c); return 0; }",
+    "unsigned long rstub1(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,201,a,b,c); return 0; }",
+    "unsigned long rstub2(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,202,a,b,c); return 0; }",
+    "unsigned long rstub3(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,203,a,b,c); return 0; }",
+    "unsigned long rstub4(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,204,a,b,c); return 0; }",
+    "unsigned long rstub5(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,205,a,b,c); return 0; }",
+    "unsigned long rstub6(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,206,a,b,c); return 0; }",
+    "unsigned long rstub7(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,207,a,b,c); return 0; }",
+    "unsigned long rstub8(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,208,a,b,c); return 0; }",
+    "unsigned long rstub9(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,209,a,b,c); return 0; }",
+    "unsigned long rstub10(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,210,a,b,c); return 0; }",
+    "unsigned long rstub11(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,211,a,b,c); return 0; }",
+    "unsigned long rstub12(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,212,a,b,c); return 0; }",
+    "unsigned long rstub13(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,213,a,b,c); return 0; }",
+    "unsigned long rstub14(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,214,a,b,c); return 0; }",
+    "unsigned long rstub15(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,215,a,b,c); return 0; }",
 ].join("\n");
 
 function voiceZero(addr, n) {
@@ -1742,15 +1764,22 @@ function voiceZero(addr, n) {
     addr.writeByteArray(z);
 }
 
-// 假 T/CB/vtable 数据源对象, 惰性构建(首次语音发送时)。
+// 假 T/CB/vtable 数据源对象, 每次语音发送新建(不缓存!)。
 // ★ T 必须 ≥ 原生尺寸 0x3F8(实分配 0x400): 引擎会写 [T+0x188], 0x80 小分配的
 //   越界写曾踩坏 frida 堆制造连环次生崩溃(战役复盘弯路#3, 勿回退)。
+// ★ [2026-10-07 崩因修复] 旧版跨发送缓存 voiceProbe: 引擎在 Treal 原地重建对象
+//   (GCW dump 实证 [+8]/[+0x10]/[+0x18] 全非我们写的值), 第二发把已重建态对象
+//   再喂进去 = 构造器跑在脏内存上, 完成分发读到 UAF 垃圾 → ldadd SIGBUS。
+//   每发新建 + 历史探针永不释放(引擎异步完成链可能仍持引用, 释放=UAF)。
 function buildVoiceProbe() {
-    if (voiceProbe) return voiceProbe;
     var cm = new CModule(VOICE_PROBE_C);
-    var vtable = Memory.alloc(0x50);
-    voiceZero(vtable, 0x50);
+    var vtable = Memory.alloc(0x80);           // 16 槽(原生 0x99CBD00 实长)
+    voiceZero(vtable, 0x80);
     for (var i = 0; i < 10; i++) vtable.add(i * 8).writePointer(cm["rs" + i]);
+    for (var i = 10; i < 16; i++) vtable.add(i * 8).writePointer(cm["rstub" + (i - 10)]);
+    var vtable2 = Memory.alloc(0x80);          // 主虚表位(原生 0x99CBE08), 全桩
+    voiceZero(vtable2, 0x80);
+    for (var i = 0; i < 16; i++) vtable2.add(i * 8).writePointer(cm["rstub" + i]);
     var dtorVt = Memory.alloc(0x20);
     voiceZero(dtorVt, 0x20);
     dtorVt.add(0x10).writePointer(cm.rdtor);
@@ -1758,14 +1787,18 @@ function buildVoiceProbe() {
     voiceZero(CB, 0x40);
     CB.writePointer(dtorVt);
     CB.add(0x08).writeU64(1);          // refcount (binder 0x31df8ac 每次 ldadd+1)
-    CB.add(0x10).writeU64(777);
+    CB.add(0x10).writeU64(777);        // 弱计数 canary: 引擎 ldadd/ldsub 永不归零 → 永不触发析构释放
     CB.add(0x18).writePointer(cm.rdtor);
+    var heapSlot = Memory.alloc(0x100);        // T+0x20 堆指针位(原生为状态机自有堆块)
+    voiceZero(heapSlot, 0x100);
     var Treal = Memory.alloc(0x400);
     voiceZero(Treal, 0x400);
     var T = Treal.add(8);
     T.writePointer(vtable);            // T+0x00 vptr
     T.add(0x08).writePointer(Treal);   // T+0x08 = T-8 (原生同构)
     T.add(0x10).writePointer(CB);      // T+0x10 = CB (原生同构)
+    T.add(0x18).writePointer(vtable2); // ★ 主虚表位补桩(原生 0x99CBE08; 曾全零, 文档§9候选A)
+    T.add(0x20).writePointer(heapSlot); // ★ 堆指针位补合法指针(曾全零, 文档§9候选B)
     T.add(0x28).writeU64(0x32aaaba7);  // 原生常量标记(macOS _PTHREAD_MUTEX_SIG)
     var ringPtr = Memory.alloc(64 * 48);
     voiceZero(ringPtr, 64 * 48);
@@ -1775,9 +1808,27 @@ function buildVoiceProbe() {
     T.add(0x48).writePointer(headPtr);
     CB.add(0x20).writePointer(T);      // CB 的 T* 槽
     // 注: [T+0x188] 保持全零(0x400 分配区内) — 旧路不启动 worker 泵, 假 P 线已撤销
-    voiceProbe = { T: T, CB: CB };
-    console.log("[+] voice probe built: T=" + T + " CB=" + CB + " vtable=" + vtable);
-    return voiceProbe;
+    var probe = { T: T, CB: CB, Treal: Treal, ring: ringPtr, head: headPtr, cm: cm };
+    voiceProbes.push(probe);
+    voiceProbe = probe;
+    console.log("[+] voice probe built(#" + voiceProbes.length + "): T=" + T + " CB=" + CB +
+        " vtable=" + vtable + " vtable2=" + vtable2);
+    return probe;
+}
+
+// [2026-10-07] ring 回读: 引擎经假 T 虚表调用过哪些槽(rput 记录), 判读 rebuild 行为
+function voiceRingDump(tag) {
+    var p = voiceProbe;
+    if (!p) return;
+    try {
+        var head = Number(p.head.readU64());
+        var s = "[VOICERING] " + tag + " head=" + head;
+        for (var i = 0; i < 8 && head - i > 0; i++) {
+            var ent = p.ring.add(((head - i - 1) & 63) * 48);
+            s += " | s" + ent.add(8).readU64() + " a1=" + ent.add(0x10).readU64();
+        }
+        console.log(s);
+    } catch (e) {}
 }
 
 // TryMultiphase(appconfig.cc) 闸门: 语音任务(0x9C==0x0F)强制 retval=0 → 旧路。
@@ -1820,7 +1871,8 @@ function armVoiceForceLegacy() {
                     var t = args[0];
                     console.log("[VPDBG] GCW this=" + t +
                         " [+8]=" + safePtr(t.add(0x8)) + " [+10]=" + safePtr(t.add(0x10)) +
-                        " [+18]=" + safePtr(t.add(0x18)));
+                        " [+18]=" + safePtr(t.add(0x18)) + " body=" + hexdumpMini(t, 0x40));
+                    voiceRingDump("gcw");
                 } catch (e) {}
             }
         });
@@ -1905,6 +1957,7 @@ function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durat
     const startUploadMedia = new NativeFunction(uploadImageAddr, 'int64', ['pointer', 'pointer']);
 
     voiceUploadSelfTest = true;
+    voiceLastSendAt = Date.now();
     try {
         return startUploadMedia(uploadGlobalX0, uploadVoiceX1);
     } finally {
@@ -2177,6 +2230,7 @@ function cndOnCompleteV3(x2) {
     const currentFileId = v3ReadStr(x2, v3CndOff.fileId);
     var kind = expected[currentFileId];
     if (!kind) return; // 非我们发起的 CDN 任务
+    if (kind === "voice") voiceRingDump("v3");
     // [VOICEDUMP] voice 每次都 dump(<=3), img 首次做校准参照
     if ((kind === "voice" && (cndDumpCount.voice = (cndDumpCount.voice || 0) + 1) <= 3) ||
         (kind === "img" && (cndDumpCount.img = (cndDumpCount.img || 0) + 1) <= 1)) {
@@ -2223,6 +2277,17 @@ function cndOnCompleteV3(x2) {
 function patchCdnOnComplete() {
     Interceptor.attach(cndOnCompleteAddr, {
         onEnter: function (args) {
+            // [VPDBG 2026-10-07] 崩点现场(0x429f0c0 ldadd 的调用者): dump this 与第二层
+            // shared_ptr 槽。仅语音发送后 90s 窗口内(防 img/video 任务刷屏)。
+            try {
+                if (Date.now() - voiceLastSendAt < 90000) {
+                    var cx0 = this.context.x0;
+                    console.log("[VPDBG] cndOnComplete this=" + cx0 +
+                        " [+10]=" + safePtr(cx0.add(0x10)) + " [+18]=" + safePtr(cx0.add(0x18)) +
+                        " body=" + hexdumpMini(cx0, 0x30));
+                    voiceRingDump("cnd");
+                }
+            } catch (e) {}
 
             try {
                 const x2 = this.context.x2;
