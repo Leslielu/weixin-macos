@@ -416,3 +416,72 @@ __throw_system_error ← recursive_mutex::lock ← 0x42a32ac ← 0x42a317c ← 0
 **rig v3.9.2 双发回归（21:24）**：probe#1/#2 每发新建生效、result=1×2、
 零崩溃、binder 观察点开火（freshT=新分配 0x14cf6d060，与生产的"原地重建"不同）。
 P2/P3 保活修复（严格模式声明+挂探针对象，78c85c0）后 rig 成功路径保持。
+
+## 13. 2026-10-08 晨：v3.9.4 — 生产崩根拔除 🏁🏁
+
+**用户决断**：跳过环境差异比较，直接攻生产 crash。
+
+### 13.1 昨晚三份 .ips 重判（第四层崩是假象）
+
+21:29/21:38 两份报告逐帧解读 = **第三层崩原样复发**，并非新崩法：
+```
+worker(0x62c9ee0) → 0x42a317c → 0x42a32ac → recursive_mutex::lock
+  → __throw_system_error → __cxa_throw → terminate → abort
+  → #1 FridaGadget+0x59fcc(frida 的 abort 处理) ← #0 ilink ForceCrashOnSigAbort(微信的)
+```
+两个信号处理器抢同一个 abort，.ips 抓的是战场残骸——"崩进 gadget 代码页"是表象。
+（21:48 那份才是真·gadget 内部崩：gdbus 线程、登录同步期、与 voice 无关。）
+
+### 13.2 反汇编 + 观察点实证（本轮两个决定性证据）
+
+**反汇编**（生产 dylib 74c5f6ac）：
+```
+0x42a3138(W): [W+0x10]==0 → cbz 干净返回（原生非流式任务的天然豁免态）
+              否则 Q=[W+8] → 0x42a3254(Q+0x20, W+0x18)
+0x42a3254:    P2=[(Q+0x20)+8]=[Q+0x28]; lock(P2+0x40)   ← 崩点
+worker 侧:    x0=[[ctx+0x118]+0x18], 虚调用 [x0的vtable+0x30] → 0x42a3138
+```
+
+**v3.9.3 观察点（07:04 那次崩）输出**：
+```
+st1pump W=T+0x180 ✓ Q=我们的P ✓ need/have 收敛 → 阶段1一直没问题是
+st2disp W=0x9c71bd000（引擎 0x9c 只读闭包区对象，不是 T+0x180！）
+        [W+8]=Treal  [W+0x10]=我们的CB
+        → wrapper=Treal+0x20=T+0x18 → 队列=[T+0x20] → lock([T+0x20]+0x40)
+```
+**崩因一句话**：T+0x20 槽（v3.9 当"堆指针"补的 heapSlot 全零块）实际是
+**阶段2嵌套队列指针**，引擎闭包 `{[+8]=Treal,[+10]=CB}` 直接拿它当队列锁 →
+零块 sig 无效 → EINVAL → throw → abort。
+
+### 13.3 v3.9.4 修复（一处对象 + 一处观察点）
+
+1. `buildVoiceProbe`：T+0x20 改挂 **Q2 队列对象**（0x200、pthread init ×2、+0x80=0），
+   heapSlot 退役
+2. 0x42a3138 观察点改为匹配 Treal/CB（v3.9.3 按 P 匹配是错的——W 根本不含 P）；
+   **绝不写 W**（0x9c 只读闭包区，铁律#1；且 [W+0x10]=CB 清零会破坏引用计数经济）
+
+### 13.4 生产验证（2026-10-08 07:10，bot 号）
+
+| 时刻 | 事件 |
+|---|---|
+| 07:10:52 | probe built(#1)，上传 result=0 |
+| 07:10:53 | GCW/st1pump/cndOnComplete 全我们对象；st2disp mine=true；**st2 wrapper=T+0x18 [T+0x20]=Q2 生效** |
+| 07:10:54 | send_voice → `{"status":"ok"}`，微信存活零崩溃 |
+| 07:1x | voice#2 同物料重发 ok；text→ludaohe ok；image→ludaohe ok；全程零 .ips |
+
+**意外发现**：`Q2+0x40sig=0x4d555458`（mars MUTX 标记）——引擎/泵把 Q2 的锁
+**重打成自家 tag 锁**后才锁的；pthread init 的作用是让这块内存"非零可重打"。
+另 07:10:07 一条原生任务走同分发器 `[W+8]=0 [W+10]=0` 干净跳过——空槽豁免态原生存在。
+
+### 13.5 终局语义（生产语音链完整版）
+
+```
+force-legacy(TryMultiphase→0) → 旧路 CGI 直传 → keys 返回 → locator 命中
+→ 完成分发链(GCW/cndOnComplete 走我们 16槽vtable+CB canary) 
+→ worker 泵: 阶段1 [T+0x188]=P(空队列干净退出)
+            阶段2 闭包W{[8]=Treal,[10]=CB} → wrapper=T+0x18 → 队列[T+0x20]=Q2 ✓
+→ send_voice → 手机完整播放(待用户确认)
+```
+
+**遗留**：21:48 gdbus/gadget 内部崩（登录同步期偶发）另案观察；
+本地 rig app 保持生产等价文件（原 dylib/gadget 备份在 `~/Prog/wechat-local-orig/`）。

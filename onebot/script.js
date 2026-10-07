@@ -1814,16 +1814,25 @@ function buildVoiceProbe() {
     CB.add(0x08).writeU64(1);          // refcount (binder 0x31df8ac 每次 ldadd+1)
     CB.add(0x10).writeU64(777);        // 弱计数 canary: 引擎 ldadd/ldsub 永不归零 → 永不触发析构释放
     CB.add(0x18).writePointer(cm.rdtor);
-    var heapSlot = Memory.alloc(0x100);        // T+0x20 堆指针位(原生为状态机自有堆块)
+    var heapSlot = Memory.alloc(0x100);        // (v3.9.4 起不再挂 T+0x20, 见 Q2)
     voiceZero(heapSlot, 0x100);
+    // ★ [2026-10-08 07:04 实证] T+0x20 = 阶段2嵌套队列指针(非"堆指针"):
+    //   引擎闭包 W(0x9c 只读区)={[W+8]=Treal,[W+10]=CB} → 0x42a3138(W) 派发
+    //   0x42a3254(wrapper=Treal+0x20=T+0x18): 队列=[wrapper+8]=[T+0x20],
+    //   lock([T+0x20]+0x40)。v3.9 塞零块 heapSlot → sig 无效 → EINVAL throw →
+    //   terminate → abort(表象=ilink/frida 抢 abort 信号)。
+    var Q2 = Memory.alloc(0x200);
+    voiceZero(Q2, 0x200);
+    voicePthreadInit(Q2, false);
+    voicePthreadInit(Q2.add(0x40), true);      // +0x80=0 空链表, 泵空转干净退出
     var Treal = Memory.alloc(0x400);
     voiceZero(Treal, 0x400);
     var T = Treal.add(8);
     T.writePointer(vtable);            // T+0x00 vptr
     T.add(0x08).writePointer(Treal);   // T+0x08 = T-8 (原生同构)
     T.add(0x10).writePointer(CB);      // T+0x10 = CB (原生同构)
-    T.add(0x18).writePointer(vtable2); // ★ 主虚表位补桩(原生 0x99CBE08; 曾全零, 文档§9候选A)
-    T.add(0x20).writePointer(heapSlot); // ★ 堆指针位补合法指针(曾全零, 文档§9候选B)
+    T.add(0x18).writePointer(vtable2); // ★ 阶段2 wrapper 基址(Treal+0x20); GCW 链经 Treal 读 [+18]=CB, 此槽内容泵不读
+    T.add(0x20).writePointer(Q2);      // ★ 阶段2 嵌套队列(07:04 实证崩因修复)
     T.add(0x28).writeU64(0x32aaaba7);  // 原生常量标记(macOS _PTHREAD_MUTEX_SIG)
     var ringPtr = Memory.alloc(64 * 48);
     voiceZero(ringPtr, 64 * 48);
@@ -1855,7 +1864,7 @@ function buildVoiceProbe() {
     T.add(0x188).writePointer(P);
     CB.add(0x20).writePointer(T);      // CB 的 T* 槽
     var probe = { T: T, CB: CB, Treal: Treal, ring: ringPtr, head: headPtr, cm: cm,
-        P: P, P2: P2, P3: P3 }; // P2/P3 随探针保活(Memory.alloc 无 JS 引用会被 GC 回收→生产悬空雷)
+        P: P, P2: P2, P3: P3, Q2: Q2 }; // P2/P3/Q2 随探针保活(Memory.alloc 无 JS 引用会被 GC 回收→生产悬空雷)
     voiceProbes.push(probe);
     voiceProbe = probe;
     console.log("[+] voice probe built(#" + voiceProbes.length + "): T=" + T + " CB=" + CB +
@@ -1923,11 +1932,57 @@ function armVoiceForceLegacy() {
                 } catch (e) {}
             }
         });
-        console.log("[+] voice force-legacy armed @ " + tryMultiphaseAddr);
+        // [2026-10-08 v3.9.4] 07:04 观察点实证: 0x42a3138 的 W 不是 T+0x180, 是引擎
+        // 0x9c 只读闭包区对象 {[W+8]=Treal, [W+10]=CB}; wrapper=Treal+0x20=T+0x18,
+        // 队列=[T+0x20](v3.9.4 已挂 Q2 队列对象修复)。本观察点只读匹配 Treal/CB
+        // 记录分发现场, 绝不写引擎闭包区(只读页, 铁律#1)。
+        Interceptor.attach(baseAddr.add(0x42a3138), {   // 阶段2分发器(虚调用槽 vtable+0x30)
+            onEnter: function (args) {
+                try {
+                    var W = args[0];
+                    var q8 = W.add(0x8).readPointer();
+                    var c16 = W.add(0x10).readPointer();
+                    var mine = false, mi = -1;
+                    for (var i = 0; i < voiceProbes.length; i++) {
+                        if (voiceProbes[i].Treal && (voiceProbes[i].Treal.equals(q8) ||
+                            (voiceProbes[i].CB && voiceProbes[i].CB.equals(c16)))) { mine = true; mi = i; break; }
+                    }
+                    if (!mine && !voiceRecentSend()) return;
+                    console.log("[VPDBG] st2disp W=" + W + " [W+8]=" + q8 + " [W+10]=" + c16 + " mine=" + mine);
+                    if (mine) {
+                        var w2 = voiceProbes[mi].Treal.add(0x20);        // wrapper=T+0x18
+                        var q2 = safePtr(w2.add(0x8));                    // = [T+0x20] 应为 Q2
+                        var sig = safePtr(voiceProbes[mi].Q2.add(0x40));  // 递归锁 sig
+                        console.log("[VPDBG] st2 wrapper=" + w2 + " [T+0x20]=" + q2 + " Q2+0x40sig=" + sig);
+                    }
+                } catch (e) { console.log("[VPDBG] st2disp err " + e); }
+            }
+        });
+        // 阶段1泵观察(只读): 确认 stage1 用的 P 是我们的还是引擎自己的
+        Interceptor.attach(baseAddr.add(0x248aaac), {
+            onEnter: function (args) {
+                try {
+                    var W = args[0];
+                    var Q = W.add(0x8).readPointer();
+                    var mine = false;
+                    for (var i = 0; i < voiceProbes.length; i++) {
+                        if (voiceProbes[i].P && voiceProbes[i].P.equals(Q)) { mine = true; break; }
+                    }
+                    if (!mine && !voiceRecentSend()) return;
+                    console.log("[VPDBG] st1pump W=" + W + " Q=" + Q + " mine=" + mine +
+                        " need=" + args[2] + " have=" + args[3]);
+                } catch (e) {}
+            }
+        });
+        console.log("[+] voice force-legacy armed @ " + tryMultiphaseAddr + " (+st2 exempt gate)");
     } catch (e) {
         console.error("[!] voice force-legacy arm fail: " + e);
     }
 }
+
+// 最近 90s 内有语音发送 → 观察/豁免判定允许记录非本发对象(判引擎自有 P 用)
+var _voiceLastSendTs = 0;
+function voiceRecentSend() { return (Date.now() - _voiceLastSendTs) < 90000; }
 
 function safePtr(a) { try { return "" + a.readPointer(); } catch (e) { return "?"; } }
 function hexdumpMini(a, n) {
@@ -1940,6 +1995,7 @@ function hexdumpMini(a, n) {
 }
 
 function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durationMs, silkMd5) {
+    _voiceLastSendTs = Date.now();
     if (uploadGlobalX0.equals(ptr(0))) {
         ensureCdnManagerX0();
     }
