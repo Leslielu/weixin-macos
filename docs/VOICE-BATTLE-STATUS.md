@@ -227,3 +227,61 @@ A/B（未启用）；forceLegacy 控制泵 no-op 与 TryMultiphase 强制。
 - **假 T/CB/vtable CModule 对象**（0x400 假 T + 10 槽 vtable + ring，约 80 行）
 - **triggerUploadVoice 接管**（内存式签名 + task 字段组装，约 60 行）
 worker.go 内存式签名改动已在仓库。
+
+## 9. 2026-10-07 傍晚：生产移植 — 上传通、完成链崩（进行中）
+
+**移植内容**（本地已 commit 待推）：
+- `wechat_version/4_1_13_63_mac.json` 新键 `tryMultiphaseAddr=0x574c0c4`
+  （script.js `{{if .tryMultiphaseAddr}}` 可选键渲染，旧 JSON 缺键自动走原路径，
+  4.1.11 渲染验证通过）
+- `onebot/script.js`：VOICE_PROBE_C（与 rigcapture 逐字节同，去 pump_nop 死符号）
+  + buildVoiceProbe（0x400 假T） + armVoiceForceLegacy + triggerUploadVoice 回调对分支
+- 签名注意：**本机(M4-work/Sequoia) 临时钥匙串免弹窗法失效**（set-key-partition-list
+  过但 codesign 仍 errSecInternalComponent）；改走 login.keychain 导入 p12 +
+  弹窗输本机密码一次（已"始终允许"，后续免弹）。
+
+**生产部署后语音首测 = 必崩**（两次复现，mac-m1 bot 号 wxid_4erh8rirquu921）：
+
+| # | 时刻 | 目标 | 崩溃指纹 |
+|---|---|---|---|
+| 1 | 16:41 | filehelper | SIGBUS KERN_PROTECTION_FAILURE @0x109cafaf8, PC=**0x429e540**(GetCallbackWrapper 真身 0x429e4fc+0x44 `ldadd x9,x8,[x8]`), 线程75 |
+| 2 | 16:48 | ludaohe | EXC_ARM_DA_ALIGN **PA failure** @ASCII"frid...", PC=**0x429f0c0**(同区另一函数, 首指令同是 `ldadd`), 线程78, 寄存器全0 |
+
+两次栈一致：`0x429exxx/0x429fxxx ← 0x570a0fc(shared_ptr调用器) ← 0x57d2220 ←
+0x58e95a8 ← 0x58f1c60 ← 0x58ef0dc`——与 rig 成功会话 GetCallbackWrapper 的
+bt 完全同链（完成回调分发路径）。
+
+**第二次完整时间线（16:48）**：
+voice任务(16:48:20) → probe built T=0x1128c7e08 CB=0x13f3db960 → UPSTRUCTDBG
+tag=ours（+0x0/+0x8 回调对写入正确✅）→ 混合式上传成功 duration_ms=13814 →
+VOICEDUMP + cndOnComplete(V3) **cdnKey 抓到** → 16:48:22 **崩** → Go 16:48:23
+收到 send_voice 但 session 已断放弃。**语音消息未送出**。
+
+**已排除**：
+- ❌ 不是函数漂移：两端真 dylib（Resources/wechat.dylib，注意 Frameworks 下 84KB
+  是 stub）`0x429e4fc` 起 128 字节 md5 一致（slice 偏移 0x0a9dc000）
+- ❌ 不是 force-legacy 未生效/上传失败：两次上传均成功+钥匙全返回
+- ✅ 基础功能无损：文本 result=1、图片 result=1、微信存活（force-legacy 只挂 voice）
+
+**崩因分析（当前最强假设）**：崩点都是完成链对"二级控制块 CB2"的 `ldadd` 引用计数
+（x8 取自 GetCallbackWrapper(this=T'-8) 的 `[this+0x18]`，反汇编实证：
+`ldp x24,x19,[x0,#0x10]; cbz x19; add x8,x19,#0x10; ldadd x9,x8,[x8]`）。
+T' = 引擎 binder(0x31df8ac) 从我们假任务重建的对象。rig 里 T'+0x10 槽=freshCB
+（frida 堆，可写）→ ldadd 成功；生产 T'+0x10 读出垃圾/只读指针 → 崩。
+**疑点：假 T 的 T+0x18（原生主虚表 0x99CBE08）/T+0x20（堆ptr）我们是全零**——
+rig 的完成链没调到、生产调到了（本地/生产 dylib md5 不同，完成链 0x58exxx 系列
+未做同址验证；生产 bot 原生流量并发也更多）。
+
+**当前动作（16:5x）**：script.js 加了 VPDBG 只读观察点已部署——
+binder(0x31df8ac) onLeave dump freshT[0x28]/freshCB + GetCallbackWrapper(0x429e4fc)
+onEnter dump this/+8/+10/+18。看门狗全链拉起后（约 16:55 稳定）再发一次语音，
+崩前即有 freshT 全貌 → 决定修复方向：
+- 候选A：T+0x18 填自建 12 槽 stub vtable2（主虚表槽不落原生函数也不落零）
+- 候选B：T+0x20 补合法堆指针
+- 候选C：若 VPDBG 显示 freshT 完全垃圾 → 引擎重建读的字段超出我们认知，回 rig 对照
+
+**回滚开关**：删 JSON 的 tryMultiphaseAddr 键 + 重启 = 语音回 3600B 截断版
+（文本/图不受影响）。生产当前带崩溃版在跑，**语音勿用，文本/图正常**。
+
+**生产试验循环成本**：每发一次语音崩一次 → 看门狗全链恢复 ~2-3 分钟
+（微信启动+回车登录+TCC+onebot），试验节奏以此为准；试验期间 watchdog 勿长期挂起。

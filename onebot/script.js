@@ -123,6 +123,8 @@ function initAddresses() {
     // 4.1.13(structVer=3) 长链 push 入口(可选键): stn.cc __OnPush 函数头。稳态
     // (登录后短链 CGI 窗口关闭) newsync 全以长链 push 到达, 此处=收消息主路+第4出队点
     {{if .onPushAddr}}onPushAddr = baseAddr.add({{.onPushAddr}});{{end}}
+    // [2026-10-07] 语音 force-legacy 闸门(可选键): 缺键=ptr(0)不挂, 语音走原路径
+    {{if .tryMultiphaseAddr}}tryMultiphaseAddr = baseAddr.add({{.tryMultiphaseAddr}});{{end}}
 
     uploadGetCallbackWrapperAddr = baseAddr.add({{.uploadGetCallbackWrapperAddr}});
     uploadGetCallbackWrapperFuncAddr = baseAddr.add({{.uploadGetCallbackWrapperFuncAddr}});
@@ -154,6 +156,7 @@ function initAddresses() {
     setImmediate(attachGetCallbackFromWrapper);
     setImmediate(setupSendReplyMessageDynamic);
     setImmediate(setupDownloadFileDynamic);
+    setImmediate(armVoiceForceLegacy);
     setImmediate(setReceiver);
 }
 
@@ -459,6 +462,14 @@ var voiceUploadSeq = 0; // [2026-10-06] alita fileId 尾部序号(原生为递�
 var voiceNativeFunc1Addr = ptr("0x819a75420");
 var voiceNativeFunc2Addr = ptr("0x819a75400");
 var voiceAudioDataAddr = ptr(0);
+// [2026-10-07 语音战役] force-legacy: TryMultiphase(appconfig.cc) onLeave 对语音
+// 任务(task+0x9C==0x0F) retval.replace(0), 把引擎从 multiphase 流式路(依赖录音
+// 会话状态机, 合成任务只出 3600B=截断根因)拨回 4.1.10 旧路 uploadvoice CGI(cmdid 19)
+// 短链直传。可选键: 旧版 JSON 无 tryMultiphaseAddr 则保持 ptr(0) 走原路径。
+// 详见 docs/VOICE-BATTLE-STATUS.md。
+var tryMultiphaseAddr = ptr(0);
+var voiceForceLegacyArmed = false;
+var voiceProbe = null; // 假 T/CB/vtable 数据源对象(旧路用, 惰性构建)
 
 
 // 发送消息的全局变量
@@ -1677,6 +1688,158 @@ function triggerUploadVideo(receiver, md5, videoPath, payloadHex) {
     return fillUploadX1AndStart(videoIdAddr, videoPathAddr1, uploadVideoX1, receiver, md5, videoPath, payloadHex);
 }
 
+// ================= [2026-10-07] 语音 force-legacy(>3600B 全量上传) =================
+// 机制/实证/复盘见 docs/VOICE-BATTLE-STATUS.md。三段: CModule 假数据源对象 +
+// TryMultiphase 闸门 hook + triggerUploadVoice 回调对分支。
+// C 源与 onebot/rigcapture.js RIG_PROBE_C 逐字节一致(rig 2026-10-07 三轮全量验证
+// 形态: 19438B×2 + 26712B TTS 手机完整播放零崩溃), 仅去掉未引用的 pump_nop 死符号。
+// self 布局(T): +0x00 vtable | +0x08 T-8 | +0x10 CB | +0x28 常量标记 0x32aaaba7
+//   | +0x40 ringPtr | +0x48 headPtr | +0x50 mode | +0x58 silkPtr | +0x60 silkLen | +0x68 readPos
+// vtable: slot_i @ i*8 (i=0..9); serve 契约A/B(mode位) rig 实测未被触发(旧路=自包含
+// CGI, 数据从 task+0x100 内存槽读), stub 仅记账; rs* 让引擎虚分发有合法落点。
+var VOICE_PROBE_C = [
+    "typedef struct { unsigned long seq, slot, a0, a1, a2, a3; } RingEnt;",
+    "#define RING_N 64",
+    "static void rput(void *self, unsigned long slot, unsigned long a1, unsigned long a2, unsigned long a3) {",
+    "  RingEnt *ring = *(RingEnt **)((char *)self + 0x40);",
+    "  unsigned long *head = *(unsigned long **)((char *)self + 0x48);",
+    "  if (!ring || !head) return;",
+    "  unsigned long h = *head;",
+    "  *head = h + 1UL;",
+    "  RingEnt *e = &ring[h & (RING_N - 1)];",
+    "  e->seq = h; e->slot = slot; e->a0 = (unsigned long)self; e->a1 = a1; e->a2 = a2; e->a3 = a3;",
+    "}",
+    "static unsigned long serve(void *self, unsigned long dstPtr, unsigned long lenPtr) {",
+    "  unsigned long mode = *(unsigned long *)((char *)self + 0x50);",
+    "  if (!mode || !dstPtr) return 0;",
+    "  unsigned char *src = *(unsigned char **)((char *)self + 0x58);",
+    "  unsigned long len = *(unsigned long *)((char *)self + 0x60);",
+    "  unsigned long *pos = (unsigned long *)((char *)self + 0x68);",
+    "  unsigned long remain = (len > *pos) ? (len - *pos) : 0;",
+    "  unsigned long n = remain < 3600UL ? remain : 3600UL;",
+    "  unsigned char *dst = (unsigned char *)dstPtr;",
+    "  for (unsigned long i = 0; i < n; i++) dst[i] = src[*pos + i];",
+    "  *pos += n;",
+    "  if (lenPtr) *(unsigned long *)lenPtr = n;",
+    "  return n;",
+    "}",
+    "unsigned long rs0(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,0,a,b,c); return 0; }",
+    "unsigned long rs1(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,1,a,b,c); return 0; }",
+    "unsigned long rs2(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,2,a,b,c); return 0; }",
+    "unsigned long rs3(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,3,a,b,c); if (*(unsigned long *)((char *)s + 0x50) & 1UL) return serve(s, a, b); return 0; }",
+    "unsigned long rs4(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,4,a,b,c); return 0; }",
+    "unsigned long rs5(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,5,a,b,c); if (*(unsigned long *)((char *)s + 0x50) & 2UL) return serve(s, b, c); return 0; }",
+    "unsigned long rs6(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,6,a,b,c); return 0; }",
+    "unsigned long rs7(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,7,a,b,c); return 0; }",
+    "unsigned long rs8(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,8,a,b,c); return 0; }",
+    "unsigned long rs9(void *s, unsigned long a, unsigned long b, unsigned long c, unsigned long d) { rput(s,9,a,b,c); return 0; }",
+    "void rdtor(void *s) { rput(s, 99, 0, 0, 0); }",
+].join("\n");
+
+function voiceZero(addr, n) {
+    var z = [];
+    for (var i = 0; i < n; i++) z.push(0);
+    addr.writeByteArray(z);
+}
+
+// 假 T/CB/vtable 数据源对象, 惰性构建(首次语音发送时)。
+// ★ T 必须 ≥ 原生尺寸 0x3F8(实分配 0x400): 引擎会写 [T+0x188], 0x80 小分配的
+//   越界写曾踩坏 frida 堆制造连环次生崩溃(战役复盘弯路#3, 勿回退)。
+function buildVoiceProbe() {
+    if (voiceProbe) return voiceProbe;
+    var cm = new CModule(VOICE_PROBE_C);
+    var vtable = Memory.alloc(0x50);
+    voiceZero(vtable, 0x50);
+    for (var i = 0; i < 10; i++) vtable.add(i * 8).writePointer(cm["rs" + i]);
+    var dtorVt = Memory.alloc(0x20);
+    voiceZero(dtorVt, 0x20);
+    dtorVt.add(0x10).writePointer(cm.rdtor);
+    var CB = Memory.alloc(0x40);
+    voiceZero(CB, 0x40);
+    CB.writePointer(dtorVt);
+    CB.add(0x08).writeU64(1);          // refcount (binder 0x31df8ac 每次 ldadd+1)
+    CB.add(0x10).writeU64(777);
+    CB.add(0x18).writePointer(cm.rdtor);
+    var Treal = Memory.alloc(0x400);
+    voiceZero(Treal, 0x400);
+    var T = Treal.add(8);
+    T.writePointer(vtable);            // T+0x00 vptr
+    T.add(0x08).writePointer(Treal);   // T+0x08 = T-8 (原生同构)
+    T.add(0x10).writePointer(CB);      // T+0x10 = CB (原生同构)
+    T.add(0x28).writeU64(0x32aaaba7);  // 原生常量标记(macOS _PTHREAD_MUTEX_SIG)
+    var ringPtr = Memory.alloc(64 * 48);
+    voiceZero(ringPtr, 64 * 48);
+    var headPtr = Memory.alloc(8);
+    headPtr.writeU64(0);
+    T.add(0x40).writePointer(ringPtr);
+    T.add(0x48).writePointer(headPtr);
+    CB.add(0x20).writePointer(T);      // CB 的 T* 槽
+    // 注: [T+0x188] 保持全零(0x400 分配区内) — 旧路不启动 worker 泵, 假 P 线已撤销
+    voiceProbe = { T: T, CB: CB };
+    console.log("[+] voice probe built: T=" + T + " CB=" + CB + " vtable=" + vtable);
+    return voiceProbe;
+}
+
+// TryMultiphase(appconfig.cc) 闸门: 语音任务(0x9C==0x0F)强制 retval=0 → 旧路。
+// 语义(4.1.13 静态实证): type2→false / type8→true / 0x9C∈{7,9,0x4EEA,0x4F4E}→true /
+// 其余(voice/img/video)落长判定树, 语音默认 true(multiphase 流式)。
+function armVoiceForceLegacy() {
+    if (voiceForceLegacyArmed || tryMultiphaseAddr.equals(ptr(0))) return;
+    voiceForceLegacyArmed = true;
+    try {
+        Interceptor.attach(tryMultiphaseAddr, {
+            onEnter: function (args) {
+                this._voice = false;
+                try { this._voice = args[0].add(0x9C).readU8() === 0x0F; } catch (e) {}
+            },
+            onLeave: function (ret) {
+                if (this._voice) ret.replace(0);
+            }
+        });
+        // [2026-10-07 生产排障] 语音完成链 SIGBUS 观察点(只读, 不改语义):
+        // 崩点两次均在完成链 ldadd 引用计数(0x429e540/0x429f0c0), x8 取自
+        // GetCallbackWrapper(this=T'-8) 的 [this+0x18]。抓引擎重建对象 freshT 内容。
+        Interceptor.attach(baseAddr.add(0x31df8ac), {   // binder(同址已验): 拷{ T,CB} 后重建
+            onEnter: function (args) {
+                this._task = args[1];
+                try { this._isVoice = this._task.add(0x9C).readU8() === 0x0F; } catch (e) { this._isVoice = false; }
+            },
+            onLeave: function (ret) {
+                if (!this._isVoice) return;
+                try {
+                    var fT = this._task.add(0x0).readPointer();
+                    var fCB = this._task.add(0x8).readPointer();
+                    console.log("[VPDBG] binder freshT=" + fT + " freshCB=" + fCB +
+                        " T[0x28]=" + hexdumpMini(fT, 0x28));
+                } catch (e) {}
+            }
+        });
+        Interceptor.attach(baseAddr.add(0x429e4fc), {   // GetCallbackWrapper 真身
+            onEnter: function (args) {
+                try {
+                    var t = args[0];
+                    console.log("[VPDBG] GCW this=" + t +
+                        " [+8]=" + safePtr(t.add(0x8)) + " [+10]=" + safePtr(t.add(0x10)) +
+                        " [+18]=" + safePtr(t.add(0x18)));
+                } catch (e) {}
+            }
+        });
+        console.log("[+] voice force-legacy armed @ " + tryMultiphaseAddr);
+    } catch (e) {
+        console.error("[!] voice force-legacy arm fail: " + e);
+    }
+}
+
+function safePtr(a) { try { return "" + a.readPointer(); } catch (e) { return "?"; } }
+function hexdumpMini(a, n) {
+    try {
+        var b = new Uint8Array(a.readByteArray(n));
+        var s = "";
+        for (var i = 0; i < b.length; i++) { var t = b[i].toString(16); s += (t.length < 2 ? "0" : "") + t; }
+        return s;
+    } catch (e) { return "ERR"; }
+}
+
 function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durationMs, silkMd5) {
     if (uploadGlobalX0.equals(ptr(0))) {
         ensureCdnManagerX0();
@@ -1704,11 +1867,25 @@ function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durat
     patchString(voicePathAddr1, voicePath);
 
     uploadVoiceX1.writeByteArray(payload);
-    // [2026-10-06 回调对实验] 原生语音的 0x0/0x8 恒为 0x819a75420/0x819a75400(会话内
-    // 稳定), 与图片的 uploadFunc1/2 不同 — 语音数据回调可能就是 3600B 截断的来源。
-    // 优先用原生回调(本会话硬编码 + 未来原生录音自动刷新), 回退图片回调。
-    uploadVoiceX1.writePointer(voiceNativeFunc1Addr || uploadFunc1Addr);
-    uploadVoiceX1.add(0x08).writePointer(voiceNativeFunc2Addr || uploadFunc2Addr);
+    // [2026-10-07 force-legacy] 有 tryMultiphaseAddr(JSON 键) → 旧路 uploadvoice CGI
+    // 直传: 回调对 = 假 T/CB 数据源对象, 不写路径槽(rig 实测形态; 旧路数据从
+    // task+0x100 内存槽读)。缺键 → 原路径(3600B 截断版)。
+    if (!tryMultiphaseAddr.equals(ptr(0))) {
+        var probe = buildVoiceProbe();
+        uploadVoiceX1.writePointer(probe.T);
+        uploadVoiceX1.add(0x08).writePointer(probe.CB);
+        probe.T.add(0x50).writeU64(0);             // mode=0 (serve 契约未启用)
+        probe.T.add(0x58).writePointer(voiceAudioDataAddr);
+        probe.T.add(0x60).writeU64(audioLen);
+        probe.T.add(0x68).writeU64(0);
+    } else {
+        patchString(voicePathAddr1, voicePath);
+        // [2026-10-06 回调对实验] 原生语音的 0x0/0x8 恒为 0x819a75420/0x819a75400(会话内
+        // 稳定), 与图片的 uploadFunc1/2 不同 — 语音数据回调可能就是 3600B 截断的来源。
+        // 优先用原生回调(本会话硬编码 + 未来原生录音自动刷新), 回退图片回调。
+        uploadVoiceX1.writePointer(voiceNativeFunc1Addr || uploadFunc1Addr);
+        uploadVoiceX1.add(0x08).writePointer(voiceNativeFunc2Addr || uploadFunc2Addr);
+    }
     uploadVoiceX1.add(0x48).writePointer(voiceIdAddr);
     uploadVoiceX1.add(0x50).writeU64(voiceIdStr.length);
     uploadVoiceX1.add(0x58).writeU64(uint64("0x8000000000000000").add(voiceIdStr.length + 1));

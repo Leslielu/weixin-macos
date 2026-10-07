@@ -1,6 +1,7 @@
 {
   "structVer": "3",
   "sendFuncAddr": "0x55d1734",
+  "tryMultiphaseAddr": "0x574c0c4",
   "req2bufEnterAddr": "0x42e3450",
   "req2bufExitAddr": "0x42e39c0",
   "mgrCaptureAddr": "0x42e4c2c",
