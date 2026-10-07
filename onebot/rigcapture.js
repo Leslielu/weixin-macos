@@ -192,6 +192,26 @@ function rigZero(addr, n) {
 }
 
 function rigStep(n, fn) { try { fn(); rigLog("bp " + n + " ok"); } catch (e) { rigLog("bp " + n + " FAIL: " + e); throw e; } }
+
+// [2026-10-07 泵契约镜像] 与 script.js voicePthreadInit 同构: 空 P 两个合法递归
+// 互斥量 + P+0x80=0 → 泵(0x248aaac)锁上后出队读空表干净退出。
+var _rigPthreadFns = null;
+function rigPthreadInit(addr, recursive) {
+    if (!_rigPthreadFns) {
+        _rigPthreadFns = {
+            attrInit: new NativeFunction(Module.getGlobalExportByName('pthread_mutexattr_init'), 'int', ['pointer']),
+            attrSettype: new NativeFunction(Module.getGlobalExportByName('pthread_mutexattr_settype'), 'int', ['pointer', 'int']),
+            init: new NativeFunction(Module.getGlobalExportByName('pthread_mutex_init'), 'int', ['pointer', 'pointer'])
+        };
+    }
+    var mattr = Memory.alloc(0x40);
+    rigZero(mattr, 0x40);
+    _rigPthreadFns.attrInit(mattr);
+    if (recursive) _rigPthreadFns.attrSettype(mattr, 2); // Darwin PTHREAD_MUTEX_RECURSIVE=2
+    var rv = _rigPthreadFns.init(addr, mattr);
+    if (rv !== 0) rigLog("pthread_mutex_init @" + addr + " rv=" + rv);
+    return rv;
+}
 function rigBuildProbe() {
     // [2026-10-07 崩因修复镜像] 不再缓存: 引擎在 Treal 原地重建对象(生产 GCW dump
     // 实证), 第二发把已重建态再喂进去 = 构造器跑在脏内存上 → 完成分发读 UAF 垃圾。
@@ -256,8 +276,18 @@ function rigBuildProbe() {
     // 回到第五轮形态: 旧路同步上传完成 → completion 直发(2-5s)跑赢泵崩溃(~18s 后)。
     // [T+0x188] 保持全零(0x400 分配区内), 泵 0x248aaac 保留原生实现。
     CB.add(0x20).writePointer(T);
+    // [2026-10-07 泵契约镜像] [T+0x188] 空队列 P: 合法互斥量×2 + 空链表。
+    // 生产实证 worker 泵会抓本任务(rig 不抓 = 无并发 CDN 流量), 空指针锁 = SEGV。
+    var P = null;
+    rigStep("P", function () {
+        P = Memory.alloc(0x100);
+        rigZero(P, 0x100);
+        rigPthreadInit(P, false);
+        rigPthreadInit(P.add(0x40), true);
+        T.add(0x188).writePointer(P);
+    });
     rigProbeHistory.push(rigProbe);            // 旧探针保活(引擎可能仍持引用)
-    rigProbe = { T: T, CB: CB, cm: cm, ringPtr: ringPtr, headPtr: headPtr, Treal: Treal };
+    rigProbe = { T: T, CB: CB, cm: cm, ringPtr: ringPtr, headPtr: headPtr, Treal: Treal, P: P };
     rigRingTail = 0;                           // 新探针新 ring, 回读游标归零
     rigLog("probe built(#" + rigProbeCount + "): T=" + T + " CB=" + CB + " vtable=" + vtable +
         " vtable2=" + vtable2 + " ring=" + ringPtr);

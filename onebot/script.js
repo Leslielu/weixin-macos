@@ -1771,6 +1771,31 @@ function voiceZero(addr, n) {
 //   (GCW dump 实证 [+8]/[+0x10]/[+0x18] 全非我们写的值), 第二发把已重建态对象
 //   再喂进去 = 构造器跑在脏内存上, 完成分发读到 UAF 垃圾 → ldadd SIGBUS。
 //   每发新建 + 历史探针永不释放(引擎异步完成链可能仍持引用, 释放=UAF)。
+// [2026-10-07 泵破译] worker 泵 0x248aaac(T+0x180,...) 契约(反汇编实证):
+//   P=[T+0x188]; accessor 0xdb84d8=P+0x40; recursive_mutex::lock(P+0x40);
+//   0x62d0f9c: P+0x90 vs tick → 不同则 0x62d11e4 出队: lock(P+0x00), node=[P+0x80],
+//   空(null)→干净退出(unlock+rv)。 ⇒ 空 P 只需: P+0x00/P+0x40 = 合法递归互斥量,
+//   P+0x80=0。v3.4 假 P 崩因 = MUTX 魔数当 pthread 互斥量(sig 必须是
+//   0x32AAABA7 族) → lock EINVAL → std::system_error。rig 不崩生产崩:
+//   rig worker 无并发 CDN 流量, 任务同步完成后即出队; 生产 bot worker 热循环。
+var _pthreadFns = null;
+function voicePthreadInit(addr, recursive) {
+    if (!_pthreadFns) {
+        _pthreadFns = {
+            attrInit: new NativeFunction(Module.getGlobalExportByName('pthread_mutexattr_init'), 'int', ['pointer']),
+            attrSettype: new NativeFunction(Module.getGlobalExportByName('pthread_mutexattr_settype'), 'int', ['pointer', 'int']),
+            init: new NativeFunction(Module.getGlobalExportByName('pthread_mutex_init'), 'int', ['pointer', 'pointer'])
+        };
+    }
+    var mattr = Memory.alloc(0x40);
+    voiceZero(mattr, 0x40);
+    _pthreadFns.attrInit(mattr);
+    if (recursive) _pthreadFns.attrSettype(mattr, 2); // Darwin PTHREAD_MUTEX_RECURSIVE=2(非 Linux 的1)
+    var rv = _pthreadFns.init(addr, mattr);
+    if (rv !== 0) console.error("[!] pthread_mutex_init @" + addr + " rv=" + rv);
+    return rv;
+}
+
 function buildVoiceProbe() {
     var cm = new CModule(VOICE_PROBE_C);
     var vtable = Memory.alloc(0x80);           // 16 槽(原生 0x99CBD00 实长)
@@ -1806,9 +1831,16 @@ function buildVoiceProbe() {
     headPtr.writeU64(0);
     T.add(0x40).writePointer(ringPtr);
     T.add(0x48).writePointer(headPtr);
+    // [2026-10-07 泵契约] 空 P: 两个合法递归互斥量 + 空链表(P+0x80=0) → 泵锁上后
+    // 出队读空表干净退出。[T+0x188] 不能再留全零: 生产 bot worker 热循环会抓到
+    // 本任务去锁 [P+0x40], 空指针锁 = 18:14:41 SIGSEGV(0x248ab0c←0x42a1d98)。
+    var P = Memory.alloc(0x100);
+    voiceZero(P, 0x100);
+    voicePthreadInit(P, false);            // P+0x00: 出队路径锁(0x62d11e4)
+    voicePthreadInit(P.add(0x40), true);   // P+0x40: 泵递归锁(0x6d963ac/.ips recursive_mutex 实证)
+    T.add(0x188).writePointer(P);
     CB.add(0x20).writePointer(T);      // CB 的 T* 槽
-    // 注: [T+0x188] 保持全零(0x400 分配区内) — 旧路不启动 worker 泵, 假 P 线已撤销
-    var probe = { T: T, CB: CB, Treal: Treal, ring: ringPtr, head: headPtr, cm: cm };
+    var probe = { T: T, CB: CB, Treal: Treal, ring: ringPtr, head: headPtr, cm: cm, P: P };
     voiceProbes.push(probe);
     voiceProbe = probe;
     console.log("[+] voice probe built(#" + voiceProbes.length + "): T=" + T + " CB=" + CB +
