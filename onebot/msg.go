@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -56,6 +58,11 @@ func Download(rawMsg []byte) error {
 		req.Media = append(req.Media, downloadReq.Media...)
 	}
 	req.LastAppendTime = time.Now().UnixMilli()
+
+	// [2026-10-08 语音音质排障] 语音族 CDN(7f0c 前缀)分片落盘, 供与发送侧 silk 对比
+	if strings.HasPrefix(downloadReq.CDNURL, "7f0c") {
+		_ = os.WriteFile("/tmp/voice_rx.bin", req.Media, 0644)
+	}
 
 	return nil
 }

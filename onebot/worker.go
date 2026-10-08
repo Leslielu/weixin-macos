@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -478,6 +479,34 @@ func HandleMsg(jsonData []byte) ([]byte, error) {
 	for _, msg := range m.Message {
 		switch msg.Type {
 		case "record":
+			// [2026-10-08 RX-DBG] voicemsg: XML 提 aeskey → 解密已捕获的 7f0c CDN 分片 → md5 对比
+			// ⚠ 仅排障用(VOICE_RX_DBG=1): GetDownloadPath 对无分片的 URL 最长阻塞 60s,
+			// 生产不开此门控会拖慢 record 消息处理
+			if os.Getenv("VOICE_RX_DBG") == "1" {
+				if m2 := regexp.MustCompile(`aeskey="([^"]+)"`).FindStringSubmatch(msg.Data.Text); len(m2) > 1 {
+					Info("[RX-DBG] voicemsg aeskey=" + m2[1])
+					Info("[RX-XML] " + msg.Data.Text)
+					userID2FileMsgMap.Range(func(k, v any) bool {
+						if url, ok := k.(string); ok && strings.HasPrefix(url, "7f0c") {
+							Info("[RX-DBG] try decrypt cdn=" + url[:44])
+							fp, err := GetDownloadPath(url, m2[1], "bin", 0)
+							if err == nil {
+								if data, rerr := os.ReadFile(fp); rerr == nil {
+									head := ""
+									if len(data) >= 16 {
+										head = fmt.Sprintf("%x", data[:16])
+									}
+									Info("[RX-DBG] decrypted", "path", fp, "len", len(data),
+										"md5", fmt.Sprintf("%x", md5.Sum(data)), "head", head)
+								}
+							} else {
+								Info("[RX-DBG] decrypt fail", "err", err)
+							}
+						}
+						return true
+					})
+				}
+			}
 			path, err := SaveAudioFile(msg.Data.Media)
 			if err != nil {
 				Error("保存音频失败", "err", err)

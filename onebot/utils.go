@@ -62,6 +62,29 @@ func SaveBase64Image(base64Data string) (string, string, error) {
 	return targetPath, md5Str, nil
 }
 
+// SilkDurationMs 按 tencent silk 块结构(02 #!SILK_V3 + [u16le len][payload]*, 每块20ms)
+// 估算时长；解析失败(截断/畸形)时返回按平均码率 20B/块 的粗估值，绝不返回 0。
+func SilkDurationMs(silk []byte) int32 {
+	body := silk[10:]
+	blocks := 0
+	for i := 0; i+2 <= len(body); {
+		n := int(binary.LittleEndian.Uint16(body[i : i+2]))
+		if n == 0xFFFF {
+			break
+		}
+		i += 2
+		if i+n > len(body) {
+			break
+		}
+		blocks++
+		i += n
+	}
+	if blocks == 0 {
+		blocks = len(body) / 22
+	}
+	return int32(blocks * 20)
+}
+
 // SaveVoiceFile 解码base64音频数据并保存为文件（不追加salt，保持二进制完整性）
 // 返回原始字节、文件路径、错误
 func SaveVoiceFile(base64Data string) ([]byte, string, error) {
@@ -187,9 +210,11 @@ func mimeToExt(mimeType string) string {
 // 如果输入已经是该格式，则直接返回
 // 返回: silkData, 时长(毫秒), error
 func ConvertToSilk(audioData []byte) ([]byte, int32, error) {
-	// 已经是tencent SILK格式 (\x02#!SILK_V3)，直接返回，时长未知设为0
+	// 已经是tencent SILK格式 (\x02#!SILK_V3)，直接返回
+	// [2026-10-08 fix] 透传也要给 voicelength: 按 20ms/块 数块数, 0 会让
+	// 接收端 voicelength=0 (气泡异常/疑似A类崩诱因), 与视频 duration=0 同族问题
 	if len(audioData) > 10 && audioData[0] == 0x02 && bytes.HasPrefix(audioData[1:], []byte("#!SILK_V3")) {
-		return audioData, 0, nil
+		return audioData, SilkDurationMs(audioData), nil
 	}
 
 	// 先用ffmpeg将输入音频转为PCM (s16le, 16000Hz, mono)
@@ -224,7 +249,9 @@ func ConvertToSilk(audioData []byte) ([]byte, int32, error) {
 	// 尝试使用外部silk-encoder（和微信兼容性更好）
 	silkData, err := encodeSilkExternal(pcmBytes)
 	if err != nil {
-		// fallback: 使用go-silk库
+		// [2026-10-08 破案] go-silk 产物腾讯解码器不认(接收端滋啦/无声)。
+		// 此回退只保证"能发出去"，接收端基本不可听 —— 必须大声告警。
+		Warn("外部pilk编码器不可用！回退go-silk(腾讯端不兼容,接收端会滋啦)", "err", err)
 		silkData, err = silk.EncodePcmBuffToSilk(pcmBytes, 16000, 16000, true)
 		if err != nil {
 			return nil, 0, fmt.Errorf("encode silk error: %v", err)
@@ -254,6 +281,8 @@ func mixNoiseFloor(pcm []byte) {
 }
 
 // encodeSilkExternal 使用外部pilk(Python)工具编码pcm->silk(和微信兼容)
+// [2026-10-08 音质破案] go-silk 回退产物腾讯解码器不认(接收端滋啦/无声, 生产全灭根因)，
+// pilk 可用性是硬依赖：按候选解释器依次尝试，全部失败必须让调用方告警。
 func encodeSilkExternal(pcmBytes []byte) ([]byte, error) {
 	tmpPcm, err := os.CreateTemp("", "voice_*.pcm")
 	if err != nil {
@@ -270,14 +299,21 @@ func encodeSilkExternal(pcmBytes []byte) ([]byte, error) {
 	tmpSilk := tmpPcm.Name() + ".silk"
 	defer os.Remove(tmpSilk)
 
-	pyScript := fmt.Sprintf(`import pilk; pilk.encode("%s", "%s", pcm_rate=16000, tencent=True)`, tmpPcm.Name(), tmpSilk)
-	cmd := exec.Command("python3", "-c", pyScript)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("pilk encode failed: %v, %s", err, stderr.String())
+	// 候选解释器：launchd PATH 只有 /usr/bin(无pilk)，必须显式覆盖 homebrew 路径
+	interpreters := []string{"python3", "/opt/homebrew/bin/python3", "/opt/homebrew/bin/python3.11"}
+	pyScript := fmt.Sprintf(`import pilk; pilk.encode("%s", "%s", pcm_rate=16000, max_rate=16000, tencent=True)`, tmpPcm.Name(), tmpSilk)
+	var lastErr error
+	for _, py := range interpreters {
+		cmd := exec.Command(py, "-c", pyScript)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			lastErr = fmt.Errorf("%s: %v, %s", py, err, stderr.String())
+			continue
+		}
+		return os.ReadFile(tmpSilk)
 	}
-	return os.ReadFile(tmpSilk)
+	return nil, lastErr
 }
 
 // GetVideoDuration 使用ffprobe获取视频时长（秒）
@@ -327,6 +363,8 @@ func FileToBase64(filePath string) (string, error) {
 }
 
 func SaveAudioFile(silkBytes []byte) (path string, err error) {
+	// [2026-10-08 音质排障] 接收语音原始字节落盘
+	_ = os.WriteFile("/tmp/voice_rx_raw.bin", silkBytes, 0644)
 	mp3Bytes, err := SilkToMp3(silkBytes)
 	if err != nil {
 		return "", err

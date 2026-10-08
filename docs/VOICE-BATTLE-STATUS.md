@@ -485,3 +485,161 @@ force-legacy(TryMultiphase→0) → 旧路 CGI 直传 → keys 返回 → locato
 
 **遗留**：21:48 gdbus/gadget 内部崩（登录同步期偶发）另案观察；
 本地 rig app 保持生产等价文件（原 dylib/gadget 备份在 `~/Prog/wechat-local-orig/`）。
+
+## 15. 2026-10-08 午：音质战役终局 — 根因 = 生产无 pilk 静默回退 go-silk 🏁🏁🏁
+
+**判决链（全部当天闭环）**：
+
+| 实验 | 变量 | 结果 |
+|---|---|---|
+| 12:31 原生桌面 silk 字节 → 本地旧路管道 → bot | 字节来源 | **正常播放** → 管道/voiceurl/XML/下载道全无罪 |
+| 12:35 V1/V2/V3（pilk 三种参数）→ 本地管道 → bot | pilk 参数 | **三条全部正常** → 编码参数也不是问题 |
+| 12:39 go-silk 编码同素材 → 本地管道 → bot | **仅编码器** | **滋啦** ← 症状完美复现，铁案 |
+
+**用户点破的分布规律**："本地发从来没问题，出问题的全是远端发的" —— 本地有 pilk（homebrew），
+生产 mac-m1 只有 /usr/bin/python3（无 pilk）→ `encodeSilkExternal` 静默失败 → 回退 go-silk →
+**go-silk 码流腾讯解码器不认** → Mac 滋啦全程 / 手机语音道永远等不到可解码数据转圈。
+
+**为什么拖了两天**：所有 silk 验证都用 go-silk 解码 go-silk 产物 —— 自证清白永远绿。
+教训：**验证器与被验物同源 = 假验证**。
+
+**修复（2026-10-08 12:44 生产已部署验证）**：
+1. mac-m1 `/opt/homebrew/bin/python3.11 -m pip install pilk`
+2. `encodeSilkExternal`：候选解释器序列（python3 → /opt/homebrew/bin/python3 → python3.11）
+   显式覆盖 launchd PATH；`pilk.encode(..., pcm_rate=16000, max_rate=16000, tencent=True)`
+   （max_rate 补一致，旧调用 16k API 配默认 24k 内部带宽属非法组合）
+3. go-silk 回退从静默改为 **Warn 大字告警**（"接收端会滋啦"）
+4. 附带修复：silk 透传 voicelength=0 → SilkDurationMs 按块数估算（20ms/块）
+5. 附带平反：mixNoiseFloor（10-06 加的微型帧噪声地板）确认**过度治疗**——原生 silk 本来
+   就有 11B 微型静音块；保留无害，后续可摘
+
+**生产验证 12:44**：bot→ludaohe 13.8s TTS 语音，pilk md5=29f7d7eb（新产物）、result=1、
+回退告警 0 次、微信存活。（手机端最终验收：待用户确认）
+
+**仍在册的附带发现**（不阻塞）：
+- record 推送 2 字节 stub 在接收端 onebot 走 SilkToMp3 失败致整条转发中止（历史 64 次）
+- 10-06 "微型帧断流" 结论作废（真根因当时已在别处）
+
+### 旧 §14 标题存档
+
+## 14. 2026-10-08 晨：音质战役 — 崩溃已终结，接收端播放全灭（进行中）
+
+### 14.1 症状矩阵（用户耳朵实测）
+
+| 端 | 症状 |
+|---|---|
+| 手机（ludaohe）播 bot→ludaohe 语音 | **动画一直转、完全无声**（= 截断时代原始症状） |
+| 本机 Mac（ludaohe 登录）播同消息 | **滋啦滋啦噪音**（时长能撑满） |
+| 早期 bot→filehelper（07:10） | 0.5s 噪音即停 |
+
+**两个客户端、两种死法** → 指向消息/文件在 receiver 侧的解释错误，而非单纯文件问题。
+
+### 14.2 已洗清的嫌疑（全部铁证）
+
+| 环节 | 证据 |
+|---|---|
+| silk 编码器 | 同二进制同 wav；解码回来=纯净语音（动态范围 43、过零率 0.15）；四份各时代 silk 帧链全 OK（690 帧=13.8s 整） |
+| 引擎入口字节 | `[VPDBG] legacy task` 观察：ptr/len/head/tail 全对（07:22/07:27 两轮） |
+| CDN 文件内容 | **接收端 parasitic 解密**（Download 钩子截分片 + 消息 XML 里的 aesKey）→ 与发送 silk **前 26785 字节零差异**，尾部仅 15 字节 PKCS#7 补齐 |
+| aesKey | 解密成功本身就是证明（错 key 解不出合法 silk 魔数） |
+| 消息 XML 参数 | voiceformat="4"/voicelength=13814/length≈silkLen/aeskey/voiceurl 全对，与 rig 成功时代同构（voice_builder.go 自 fb716ff 未改） |
+| 服务端校验 | 完成结构 md5Key == md5(我们的 silk)；+0x110 == silk 字节数 |
+
+**接收端拿到的 voicemsg XML**（RX-XML 观察，07:47 轮）：
+```xml
+<msg><voicemsg endflag="1" cancelflag="0" forwardflag="0" voiceformat="4"
+  voicelength="13814" length="26644" bufid="0" aeskey="..."
+  voiceurl="7f0c0000..." voicemd5="" clientmsgid="..."
+  fromusername="wxid_4erh8rirquu921" silklength="0" /></msg>
+```
+可疑空字段：`bufid="0"`、`voicemd5=""`、`silklength="0"`（rig 成功时代同为空——但见 14.3）。
+
+### 14.3 关键认知修正：rig 时代从未验证过 receiver 侧
+
+rig 全部成功回放 = **sender 自己 filehelper 里的副本**（ludaohe 多端同步，
+手机播的是 sender 侧同步消息，可能走 sender 本地状态而非 receiver 下载链）。
+bot→ludaohe = 首次真 receiver 侧回放 = 破。**旧路语音的 receiver 侧回放从未被证明过。**
+
+### 14.4 排障工具链（本轮新增，本地 onebot-debug）
+
+- `msg.go`：语音族 CDN(7f0c) 分片落盘 `/tmp/voice_rx.bin`
+- `utils.go SaveAudioFile`：接收音频原始字节落盘 `/tmp/voice_rx_raw.bin`
+- `worker.go record case`：RX-DBG（XML 提 aeskey→解密已捕获分片→md5 对比）+ RX-XML（全 XML dump）
+- `silktest/decode`：silk→wav+语音/噪音统计判定（RMS 动态范围/过零率）
+- 生产 script.js v3.9.5：0x58c3b44 入口字节核对观察点
+
+### 14.5 下一步
+
+1. **取原生 receiver 侧 voicemsg XML**（ludaohe 收到任意真人语音 → RX-XML hook 自动抓）
+   → 与我们的逐字段 diff（重点：bufid/voicemd5/silklength/endflag/clientmsgid 结构）
+2. 按 diff 修 BuildVoiceMsgProto 或上传 task 字段 → 生产复测
+3. 副线：本机 GUI 点播 bot 语音（Mac 与手机症状已由用户分别确认，此步可跳过）
+4. 用户听 07:26 本地发 filehelper 那条（sender 侧回放验证，区分 sender/receiver 路径假设）
+
+### 14.6 2026-10-08 午间：原生样本三连 + 下载道分离实锤（进行中）
+
+**样本链（今日全部拿到 XML+钥匙）**：
+
+| 样本 | 路径 | voicelength | voiceurl 类型字 | 状态 |
+|---|---|---|---|---|
+| 我们 07:46 | bot→ludaohe 旧路 CGI | 13814ms | **7f0c0000** | Mac 滋啦 / 手机转圈 |
+| 原生#1 08:41 | ludaohe 手机→bot | 6780ms | 7f0c0004 | **发送失败⚠️**（bot 当时离线，未送达，气泡点不播） |
+| 原生#2 11:39 | ludaohe 手机→bot 重发 | 6860ms | **7f0c0006** | 已送达 bot（生产日志实锤），但未同步到本地 Mac |
+| 原生#3 12:13 | **bot 桌面录制→ludaohe** | 7840ms | **7f0c0004** | **本地 Mac 正常播放 ✓**（用户耳测） |
+
+**字段级排除（原生#3 vs 我们，桌面对桌面最干净）**：
+- TLV 字段 `0a`：01=手机端 / **02=桌面端**（原生#3 与我们同为 02）→ 平台标记，与故障无关
+- clientmsgid：桌面原生 = `ASCII前缀+UUID`，与我们**同格式** → 无嫌疑
+- bufid="0" / voicemd5="" / silklength="0"：原生同样为空 → 无嫌疑
+- **唯一持续显著差异：voiceurl[2:4] —— 我们恒 0000（旧路 CGI），原生恒 0003/0004/0006（multiphase 族）**
+
+**下载道分离实锤（本轮最重要发现）**：
+- 我们 07:46 的 0000 blob：**push 同秒自动下载**（07:46:21 分片即达，非点击触发），走的是
+  CdnManager 通用道（downloadFileAddr 钩子捕获）→ 客户端"拿到了完整密文"却仍播放失败
+- 原生#3 12:13 的 0004 blob：用户点播正常，但**通用道钩子零分片** → 走语音专用下载道
+  （script.js 只挂了 image/file/video 三条回调，语音道是第四条未挂）
+- **推论**：4.1.13 客户端语音播放的消费路径按 voiceurl 族选择；旧路 0000 blob 被通用道
+  自动拉取后，播放器不读它 → Mac 按 voicelength 生成噪声填充(滋啦全程)、手机语音道
+  永远等不到数据(转圈)。文件/密钥/XML 全对但播放器根本不消费 = 与 §14.2 全部铁证相容。
+
+**Mac 静态噪声的残余竞争假设**：(B) silk 码流变体不兼容（原生可能 24kHz，我们 pilk 16kHz）
+—— 尚未排除。**判决实验进行中**：用户在本地录原生语音 → 抓桌面原生 silk 临时文件 →
+把**原生字节**灌进生产 bot 旧路管道重发 ludaohe：
+- 原生字节也滋啦 → (A) 管道判死刑（旧路对 4.1.13 接收端不可修，需换上传路）
+- 原生字节正常 → (B) 编码器参数问题（改 24kHz 编码即可，便宜得多）
+
+### 14.7 原生桌面 silk 抓取成功 + 判决实验发出（12:29-12:31）
+
+**工具**：UPSTRUCTDBG 观察点扩展（uploadImageAddr 入口对 native voice 任务读 0x100/0x108
+silk 缓冲全量 hex 回传 Go 落盘 /tmp/voicecmp/native_desktop_*.silk）—— 10-06 已证原生语音
+同样走内存缓冲式，观察点只读零行为改动。
+
+**结构对比（原生桌面 7.9s/13049B vs 我们 13.8s/26785B）**：
+
+| 维度 | 原生桌面 | 我们(pilk+噪声地板) |
+|---|---|---|
+| magic | 02 #!SILK_V3 ✓ | 同 |
+| 块结构 | 393 块×20ms 整 ✓ | 690 块×20ms 整 ✓ |
+| 码率 | 13.3 kbps | 15.5 kbps |
+| **微型静音块(<20B)** | **48 个，min 11B** | **0 个（噪声地板抬到 ≥24B）** |
+
+→ **原生 silk 本来就带微型静音块**。10-06 "微型帧致 CDN 断流" 的结论被推翻
+（真根因是后来的 fileId/alita 归属 + T+0x20 队列对象），mixNoiseFloor 属于过度治疗
+（无害但无必要）。两族结构同源，无天然格式不兼容迹象。
+
+**判决实验（12:31 发出）**：对抓到的原生 silk 做单字节异变（防 CDN 秒传返回原生族 URL，
+异变点=首个 18B 静音微块 payload 尾字节，结构/听感不变，go-silk 解码验证纯净语音）
+→ 本地 rig 旧路管道发 bot（voicelength=7860，SilkDurationMs 修复首次实战）→
+result=1 + 服务端 ack。等用户在远端 Mac 播放判决。
+
+**附带发现**：record 推送 2 字节 stub（08 00）在生产 onebot 走 SilkToMp3 失败
+（"not a silk" 64 次历史）导致整条转发中止 —— 转发健壮性 bug 另案待修
+（stub 应跳过转换直接转发）。
+
+**若 (A) 成立的候选路线**：
+1. 虚拟麦克风方案（BlackHole + GUI 按住录音）：客户端全程原生，无协议伪造
+2. 直连 multiphase CGI（upload_init/part/finish 经 SubmitCgi，仿 send_file_simple 模式）
+3. 维持 record→file 降级（现状保底）
+
+**排障工具链补充**：日志 grep 注意结构化日志键值间有 ANSI 色码（`cdn_url=` 后跟 `\x1b[0m`），
+`grep "cdn_url=7f0c"` 永远不命中，要 grep 裸值；`/tmp/voicecmp/silkstat.py` 块结构分析。

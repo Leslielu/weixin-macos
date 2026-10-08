@@ -1974,6 +1974,28 @@ function armVoiceForceLegacy() {
                 } catch (e) {}
             }
         });
+        // [2026-10-08 音质排障] 旧路 handler 入口核对引擎侧 silk 字节:
+        // 0.5s噪音嫌疑 = 出站字节被截/被换。dump task+0x100{ptr,len}头尾 + T数据源。
+        Interceptor.attach(baseAddr.add(0x58c3b44), {
+            onEnter: function (args) {
+                try {
+                    var task = args[1];
+                    var p = task.add(0x100).readPointer();
+                    var len = Number(task.add(0x108).readU64());
+                    var head = p.equals(ptr(0)) ? "NULL" : hexdumpMini(p, 16);
+                    var tail = (len > 32 && !p.equals(ptr(0))) ? hexdumpMini(p.add(len - 16), 16) : "-";
+                    var tp = task.add(0x0).readPointer();
+                    var tbuf = "-", tlen = "-";
+                    try {
+                        tbuf = "" + tp.add(0x58).readPointer();
+                        tlen = "" + tp.add(0x60).readU64();
+                    } catch (e2) {}
+                    console.log("[VPDBG] legacy task=" + task + " silk{ptr=" + p + " len=" + len +
+                        "} head=" + head + " tail=" + tail + " T.buf=" + tbuf + " T.len=" + tlen +
+                        " audioAddr=" + voiceAudioDataAddr);
+                } catch (e) { console.log("[VPDBG] legacy dump err " + e); }
+            }
+        });
         console.log("[+] voice force-legacy armed @ " + tryMultiphaseAddr + " (+st2 exempt gate)");
     } catch (e) {
         console.error("[!] voice force-legacy arm fail: " + e);
@@ -2129,6 +2151,17 @@ function triggerUploadVoiceFile(receiver, silkPath, md5hex, payloadHex, duration
     return "fail";
 }
 
+// [NATIVESILK 2026-10-08] ArrayBuffer → hex 字符串(小写), 原生 silk 回传用
+function buf2hex(buf) {
+    var arr = new Uint8Array(buf);
+    var s = "";
+    for (var i = 0; i < arr.length; i++) {
+        var h = arr[i].toString(16);
+        s += (h.length < 2 ? "0" + h : h);
+    }
+    return s;
+}
+
 // [UPSTRUCTDBG 2026-10-06] 语音上传结构 4.1.13 校准: dump 上传入口 x1 任务结构。
 // 背景: 语音内存缓冲注入(0x100/0x108/0x110 槽)是 4.1.10 逆向的, 4.1.13 疑似布局漂移
 // (同一 silk 两次发送分别出现"放1s"/"无声", 野指针特征)。img/video 走文件路径式是好的。
@@ -2179,6 +2212,20 @@ function attachUploadStructDbg() {
                         console.log("[+] 原生语音回调对已捕获: 0x" + f1 + " / 0x" + f2 +
                             (m ? " module=" + m.name + " base=" + m.base : " (无模块,裸mmap)"));
                     }
+                    // [NATIVESILK 2026-10-08] 原生桌面录音的 silk 内存缓冲(0x100=ptr/0x108=len,
+                    // 10-06 UPSTRUCTDBG 已证 native 语音也走内存缓冲式)全量回传 Go 落盘,
+                    // 用于 (A)旧路管道 vs (B)silk码流变体 判决实验。只读。
+                    try {
+                        var sp = x1.add(0x100).readPointer();
+                        var sl = x1.add(0x108).readU64().toNumber();
+                        if (!sp.isNull() && sl > 100 && sl < 2000000 && isReadablePointer(sp)) {
+                            var silkHex = buf2hex(sp.readByteArray(Math.min(sl, 400000)));
+                            send({ type: "nativesilk", len: sl, hex: silkHex });
+                            console.log("[NATIVESILK] 原生 silk 已回传 len=" + sl);
+                        } else {
+                            console.log("[NATIVESILK] 缓冲无效 ptr=" + sp + " len=" + sl);
+                        }
+                    } catch (ens) { console.error("[NATIVESILK] err: " + ens); }
                 }
                 var limit = (kind === "voice") ? 6 : 1;
                 upStructDumpCount[kind] = upStructDumpCount[kind] || 0;

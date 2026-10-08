@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -356,6 +358,19 @@ func loadJs() {
 							err = Download(payloadJson)
 							if err != nil {
 								Error("下载失败", "err", err)
+							}
+						case "nativesilk":
+							// [2026-10-08 音质判决实验] 原生桌面录音 silk 全量落盘
+							if hexStr, ok := pMap["hex"].(string); ok {
+								raw, derr := hex.DecodeString(hexStr)
+								if derr == nil && len(raw) > 100 {
+									fp := fmt.Sprintf("/tmp/voicecmp/native_desktop_%d.silk", time.Now().Unix())
+									_ = os.MkdirAll("/tmp/voicecmp", 0755)
+									_ = os.WriteFile(fp, raw, 0644)
+									Info("[NATIVESILK] 原生silk落盘", "path", fp, "len", len(raw), "md5", fmt.Sprintf("%x", md5.Sum(raw)))
+								} else {
+									Error("[NATIVESILK] hex解码失败", "err", derr)
+								}
 							}
 						}
 
