@@ -22,6 +22,12 @@ import (
 func main() {
 	initFlag()
 	initLogger()
+	// 部署硬约束: pilk(silk编码器)启动自检 —— 缺失时语音会静默产出腾讯端不认的
+	// go-silk 码流(接收端滋啦, 2026-10-08 两天才定位), 宁可拒绝启动也不带病上线
+	if err := CheckSilkEncoder(); err != nil {
+		Fatal("silk编码器自检失败, 拒绝启动", "err", err)
+	}
+	Info("silk编码器自检通过(pilk, tencent格式)")
 	if config.FridaType == "gadget" {
 		initFridaGadget()
 	} else {

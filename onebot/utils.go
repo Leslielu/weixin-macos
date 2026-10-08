@@ -249,13 +249,10 @@ func ConvertToSilk(audioData []byte) ([]byte, int32, error) {
 	// 尝试使用外部silk-encoder（和微信兼容性更好）
 	silkData, err := encodeSilkExternal(pcmBytes)
 	if err != nil {
-		// [2026-10-08 破案] go-silk 产物腾讯解码器不认(接收端滋啦/无声)。
-		// 此回退只保证"能发出去"，接收端基本不可听 —— 必须大声告警。
-		Warn("外部pilk编码器不可用！回退go-silk(腾讯端不兼容,接收端会滋啦)", "err", err)
-		silkData, err = silk.EncodePcmBuffToSilk(pcmBytes, 16000, 16000, true)
-		if err != nil {
-			return nil, 0, fmt.Errorf("encode silk error: %v", err)
-		}
+		// [2026-10-08 破案] go-silk 产物腾讯解码器不认(接收端滋啦/无声), 当年的
+		// 静默回退正是两天才定位的事故根源 —— 回退已删除: pilk 不可用就明确失败,
+		// 绝不发滋啦语音。启动时有 CheckSilkEncoder 硬约束兜底。
+		return nil, 0, fmt.Errorf("pilk编码器不可用, 拒绝编码(修复: /opt/homebrew/bin/python3 -m pip install pilk): %w", err)
 	}
 
 	return silkData, durationMs, nil
@@ -314,6 +311,26 @@ func encodeSilkExternal(pcmBytes []byte) ([]byte, error) {
 		return os.ReadFile(tmpSilk)
 	}
 	return nil, lastErr
+}
+
+// CheckSilkEncoder 部署硬约束自检: 真跑一遍 pilk 编码并验证 tencent silk 头
+// (0x02 + "#!SILK_V3")。[2026-10-08 教训] 生产缺 python3+pilk 时曾静默回退
+// go-silk, 腾讯解码器不认 → 接收端全程滋啦, 两天才定位。缺依赖必须在启动
+// 第一分钟爆出来, 不带病上线。pilk tencent=True 头字节已实测定稿(0.2.4)。
+func CheckSilkEncoder() error {
+	pcm := make([]byte, 320*2) // 20ms 静音 @16kHz s16le
+	silkOut, err := encodeSilkExternal(pcm)
+	if err != nil {
+		return fmt.Errorf("pilk不可用(新机器: brew install python@3.x 后 /opt/homebrew/bin/python3 -m pip install pilk): %w", err)
+	}
+	if len(silkOut) < 10 || silkOut[0] != 0x02 || !bytes.HasPrefix(silkOut[1:], []byte("#!SILK_V3")) {
+		head := silkOut
+		if len(head) > 10 {
+			head = head[:10]
+		}
+		return fmt.Errorf("pilk输出非tencent silk格式: head=%x", head)
+	}
+	return nil
 }
 
 // GetVideoDuration 使用ffprobe获取视频时长（秒）

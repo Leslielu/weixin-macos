@@ -74,6 +74,11 @@ codesign --verify --strict onebot && echo SIGN_OK
 部署：签名后 rsync/scp 二进制到 mac-m1 `~/Prog/weixin-macos/onebot/onebot`，再重启链路
 （mac-m1 `~/Prog/wxgate/start.sh restart`，先停 onebot→wxgate 再依序拉起）。
 
+**运行硬依赖（启动自检 fail-fast）**：`python3 + pilk`（silk 语音编码）。新机器：
+`brew install python@3.x` 后 `/opt/homebrew/bin/python3 -m pip install pilk`。缺失时 onebot
+拒绝启动（2026-10-08 滋啦事故：缺 pilk 曾静默回退 go-silk，腾讯解码器不认，详见
+docs/VOICE-BATTLE-STATUS.md §15）。
+
 ### Run OneBot
 ```bash
 # Local mode (SIP disabled)
