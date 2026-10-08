@@ -549,6 +549,18 @@ force-legacy(TryMultiphase→0) → 旧路 CGI 直传 → keys 返回 → locato
 两条线独立，同在"本地从不复现"的伪装下纠缠了两天。
 ```
 
+## 16. 2026-10-08 晚：战役收工 — 调试代码清理 + silk 依赖硬约束 🏁
+
+- **d1e122a**：全部排障装置拆除（VPDBG/UPSTRUCTDBG/VOICEDUMP/VOICERING/NATIVESILK 观察点、
+  voiceUploadSelfTest、hexdump 族、RX-DBG、/tmp 落盘×3、nativesilk case），本地与生产统一为
+  最终代码；rendercheck 4.1.13/4.1.11 双版本通过（rendercheck 需绝对路径给 JSON，相对路径
+  `../wechat_version` 会解析到 onebot/ 下报 exit 2）。
+- **e8f2b82**：pilk 依赖从"文档约定"升级为启动硬约束 —— `CheckSilkEncoder` 真跑一遍 pilk
+  并验 tencent 头(0x02+#!SILK_V3，pilk 0.2.4 Tencent_break 为不可见 0x02 字面字节，实测定稿)，
+  失败 Fatal 拒启；go-silk 回退删除。新机器缺依赖在部署第一分钟爆出来。
+- **22:31 生产回归**（bot→ludaohe）：语音 result=0 + status ok + pilk 产物 + 零回退 + 零崩溃，
+  文本 ok，**用户手机验收"正常"**。战役全线闭环。
+
 ### 旧 §14 标题存档
 
 ## 14. 2026-10-08 晨：音质战役 — 崩溃已终结，接收端播放全灭（进行中）
