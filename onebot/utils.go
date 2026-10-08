@@ -363,8 +363,6 @@ func FileToBase64(filePath string) (string, error) {
 }
 
 func SaveAudioFile(silkBytes []byte) (path string, err error) {
-	// [2026-10-08 音质排障] 接收语音原始字节落盘
-	_ = os.WriteFile("/tmp/voice_rx_raw.bin", silkBytes, 0644)
 	mp3Bytes, err := SilkToMp3(silkBytes)
 	if err != nil {
 		return "", err

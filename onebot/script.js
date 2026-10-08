@@ -151,7 +151,6 @@ function initAddresses() {
     setImmediate(attachReq2buf);
     setImmediate(setupSendImgMessageDynamic);
     setImmediate(attachUploadMedia);
-    setImmediate(attachUploadStructDbg);
     setImmediate(patchCdnOnComplete);
     setImmediate(attachGetCallbackFromWrapper);
     setImmediate(setupSendReplyMessageDynamic);
@@ -470,7 +469,6 @@ var voiceAudioDataAddr = ptr(0);
 var tryMultiphaseAddr = ptr(0);
 var voiceForceLegacyArmed = false;
 var voiceProbe = null; // 假 T/CB/vtable 数据源对象(旧路用, 惰性构建)
-var voiceLastSendAt = 0; // 最近一次语音发送时刻(ms) — cndOnComplete 观察点窗口
 var voiceProbes = [];
 
 
@@ -1872,21 +1870,6 @@ function buildVoiceProbe() {
     return probe;
 }
 
-// [2026-10-07] ring 回读: 引擎经假 T 虚表调用过哪些槽(rput 记录), 判读 rebuild 行为
-function voiceRingDump(tag) {
-    var p = voiceProbe;
-    if (!p) return;
-    try {
-        var head = Number(p.head.readU64());
-        var s = "[VOICERING] " + tag + " head=" + head;
-        for (var i = 0; i < 8 && head - i > 0; i++) {
-            var ent = p.ring.add(((head - i - 1) & 63) * 48);
-            s += " | s" + ent.add(8).readU64() + " a1=" + ent.add(0x10).readU64();
-        }
-        console.log(s);
-    } catch (e) {}
-}
-
 // TryMultiphase(appconfig.cc) 闸门: 语音任务(0x9C==0x0F)强制 retval=0 → 旧路。
 // 语义(4.1.13 静态实证): type2→false / type8→true / 0x9C∈{7,9,0x4EEA,0x4F4E}→true /
 // 其余(voice/img/video)落长判定树, 语音默认 true(multiphase 流式)。
@@ -1903,121 +1886,13 @@ function armVoiceForceLegacy() {
                 if (this._voice) ret.replace(0);
             }
         });
-        // [2026-10-07 生产排障] 语音完成链 SIGBUS 观察点(只读, 不改语义):
-        // 崩点两次均在完成链 ldadd 引用计数(0x429e540/0x429f0c0), x8 取自
-        // GetCallbackWrapper(this=T'-8) 的 [this+0x18]。抓引擎重建对象 freshT 内容。
-        Interceptor.attach(baseAddr.add(0x31df8ac), {   // binder(同址已验): 拷{ T,CB} 后重建
-            onEnter: function (args) {
-                this._task = args[1];
-                try { this._isVoice = this._task.add(0x9C).readU8() === 0x0F; } catch (e) { this._isVoice = false; }
-            },
-            onLeave: function (ret) {
-                if (!this._isVoice) return;
-                try {
-                    var fT = this._task.add(0x0).readPointer();
-                    var fCB = this._task.add(0x8).readPointer();
-                    console.log("[VPDBG] binder freshT=" + fT + " freshCB=" + fCB +
-                        " T[0x28]=" + hexdumpMini(fT, 0x28));
-                } catch (e) {}
-            }
-        });
-        Interceptor.attach(baseAddr.add(0x429e4fc), {   // GetCallbackWrapper 真身
-            onEnter: function (args) {
-                try {
-                    var t = args[0];
-                    console.log("[VPDBG] GCW this=" + t +
-                        " [+8]=" + safePtr(t.add(0x8)) + " [+10]=" + safePtr(t.add(0x10)) +
-                        " [+18]=" + safePtr(t.add(0x18)) + " body=" + hexdumpMini(t, 0x40));
-                    voiceRingDump("gcw");
-                } catch (e) {}
-            }
-        });
-        // [2026-10-08 v3.9.4] 07:04 观察点实证: 0x42a3138 的 W 不是 T+0x180, 是引擎
-        // 0x9c 只读闭包区对象 {[W+8]=Treal, [W+10]=CB}; wrapper=Treal+0x20=T+0x18,
-        // 队列=[T+0x20](v3.9.4 已挂 Q2 队列对象修复)。本观察点只读匹配 Treal/CB
-        // 记录分发现场, 绝不写引擎闭包区(只读页, 铁律#1)。
-        Interceptor.attach(baseAddr.add(0x42a3138), {   // 阶段2分发器(虚调用槽 vtable+0x30)
-            onEnter: function (args) {
-                try {
-                    var W = args[0];
-                    var q8 = W.add(0x8).readPointer();
-                    var c16 = W.add(0x10).readPointer();
-                    var mine = false, mi = -1;
-                    for (var i = 0; i < voiceProbes.length; i++) {
-                        if (voiceProbes[i].Treal && (voiceProbes[i].Treal.equals(q8) ||
-                            (voiceProbes[i].CB && voiceProbes[i].CB.equals(c16)))) { mine = true; mi = i; break; }
-                    }
-                    if (!mine && !voiceRecentSend()) return;
-                    console.log("[VPDBG] st2disp W=" + W + " [W+8]=" + q8 + " [W+10]=" + c16 + " mine=" + mine);
-                    if (mine) {
-                        var w2 = voiceProbes[mi].Treal.add(0x20);        // wrapper=T+0x18
-                        var q2 = safePtr(w2.add(0x8));                    // = [T+0x20] 应为 Q2
-                        var sig = safePtr(voiceProbes[mi].Q2.add(0x40));  // 递归锁 sig
-                        console.log("[VPDBG] st2 wrapper=" + w2 + " [T+0x20]=" + q2 + " Q2+0x40sig=" + sig);
-                    }
-                } catch (e) { console.log("[VPDBG] st2disp err " + e); }
-            }
-        });
-        // 阶段1泵观察(只读): 确认 stage1 用的 P 是我们的还是引擎自己的
-        Interceptor.attach(baseAddr.add(0x248aaac), {
-            onEnter: function (args) {
-                try {
-                    var W = args[0];
-                    var Q = W.add(0x8).readPointer();
-                    var mine = false;
-                    for (var i = 0; i < voiceProbes.length; i++) {
-                        if (voiceProbes[i].P && voiceProbes[i].P.equals(Q)) { mine = true; break; }
-                    }
-                    if (!mine && !voiceRecentSend()) return;
-                    console.log("[VPDBG] st1pump W=" + W + " Q=" + Q + " mine=" + mine +
-                        " need=" + args[2] + " have=" + args[3]);
-                } catch (e) {}
-            }
-        });
-        // [2026-10-08 音质排障] 旧路 handler 入口核对引擎侧 silk 字节:
-        // 0.5s噪音嫌疑 = 出站字节被截/被换。dump task+0x100{ptr,len}头尾 + T数据源。
-        Interceptor.attach(baseAddr.add(0x58c3b44), {
-            onEnter: function (args) {
-                try {
-                    var task = args[1];
-                    var p = task.add(0x100).readPointer();
-                    var len = Number(task.add(0x108).readU64());
-                    var head = p.equals(ptr(0)) ? "NULL" : hexdumpMini(p, 16);
-                    var tail = (len > 32 && !p.equals(ptr(0))) ? hexdumpMini(p.add(len - 16), 16) : "-";
-                    var tp = task.add(0x0).readPointer();
-                    var tbuf = "-", tlen = "-";
-                    try {
-                        tbuf = "" + tp.add(0x58).readPointer();
-                        tlen = "" + tp.add(0x60).readU64();
-                    } catch (e2) {}
-                    console.log("[VPDBG] legacy task=" + task + " silk{ptr=" + p + " len=" + len +
-                        "} head=" + head + " tail=" + tail + " T.buf=" + tbuf + " T.len=" + tlen +
-                        " audioAddr=" + voiceAudioDataAddr);
-                } catch (e) { console.log("[VPDBG] legacy dump err " + e); }
-            }
-        });
-        console.log("[+] voice force-legacy armed @ " + tryMultiphaseAddr + " (+st2 exempt gate)");
+        console.log("[+] voice force-legacy armed @ " + tryMultiphaseAddr);
     } catch (e) {
         console.error("[!] voice force-legacy arm fail: " + e);
     }
 }
 
-// 最近 90s 内有语音发送 → 观察/豁免判定允许记录非本发对象(判引擎自有 P 用)
-var _voiceLastSendTs = 0;
-function voiceRecentSend() { return (Date.now() - _voiceLastSendTs) < 90000; }
-
-function safePtr(a) { try { return "" + a.readPointer(); } catch (e) { return "?"; } }
-function hexdumpMini(a, n) {
-    try {
-        var b = new Uint8Array(a.readByteArray(n));
-        var s = "";
-        for (var i = 0; i < b.length; i++) { var t = b[i].toString(16); s += (t.length < 2 ? "0" : "") + t; }
-        return s;
-    } catch (e) { return "ERR"; }
-}
-
 function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durationMs, silkMd5) {
-    _voiceLastSendTs = Date.now();
     if (uploadGlobalX0.equals(ptr(0))) {
         ensureCdnManagerX0();
     }
@@ -2080,162 +1955,7 @@ function triggerUploadVoice(receiver, voicePath, payloadHex, audioDataHex, durat
     uploadVoiceX1.add(0x110).writeU64(uint64("0x8000000000000000").add(Math.ceil(audioLen / 16) * 16));
 
     const startUploadMedia = new NativeFunction(uploadImageAddr, 'int64', ['pointer', 'pointer']);
-
-    voiceUploadSelfTest = true;
-    voiceLastSendAt = Date.now();
-    try {
-        return startUploadMedia(uploadGlobalX0, uploadVoiceX1);
-    } finally {
-        voiceUploadSelfTest = false;
-    }
-}
-
-// [2026-10-06] 文件路径式语音上传(实验): 与 img/video 共用同一套路径槽填充
-// (0xe8/0x118/0x148=silk路径, 0xa8=md5, 0x200=aes), payload 模板用 Go 侧
-// BuildUploadPayload("voice")(0x9C=0x0F, 0x1BC=07)。4.1.13 内存缓冲注入疑似
-// 布局漂移(语音1s/无声), img/video 的文件式链路是好的, 故改走文件式验证。
-// [2026-10-06 混合式] 语音类型 + alita id + 原生校准模板 + 路径槽喂数据 + 图片回调。
-// 内存式两条回调路线上限 3600B/1200B(任务注册态缺失), 图片式路径数据源任意大小畅通。
-function triggerUploadVoiceFile2(receiver, silkPath, silkMd5hex, payloadHex, durationMs, silkLen, selfIdMd5) {
-    if (uploadGlobalX0.equals(ptr(0))) {
-        ensureCdnManagerX0();
-    }
-    if (uploadGlobalX0.equals(ptr(0))) {
-        console.error("[!] uploadGlobalX0 尚未初始化，请等待 hook 捕获");
-        return "fail";
-    }
-    voiceDurationGlobal = durationMs;
-    voiceSilkDataLenGlobal = silkLen;
-    voiceUploadSeq = voiceUploadSeq + 1;
-    var voiceIdStr = "alita_1_" + selfIdMd5 + "_15_0_" + voiceUploadSeq;
-    patchString(voiceIdAddr, voiceIdStr);
-    patchString(voicePathAddr1, silkPath);
-
-    const payload = hexToByteArray(payloadHex);
-    uploadVoiceX1.writeByteArray(payload);
-    // 图片回调(路径数据源, 任意大小); 原生语音回调对已实测更短(1200B), 弃用
-    uploadVoiceX1.writePointer(uploadFunc1Addr);
-    uploadVoiceX1.add(0x08).writePointer(uploadFunc2Addr);
-    uploadVoiceX1.add(0x48).writePointer(voiceIdAddr);
-    uploadVoiceX1.add(0x50).writeU64(voiceIdStr.length);
-    uploadVoiceX1.add(0x58).writeU64(uint64("0x8000000000000000").add(voiceIdStr.length + 1));
-    uploadVoiceX1.add(0x68).writeUtf8String(receiver);
-    uploadVoiceX1.add(0x7F).writeU8(receiver.length);
-    // 路径槽三连(img 式喂数据核心) + 长度/容量
-    uploadVoiceX1.add(0xe8).writePointer(voicePathAddr1);
-    uploadVoiceX1.add(0xf0).writeU64(silkPath.length);
-    uploadVoiceX1.add(0xf8).writeU64(uint64("0x8000000000000000").add(silkPath.length + 1));
-    uploadVoiceX1.add(0x118).writePointer(voicePathAddr1);
-    uploadVoiceX1.add(0x120).writeU64(silkPath.length);
-    uploadVoiceX1.add(0x128).writeU64(uint64("0x8000000000000000").add(silkPath.length + 1));
-    uploadVoiceX1.add(0x148).writePointer(voicePathAddr1);
-    uploadVoiceX1.add(0x150).writeU64(silkPath.length);
-    uploadVoiceX1.add(0x158).writeU64(uint64("0x8000000000000000").add(silkPath.length + 1));
-    // 0xD8 写实际大小(3600 恒定值疑似上限语义)
-    uploadVoiceX1.add(0xD8).writeU32(silkLen);
-    uploadVoiceX1.add(0xDC).writeU32(Math.ceil(silkLen / 2));
-
-    const startUploadMedia = new NativeFunction(uploadImageAddr, 'int64', ['pointer', 'pointer']);
-    voiceUploadSelfTest = true;
-    try {
-        return startUploadMedia(uploadGlobalX0, uploadVoiceX1);
-    } finally {
-        voiceUploadSelfTest = false;
-    }
-}
-
-function triggerUploadVoiceFile(receiver, silkPath, md5hex, payloadHex, durationMs, silkLen) {
-    // [2026-10-06] 旧文件式(img模板+receiver式id)已废弃, 保留签名供历史对照。
-    voiceDurationGlobal = durationMs;
-    voiceSilkDataLenGlobal = silkLen;
-    return "fail";
-}
-
-// [NATIVESILK 2026-10-08] ArrayBuffer → hex 字符串(小写), 原生 silk 回传用
-function buf2hex(buf) {
-    var arr = new Uint8Array(buf);
-    var s = "";
-    for (var i = 0; i < arr.length; i++) {
-        var h = arr[i].toString(16);
-        s += (h.length < 2 ? "0" + h : h);
-    }
-    return s;
-}
-
-// [UPSTRUCTDBG 2026-10-06] 语音上传结构 4.1.13 校准: dump 上传入口 x1 任务结构。
-// 背景: 语音内存缓冲注入(0x100/0x108/0x110 槽)是 4.1.10 逆向的, 4.1.13 疑似布局漂移
-// (同一 silk 两次发送分别出现"放1s"/"无声", 野指针特征)。img/video 走文件路径式是好的。
-// 本 hook 在上传入口 dump 任务结构, 我们注入的(tag=ours)与原生 UI 发的(tag=native)都抓,
-// 拿到原生语音上传结构后对比校准偏移。只读不改行为。
-var voiceUploadSelfTest = false;
-var upStructDumpCount = {};
-function dumpUploadStruct(x1, kind) {
-    try {
-        var tag = voiceUploadSelfTest ? "ours" : "native";
-        var out = [];
-        for (var off = 0x00; off < 0x2A0; off += 8) {
-            var raw = "";
-            try {
-                var arr = new Uint8Array(x1.add(off).readByteArray(8));
-                for (var i = 0; i < arr.length; i++) { var t = arr[i].toString(16); raw += (t.length < 2 ? "0" + t : t); }
-            } catch (e0) {}
-            var note = "";
-            try {
-                var p = x1.add(off).readPointer();
-                if (!p.isNull() && isReadablePointer(p)) {
-                    try { var s = p.readUtf8String(); if (s && s.length > 0 && s.length < 200) note = " ->str:" + s; } catch (e1) {}
-                }
-            } catch (e2) {}
-            if (note === "") {
-                try { var s2 = x1.add(off).readUtf8String(); if (s2 && s2.length > 2 && s2.length < 200) note = " inline:" + s2; } catch (e3) {}
-            }
-            if (raw !== "") out.push("+0x" + off.toString(16) + ": " + raw + note);
-        }
-        console.log("[UPSTRUCTDBG] tag=" + tag + " kind=" + kind + "\n" + out.join("\n"));
-    } catch (e) { console.error("[UPSTRUCTDBG] err: " + e); }
-}
-function attachUploadStructDbg() {
-    Interceptor.attach(uploadImageAddr, {
-        onEnter: function (args) {
-            try {
-                var x1 = args[1];
-                var t = x1.add(0x9C).readU8();
-                var kind = (t === 0x0F) ? "voice" : (t === 0x01) ? "img" : (t === 0x04) ? "video" : "other";
-                if (kind === "voice" && !voiceUploadSelfTest) {
-                    // 原生语音上传: 刷新回调对 + 记录模块信息(微信重启后地址会变, 见此即自愈)
-                    var f1 = x1.add(0x0).readPointer();
-                    var f2 = x1.add(0x8).readPointer();
-                    if (!f1.isNull() && !f2.isNull()) {
-                        voiceNativeFunc1Addr = f1;
-                        voiceNativeFunc2Addr = f2;
-                        var m = Process.findModuleByAddress(f1);
-                        console.log("[+] 原生语音回调对已捕获: 0x" + f1 + " / 0x" + f2 +
-                            (m ? " module=" + m.name + " base=" + m.base : " (无模块,裸mmap)"));
-                    }
-                    // [NATIVESILK 2026-10-08] 原生桌面录音的 silk 内存缓冲(0x100=ptr/0x108=len,
-                    // 10-06 UPSTRUCTDBG 已证 native 语音也走内存缓冲式)全量回传 Go 落盘,
-                    // 用于 (A)旧路管道 vs (B)silk码流变体 判决实验。只读。
-                    try {
-                        var sp = x1.add(0x100).readPointer();
-                        var sl = x1.add(0x108).readU64().toNumber();
-                        if (!sp.isNull() && sl > 100 && sl < 2000000 && isReadablePointer(sp)) {
-                            var silkHex = buf2hex(sp.readByteArray(Math.min(sl, 400000)));
-                            send({ type: "nativesilk", len: sl, hex: silkHex });
-                            console.log("[NATIVESILK] 原生 silk 已回传 len=" + sl);
-                        } else {
-                            console.log("[NATIVESILK] 缓冲无效 ptr=" + sp + " len=" + sl);
-                        }
-                    } catch (ens) { console.error("[NATIVESILK] err: " + ens); }
-                }
-                var limit = (kind === "voice") ? 6 : 1;
-                upStructDumpCount[kind] = upStructDumpCount[kind] || 0;
-                if (upStructDumpCount[kind] < limit) {
-                    upStructDumpCount[kind]++;
-                    dumpUploadStruct(x1, kind);
-                }
-            } catch (e) {}
-        }
-    });
+    return startUploadMedia(uploadGlobalX0, uploadVoiceX1);
 }
 
 function attachUploadMedia() {
@@ -2329,32 +2049,6 @@ function v3LocateCndOffsets(x2, expected) {
         "delta=0x" + delta.toString(16) + " target=" + tgt + " cdn=" + cdn + " aes=" + aes + " md5=" + md5);
     return ok ? cand : null;
 }
-// [VOICEDUMP 诊断 2026-10-06] 语音接收方静音排障: dump CDN 完成结构原始内容,
-// 对比 img(钥匙可用)与 voice(疑似读错槽)的布局差异。限次防刷屏, 只读不影响行为。
-var cndDumpCount = {};
-function dumpCompleteStruct(x2, kind) {
-    try {
-        var out = [];
-        for (var off = 0x00; off < 0x2A0; off += 8) {
-            var raw = "";
-            try {
-                var arr = new Uint8Array(x2.add(off).readByteArray(8));
-                for (var i = 0; i < arr.length; i++) {
-                    var t = arr[i].toString(16);
-                    raw += (t.length < 2 ? "0" + t : t);
-                }
-            } catch (e0) {}
-            var s = v3ReadStr(x2, off);
-            if (raw !== "" || (s && s.length > 0)) {
-                out.push("+0x" + off.toString(16) + ": " + raw + (s && s.length > 0 ? "  str=" + s : ""));
-            }
-        }
-        console.log("[VOICEDUMP] kind=" + kind + " slots=" + out.length + "\n" + out.join("\n"));
-    } catch (e) {
-        console.error("[VOICEDUMP] err: " + e);
-    }
-}
-
 function cndOnCompleteV3(x2) {
     const imageFileId = imageIdAddr.readUtf8String();
     const videoFileId = videoIdAddr.readUtf8String();
@@ -2367,25 +2061,12 @@ function cndOnCompleteV3(x2) {
     if (fileUploadFileId && fileUploadFileId !== "file_upload_not_init") expected[fileUploadFileId] = "fileUpload";
     if (v3CndOff === null) {
         v3CndOff = v3LocateCndOffsets(x2, expected);
-        if (!v3CndOff) {
-            // [VOICEDBG 2026-10-06] 定位失败也dump(限2次): 0x1D8/0x1E0 标志改变了
-            // 完成结构布局, 需要观察新的 aes/md5 槽位
-            if ((cndDumpCount.locatefail = (cndDumpCount.locatefail || 0) + 1) <= 2) {
-                dumpCompleteStruct(x2, "locate-fail");
-            }
-            return;
-        }
+        if (!v3CndOff) return;
     }
     if (!v3CndOff) return;
     const currentFileId = v3ReadStr(x2, v3CndOff.fileId);
     var kind = expected[currentFileId];
     if (!kind) return; // 非我们发起的 CDN 任务
-    if (kind === "voice") voiceRingDump("v3");
-    // [VOICEDUMP] voice 每次都 dump(<=3), img 首次做校准参照
-    if ((kind === "voice" && (cndDumpCount.voice = (cndDumpCount.voice || 0) + 1) <= 3) ||
-        (kind === "img" && (cndDumpCount.img = (cndDumpCount.img || 0) + 1) <= 1)) {
-        dumpCompleteStruct(x2, kind);
-    }
     const cdnKey = v3ReadStr(x2, v3CndOff.cdn);
     const aesKey = v3ReadStr(x2, v3CndOff.aes);
     const md5Key = v3ReadStr(x2, v3CndOff.md5);
@@ -2427,18 +2108,6 @@ function cndOnCompleteV3(x2) {
 function patchCdnOnComplete() {
     Interceptor.attach(cndOnCompleteAddr, {
         onEnter: function (args) {
-            // [VPDBG 2026-10-07] 崩点现场(0x429f0c0 ldadd 的调用者): dump this 与第二层
-            // shared_ptr 槽。仅语音发送后 90s 窗口内(防 img/video 任务刷屏)。
-            try {
-                if (Date.now() - voiceLastSendAt < 90000) {
-                    var cx0 = this.context.x0;
-                    console.log("[VPDBG] cndOnComplete this=" + cx0 +
-                        " [+10]=" + safePtr(cx0.add(0x10)) + " [+18]=" + safePtr(cx0.add(0x18)) +
-                        " body=" + hexdumpMini(cx0, 0x30));
-                    voiceRingDump("cnd");
-                }
-            } catch (e) {}
-
             try {
                 const x2 = this.context.x2;
                 if (structVer === "3") {
@@ -2640,8 +2309,6 @@ rpc.exports = {
     triggerSendVideoMessage: triggerSendVideoMessage,
     triggerSendReplyMessage: triggerSendReplyMessage,
     triggerUploadVoice: triggerUploadVoice,
-    triggerUploadVoiceFile: triggerUploadVoiceFile,
-    triggerUploadVoiceFile2: triggerUploadVoiceFile2,
     triggerSendVoiceMessage: triggerSendVoiceMessage,
     triggerSendFileMessage: triggerSendFileMessage,
     triggerSendFileUploadMessage: triggerSendFileUploadMessage,
