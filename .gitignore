@@ -31,4 +31,4 @@ __pycache__/
 /test-assets/
 # voip 逆向工具链的产物与原始会话日志 (源码保留)
 tools/voip/voipprobe
-tools/voip/probe-session*.log
+tools/voip/probe*.log

@@ -12,16 +12,16 @@
 | 通话信令全图(mars层) | ✅ 测绘完毕 | §2 时间轴, 4次通话逐毫秒对齐 |
 | 请求 protobuf 解码 | ✅ invite/sync/cancel 全解 | §3 |
 | VoIP CGI 统一发送函数 + 服务单例 | ✅ 已定位并4次验证 | §4 `0x1fdc80c` |
-| 通话状态 beacon(可上生产) | ✅ 引擎起停 4+次验证 | §5 `0x5470688/0x547070c` |
+| 通话状态 beacon(可上生产) | ⚠️ 仅拨号方本机音频, **不能判对方振铃** | §5, §10 |
 | 工具链 | ✅ 入库 `tools/voip/` | §7 |
-| UI侧入队函数(带被叫wxid) | ❌ 唯一缺口 | §9 下一步一钩可破 |
-| triggerVoipCall 实现 | ⏳ 等上一项 | §9 |
+| **程序化拨号(对方响铃)** | ✅ **已打通并参数化** | §10 `0x1fcaf64` selector 34 |
+| 挂断 / onebot 端点 | ⏳ 下一步 | §9 |
 
 ## 1. 通话信令架构(结论)
 
 ```
-UI点击「语音通话」 ──→ 入队事件(含被叫wxid)【缺口:入队函数未定位】
-                          │
+UI点击「语音通话」 ──→ ConfSDKdyn(通话SDK) 组 invite 报文
+                          │  0x1fcaf64(svc, selector=34, 0, payload, len, 0)   ← §10
                           ▼ (worker线程, 非主线程)
    0x1fdc604 FSM事件处理器 → 0x1fdc714(从事件取cmdid+URI)
                           → 0x1fdc80c(服务单例, ctx, cmdid, URI) ←统一发送方法
@@ -139,11 +139,64 @@ field2 = 各自业务体。
 
 ## 9. 下一步(实现路线)
 
-1. **probe16(一钩破缺口)**: hook `0x1fdc604` 入口, dump 事件对象([x19]队列项+x0字段)
-   — 被叫wxid 应在其中; 同时从队列唤醒/信号函数 backtrace 抓**UI侧入队函数**。
-2. **triggerVoipCall(wxid)**: 照 triggerXXX 范式伪造事件入队(或直调入队函数),
-   微信原生 FSM 完整接管(UI/响铃/音频全原生)。挂断 = 同服务 cancel 路径(0x2474)。
-3. onebot: `/voip_call` 端点 + 通话事件推送(beacon §5 + resp-dispatch)。
+1. **挂断**: 同服务对象另一 selector(`0x2474 voipilinkcancel`); 先从真实挂断抓 payload+selector,
+   再决定是走服务虚分发器还是复用 invite 的调用形态。
+2. **svc 指针自取**: 现在靠真实拨号抓一次(同进程恒定)。生产化需要程序化获取 ——
+   ConfSDKdyn 导出 `_GetWXConfService`(3 个导出之一)是最直接的候选;
+   备选: wechat.dylib 内 0x1fd7bc0(ctx 工厂, vtable 0x98cbc38) 附近的持有者字段。
+3. onebot: `/voip_call` 端点 + 通话事件推送。
 4. 生产部署注意: TCC麦克风弹窗(开发副本全程未弹, 生产首次呼叫需观察/预授权);
    看门狗对通话中崩溃的覆盖; VOIPWindow 在 dummy 主屏环境的表现待验。
 5. 回归: 每轮用 probe12 全量时间轴对照(信令序列不变即无回归)。
+
+## 10. 拨号入口已打通并参数化(probe16~22)
+
+**以前的「UI侧入队缺口」是找错了模块**: UI 点击后真正提交邀请的不是 wechat.dylib 的
+界面代码, 而是通话 SDK **ConfSDKdyn.framework**(`Contents/Resources/ConfSDKdyn.framework/
+ConfSDKdyn`, 真身 `__text: 0x3b58 size 0x8c9ac`; Frameworks/ 下还有一个同名 84KB 桩,
+voipwalk 会误判)。它调用 wechat.dylib 服务对象的**虚方法**提交邀请:
+
+```
+0x1fcaf64(服务对象, selector, 0, payload, len, 0)   // 服务虚分发器
+   w1=34(0x22) → 0x1fcafe8 → bl 0x1fd7bac (invite 工厂)
+```
+
+- 调用签名(实测可用): `x0=svc, w1=34, x2=0, x3=payload ptr, w4=len, x5=忽略`
+- `svc` 由真实拨号时在 `0x1fcaf64` 入口捕获(单次会话恒定; probe19/20 为 `0x123877ab8`)
+- 校验: `[svc] == wechat+0x98cbac8`(服务对象 vtable, 4.1.13.63 实测)
+- **payload(273B)结构**(抓包模板, 见 `probe-session20.log`):
+  ```
+  08 ae44                field1 varint 0x222e (请求类型)
+  12 e1 01               field2 len=225
+    0a 13 <被叫wxid>       ← 唯一需要替换的字段
+    10 02 1a 00
+    22 b6 01 <设备信息 182B>
+    ... 平台 arm64/Apple M4/en0, uin, 'voip-2p'
+  18 e650                field3 = cmdid 0x2866
+  22 25 "/cgi-bin/micromsg-bin/voipilinkinvite"
+  ```
+  **被叫 wxid 在 payload 里**, 不在 mars 请求里 —— 和 §3 的结论一致, 说明 ConfSDK 把
+  「给谁打」放在交给 wechat.dylib 的上层报文里。
+
+**实测战绩(2026-10-31 夜)**:
+
+| 时间 | 动作 | 结果 |
+|---|---|---|
+| 23:22 | probe20 原样重放 invite(273B) | `replayDone ok`, 31s 后 audioStart; 对方响铃 |
+| 23:26 | probe21 定点重放(23:26:00 整) | 对方手机响铃(人工确认), **无任何 audio beacon** |
+| 23:36 | probe22 换成 `wxid_4erh8rirquu921` | 对方手机响铃; mac-m1 侧微信收到 VoIP 气泡「已拒绝」 |
+
+**修正两条旧结论**:
+- §5 的音频 beacon **只反映本机音频引擎**, 23:26 与 23:36 两次成功响铃都没有 beacon
+  (分别延迟 31s / 完全没有) ⇒ 不能作为「对方振铃」判据, 只能做本机通话状态参考。
+- 被叫侧(登录在同一账号的 mac-m1 微信)会在几秒后收到
+  `<voipmsg type="VoIPBubbleMsg">…已拒绝/对方已拒绝…` 并落进 wxgate.db ⇒ 通话事件
+  可以直接复用 wxgate 的气泡日志, 不必自己造轮子。
+
+**工具**:
+| 文件 | 用途 |
+|---|---|
+| `invite_payload.py` | 模板拆包/替换 wxid/重算两级 protobuf 长度; `--selftest` 逐字节 round-trip |
+| `probe21.js` | 固定 payload 定点重放(文件触发 `/tmp/voip_replay.req`) |
+| `probe22.js` | 参数化: 读 `/tmp/voip_target.txt` 的 wxid → 重建 payload → 触发即拨号 |
+| `probe16~19.js` | 缺口定位过程(事件结构/任务 vtable/ctx 工厂/服务虚分发器), 结论已并入本节 |
