@@ -58,6 +58,14 @@ for programmatic message sending and receiving.
   ("blind hooking") crashes WeChat.
 - `tools/addrfind`: cross-version address finder (structVer switch).
   Methodology and workflow: `docs/version-upgrade.md`.
+- `tools/voip`: VoIP-call reverse-engineering toolchain (`strxref`/`voipwalk`/
+  `voipclimb` static analysis, `voipprobe` frida-go runner, probe1–15 session
+  scripts, per-session logs). Dev clone: `~/Applications/WeChat-4.1.13.app`
+  (same 4.1.13.63 binary as production, addresses transfer 1:1). Read
+  `docs/VOIP-CALL-STATUS.md` before any voip work: it maps the signaling flow
+  (voipilinkinvite/livesync/cancel), the unified sender `0x1fdc80c`, audio
+  beacons (`0x5470688`/`0x547070c`), and the probe pitfalls (Stalker always
+  crashes this process; SubmitCgi payload is x1 not x0).
 - `idapro/`, `diaphora/`: static analysis scripts and notes.
 - `docs/`: operational documentation. Read `docs/crash-history.md` before any
   crash investigation; it records fingerprints, root causes, shipped fixes,
@@ -181,7 +189,8 @@ watchdog if WeChat itself will be touched.
 ## Agent Workflow
 
 1. For crash or send-failure work, read `docs/crash-history.md` first;
-   for version upgrades, read `docs/version-upgrade.md` first.
+   for version upgrades, read `docs/version-upgrade.md` first; for voip-call
+   work, read `docs/VOIP-CALL-STATUS.md` first.
 2. Read the relevant implementation and nearby configuration before
    changing code; check `git status` and preserve unrelated worktree
    changes.
