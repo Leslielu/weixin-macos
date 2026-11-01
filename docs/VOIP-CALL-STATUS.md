@@ -18,7 +18,7 @@
 | **程序化拨号 + 接通 + 挂断(原生全流程)** | ✅ **2026-11-01 打通并人工实测** | §11 ConfSDK `vt[6]`/`vt[12]` |
 | 本机标识字段(field7) | ✅ 可填 0, 无需常量 | §11.2 实测 |
 | **通话音频: 出站注入(给对方放音)** | ✅ **2026-11-01 打通**(帧长按每通协商格式自适应, 16k/48k 打手机实听均干净) | §13 |
-| **通话音频: 入站接收(听对方)** | ⏳ 接口已定位(`GetExternalHybridPlayData`)未接线 | §13 |
+| **通话音频: 入站接收(听对方)** | ⏳ 已定性: 卡播放设备注册, 收流活/解码是拉取驱动 | §15 |
 | onebot 端点 | ✅ 2026-11-01 实现并在 mac-m1 部署验证(`/send_voice_call` 等三端点) | §13.5 |
 | 生产部署 / 入站接听 / 通话事件推送 | ⏳ 下一步 | §9 |
 
@@ -495,6 +495,7 @@ svc → [svc+8]                 ConfEngine
   5ms 醒 + 临界自旋) + 抖动统计。实测数百帧 `maxLateMs=0, lateOver3ms=0`。
 - 入站方向(听对方)接口已定位未接线: `GetExternalHybridPlayData`(wrapper
   `ConfSDKdyn+0x7a388`) / `GetExternalPlayData`(`+0x7a3a8`), 与注入对称。
+  **2026-11-01 深夜定性: 这两个口在没有播放设备时不可用, 见 §15。**
 
 ### 13.3 实测验收(最终形态)
 
@@ -634,3 +635,64 @@ mute 与否(freeze在 m1 侧)全都改不动它。
 | `probe69_payload.js` | 包体哈希(证明媒体加密, 静音不可辨) |
 | `probe70_mute.js` | 本机侧 MuteMicPhone 触发(注意 confEngine 是 `inner+0xa10` 地址) |
 | `probe71~72` | 下行数字流落盘(onEnter/onLeave 两读) |
+
+## 15. 下行采集(听对方)定性 —— 卡在播放设备注册, 未通(2026-11-01 深夜, probe44~52)
+
+> 结论先行: **远端 RTP 全程在收、收包解码调度在跑, 但「解码成 PCM」是播放拉取驱动
+> (decode-on-pull), 而拉取方只有 app 的 CoreAudio 设备回调。无 UI ⇒ 引擎侧 AudioUnit
+> 从未创建 ⇒ 没人拉 ⇒ 引擎内存里根本不存在解码后的对方 PCM。** 公开拉取口
+> `GetAudioData`/`GetAudioDataEx` 直调被 `mv->vt[32]` 内部更深一道门拦住
+> (疑播放设备注册计数), 尚未破。注入(上行)不受影响。
+
+### 15.1 已实证的事实链
+
+| # | 事实 | 证据 |
+|---|---|---|
+| 1 | 收流活着: 对方 RTP 持续到达并被处理 | `DecodeAudioPkt`(ConfSDKdyn+0x54d78) 整通电话几千次调用全 ret=0, memberid=1, 包长 41~142B |
+| 2 | 播放端不存在: 通话全程零音频单元 | probe46 挂 `AudioUnitRender`+三个 IOProc 注册钩, 一整通(用户说满 30s 话)零调用零注册; 本机扬声器输出设备正常 |
+| 3 | 无解码 PCM: 内存里所有 PCM 样缓冲都是注入回声 | 罗塞塔法(probe48): 注入 10 帧锯齿图形→全内存扫签名→4 命中都在 REC 侧; channel 对象(ce+0x420 表)扫出 7 个候选用户耳测**全是嗡嗡声**, 与注入锯齿 ncc 0.4~0.6 |
+| 4 | 公开拉取口被更深门禁拦住 | `GetAudioData`(ConfSDKdyn+0x4dba8)→`mv->vt[32]`; 接通+SetAudioPlayStatus(ce,1,1)=ret 0 后**仍恒 -1**(status 0/1、GetAudioData/Ex 两口、2001 次全 -1, probe52) |
+| 5 | 盲调 hybrid 口会崩 | `GetExternalHybridPlayData`(+0x7a388) mode=2 直调 → access violation 0x780(vt[97] 内部解引用未构造的播放上下文空指针) |
+| 6 | 播放引擎本体在 MultiMediaDyn | 运行时读 mv vtable(0x10bd6b6d8): vt[32]=MultiMediaDyn+0x211d1c, vt[97]=+0x1f9874, vt[118]=+0x216a0c |
+
+### 15.2 关键地址与结构(本轮新增)
+
+```
+ConfEngine 对象 ce = [svc+8]+0xa10 (svc=GetWXConfService(0x1352707))
+  +0x2c   startTalkFlag(接通后=7)
+  +0x3f8  member id 表 / +0x400 channel 句柄表 / +0x418 播放状态表(由 Set 写)
+  +0x420  channel 对象指针表(步进 0x10) / +0x474 成员数
+  +0x7f4(u32)/+0x523(u8) 外部播放使能门禁(接通后微信自己写 +0x7f4=1)
+  +0x53e  SetAudioPlayStatus 成功后置 1
+DecodeAudioPkt      = ConfSDKdyn+0x54d78 (ce, pkt, x2, memberid, x4, x5)
+SetAudioPlayStatus  = ConfSDKdyn+0x67fdc (ce, member_id, status) → mv->vt[118]
+GetAudioData        = ConfSDKdyn+0x4dba8 (ce, buf, memberid_i16, &outInt) → mv->vt[32]
+GetAudioDataEx      = ConfSDKdyn+0x4dd98 同型
+GetExternalHybridPlayData = ConfSDKdyn+0x7a388 wrapper → 0x65e20(门禁 +0x7f4/+0x523,
+                          mode(x4)==2 走混音路, 否则查表; 实现体在 MultiMediaDyn vt[97])
+```
+
+### 15.3 下一步(恢复工作时从这里接)
+
+1. **反汇编 `MultiMediaDyn+0x211d1c`(vt[32])**, 找返回 -1 的分支 —— 头号嫌疑是
+   「播放设备注册计数」(日志字符串 `get_audio_dev_cnt`)或等效的 InitAPlay 状态位。
+   找到注册 API 后先调它再拉, `GetAudioData` 即可能放行。
+2. 放行后的接法: 每 20ms `GetAudioData(ce, buf, memberid, &out)` 当设备拉 →
+   落盘/进 onebot —— 与注入完全对称, 不需要 UI、不碰 CoreAudio、不碰 PAC 禁区。
+3. 备选: `GetAudioDataToPlayInLiveMode`(ConfSDKdyn+0x6789c, 额外查 +0x53d)。
+4. 教训: `+0x7a388`/`+0x7a3a8` 在播放上下文缺失时**不可调**(必崩); 本轮 probe44
+   曾把 JS 运行时打死、gadget 卡死, 只能重启微信恢复(F 类)。
+
+### 15.4 工具(本轮新增)
+
+| 文件 | 用途 |
+|---|---|
+| `probe44.js`(覆写) | mv vtable 槽位 70..100 全被动观测(注意: 覆盖了 §14 时代的 v44) |
+| `probe45.js` | 引擎对象每通新建实证 + impl 入口钩(0x65e20/0x66000) |
+| `probe46.js` | CoreAudio 出口堵截(AudioUnitRender + IOProc 注册钩)——零流量实证 |
+| `probe47.js` | mv 指针表盲扫(发现对象每通重建问题) |
+| `probe48.js` | 罗塞塔锚点: 注入特征图形+全内存签名扫描(定位 REC 环, 证伪 PLAY 环存在) |
+| `probe49.js` | channel 表定向扫(ce+0x3f8/0x420/0x474)+DecodeAudioPkt 证明 |
+| `probe50.js` | GetAudioData 直拉首试(-1) |
+| `probe51.js` | SetAudioPlayStatus+拉联动(激活成功但拉仍 -1) |
+| `probe52.js` | 矩阵: status{1,0}×{AudioData,Ex}(2001 次 -1, 门在 vt[32] 内部) |
