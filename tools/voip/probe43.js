@@ -291,12 +291,22 @@ function startPcm(reason) {
     var frameBytes = ef ? ef.frameBytes : 960;       // memcpy 总长
     var payloadBytes = ef ? (ef.payloadBytes || ef.frameBytes) : 640; // 有效数据
     var frameMs = ef ? ef.frameMs : 20;
-    playU8 = (contentRate === 16000 && chn === 1) ? new Uint8Array(pcmBuf)
-                                                  : loadPreResampled(contentRate, chn);
+    playU8 = (contentRate === 16000 && chn === 1)
+        ? (function () {   // 每轮重读载荷文件, 支持 A/B 换内容不重启
+            try { var f = new File("/tmp/voip_payload.pcm", "rb");
+                  var b = f.readBytes(); f.close();
+                  log("payload loaded " + b.byteLength + "B");
+                  return new Uint8Array(b); }
+            catch (e) { return new Uint8Array(pcmBuf); }
+          })()
+        : loadPreResampled(contentRate, chn);
     playMeta = { rate: rate, contentRate: contentRate, channels: chn,
                  frameBytes: frameBytes, payloadBytes: payloadBytes, frameMs: frameMs };
-    frame = Memory.alloc(frameBytes);
+    // 预留整页余量并清零：曾出现首帧访问帧后一页边界(0x...0000)的
+    // access violation；只分配 960B 时无法承受 SDK 的任何越界读。
+    frame = Memory.alloc(8192);
     KEEP.push(frame);
+    frame.writeByteArray(new Uint8Array(8192));
     // 静音 SDK 内部麦克风: 上行若混入采集环境声, 此调用应消除叠加杂音
     var micMute = null;
     try { micMute = muteMicFn(svc.add(8).readPointer().add(0xa10), 1); }
@@ -319,11 +329,12 @@ function startPcm(reason) {
             frame.writeByteArray(stage);
             ret = putExternal(svc, frame, frameBytes, rate, chn);
         } catch (e) { err = String(e); }
-        // -405447 = "NoMember is Active": 对方还没接听, 原地等待, 不消耗数据
-        if (ret === -405447 && err === null) {
+        // -405447 = "NoMember is Active"(未接听) / -405471 = 会话未就绪:
+        // 都原地等待, 不消耗数据(等待上限 90s)
+        if ((ret === -405447 || ret === -405471) && err === null) {
             waiting++;
-            if (waiting === 1) send({ type: "pcmWait", reason: "not answered, retrying 200ms", ts: Date.now() });
-            if (waiting > 300) { stopPcm("answer timeout 60s"); return; }
+            if (waiting === 1) send({ type: "pcmWait", reason: "ret " + ret + ", retrying 200ms", ts: Date.now() });
+            if (waiting > 450) { stopPcm("answer timeout 90s"); return; }
             lastRet = ret;
             streamTimer = setTimeout(tick, 200);
             return;
@@ -357,6 +368,54 @@ function startPcm(reason) {
 }
 log("ConfSDK=" + CONF.base + " svc=" + svc + " putExternal=" + CONF.base.add("0x7a370"),
     { pcmBytes: pcmBuf === null ? 0 : pcmBuf.byteLength, engine: engineInfo() });
+
+// ---------- 观察 vt[18]/vt[19] 的内部调用(只挂钩子, 不主动调) ----------
+// 静态: vt[18]=GetExternalHybridPlayData(this,buf,len,arg3,channels,rate,a6,a7,a8)
+//       内部 → impl->vt[0x308]; this+0x2c<1 早退 -405533
+//       本机实测: 未接通时调一次返回 -405533(符合静态), 通话中调用曾 access violation,
+//       故改为先看微信自己怎么调。
+var playVt = svc.readPointer();
+var playHooks = [];
+[18, 19].forEach(function (slot) {
+    var fn = playVt.add(slot * 8).readPointer();
+    try {
+        Interceptor.attach(fn, {
+            onEnter: function (args) {
+                var c = this.context;
+                this.slot = slot;
+                this.a1 = c.x1;
+                this.a2 = c.x2;
+                this.a4 = c.x4;
+                send({
+                    type: "playCallEnter", slot: slot,
+                    x1: String(c.x1), x2: String(c.x2), x3: String(c.x3),
+                    x4: String(c.x4), x5: String(c.x5), x6: String(c.x6),
+                    x7: String(c.x7),
+                    sp0: String(c.sp.readPointer()),
+                    x2i: c.x2.toInt32(), x4i: c.x4.toInt32(), x5i: c.x5.toInt32(),
+                    ts: Date.now()
+                });
+            },
+            onLeave: function (retval) {
+                var nz = null;
+                try {
+                    var n = this.a2.toInt32();
+                    if (this.slot === 18 && !this.a1.isNull() && n > 0 && n <= 8192) {
+                        var b = new Uint8Array(this.a1.readByteArray(n));
+                        var c = 0, first = -1;
+                        for (var i = 0; i < b.length; i++) if (b[i] !== 0) { c++; if (first < 0) first = i; }
+                        nz = { nonzero: c, first: first };
+                    }
+                } catch (e) { nz = { err: String(e) }; }
+                send({ type: "playCallLeave", slot: this.slot, ret: String(retval), buf: nz, ts: Date.now() });
+            }
+        });
+        playHooks.push(slot);
+    } catch (e) {
+        send({ type: "log", msg: "hook vt[" + slot + "] failed: " + e, ts: Date.now() });
+    }
+});
+log("playHooks=" + JSON.stringify(playHooks));
 
 // ---------- 文件触发拨号/注入/挂断 ----------
 var lastTag = (readText("/tmp/voip_uidial.req") || "").trim();

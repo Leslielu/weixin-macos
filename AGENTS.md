@@ -87,7 +87,12 @@ for programmatic message sending and receiving.
   auto-starts on answer). Known variable: one same-config round was noisy
   (suspect SDK recorder device contention — try holding the built-in mic if
   noise recurs); inbound receive API `GetExternalHybridPlayData(+0x7a388)` is
-  located but not wired. Also documented there: audio probe pitfalls (Stalker
+  located but not wired. **Topology rule (§14)**: always verify injection
+  quality with the tested side being the *dialer* and us answering. When the
+  *callee* injects, ConfSDK's external-record consumer runs on a 40 ms tick
+  and yields 20 ms holes + occasional 2× slow-motion, invariant to payload,
+  cadence and declared rate (settled 2026-11-01; production already injects
+  from the dialer and is clean). Also documented there: audio probe pitfalls (Stalker
   always crashes this process; SubmitCgi payload is x1 not x0). **Never hook
   `0x546a558/0x5470f7c/0x54704e4/0x5470644/0x5470688`** — they are PAC-signed
   indirect call targets and hooking them SIGBUSes AudioIOThread
