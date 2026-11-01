@@ -2299,6 +2299,89 @@ function triggerSendVoiceMessage(taskId, sender, receiver, protoHex, payloadHex)
 }
 // -------------------------发送语音消息分区-------------------------
 
+// -------------------------语音通话(VoIP)分区-------------------------
+// 2026-11-01 里程碑(docs/VOIP-CALL-STATUS.md §11): 走 ConfSDK 原生入口,
+// 不再用 wechat.dylib+0x1fcaf64 selector 34 注入口(§10 历史路线, 只能响铃接不通)。
+//   拨出: GetWXConfService(0x1352707) 取单例 → vt[6](svc, pb, len) → ConfSDKdyn+0x79ab4
+//   挂断: vt[12](svc, 1, 0)                                      → ConfSDKdyn+0x79dfc
+// pb(50B) = 0a <len> <被叫wxid> 10 02 18 00 20 04 38 00 42 06 "wechat" 4a 07 "voip-2p"
+// field7(本机uin)填 0 实测可正常振铃+接通, 不依赖任何本机常量。
+// 服务单例按调用现取: 通话结束后 SDK 可能重建, 缓存指针有悬空风险。
+// ⚠️ 已知未闭环(docs/VOIP-CALL-STATUS.md §12): 这条路径只发信令, 微信自己的
+// VoIP 客户端层(通话窗口/状态机/音频引擎)不会启动 ⇒ 能响铃能接通但双方静音。
+// Go 侧暂未接 /voip_call 路由, 等音频方案定了再开。
+var VOIP_GET_SVC_ARG = 0x1352707;
+
+function voipConfModule() {
+    var cands = Process.enumerateModules().filter(function (m) {
+        return m.name.indexOf("ConfSDKdyn") !== -1 && m.size > 100 * 1024;
+    });
+    cands.sort(function (a, b) { return b.size - a.size; });
+    return cands.length ? cands[0] : null;
+}
+
+function voipGetService() {
+    var conf = voipConfModule();
+    if (!conf) throw new Error("ConfSDKdyn 未加载");
+    var getter = null;
+    conf.enumerateExports().forEach(function (e) {
+        if (e.name === "GetWXConfService") getter = e.address;
+    });
+    if (!getter) throw new Error("ConfSDKdyn 缺少 GetWXConfService 导出");
+    var svc = new NativeFunction(getter, "pointer", ["int"])(VOIP_GET_SVC_ARG);
+    if (svc.isNull()) throw new Error("GetWXConfService 返回空");
+    return svc;
+}
+
+function voipEncodeVarint(n) {
+    var out = [];
+    while (true) {
+        var b = n & 0x7f;
+        n = Math.floor(n / 128);
+        if (n) { out.push(b | 0x80); } else { out.push(b); return out; }
+    }
+}
+
+function voipBuildInvitePb(wxid) {
+    var w = [];
+    for (var i = 0; i < wxid.length; i++) w.push(wxid.charCodeAt(i) & 0xff);
+    var tail = [0x10, 0x02, 0x18, 0x00, 0x20, 0x04, 0x38, 0x00,
+                0x42, 0x06, 0x77, 0x65, 0x63, 0x68, 0x61, 0x74,
+                0x4a, 0x07, 0x76, 0x6f, 0x69, 0x70, 0x2d, 0x32, 0x70];
+    return [0x0a].concat(voipEncodeVarint(w.length), w, tail);
+}
+
+function triggerVoipCall(targetId) {
+    try {
+        if (!targetId) throw new Error("被叫 wxid 为空");
+        var svc = voipGetService();
+        var fn = svc.readPointer().add(6 * 8).readPointer();
+        var pb = voipBuildInvitePb(targetId);
+        var mem = Memory.alloc(pb.length);
+        mem.writeByteArray(pb);
+        var r = new NativeFunction(fn, "int", ["pointer", "pointer", "int"])(svc, mem, pb.length);
+        console.log("[+] voip 拨出 target=" + targetId + " pb=" + pb.length + "B ret=" + r);
+        return r === 0 ? "0" : String(r);
+    } catch (e) {
+        console.log("[-] voip 拨出失败: " + e);
+        return "-1";
+    }
+}
+
+function triggerVoipHangup() {
+    try {
+        var svc = voipGetService();
+        var fn = svc.readPointer().add(12 * 8).readPointer();
+        var r = new NativeFunction(fn, "int", ["pointer", "int", "int"])(svc, 1, 0);
+        console.log("[+] voip 挂断 ret=" + r);
+        return r === 0 ? "0" : String(r);
+    } catch (e) {
+        console.log("[-] voip 挂断失败: " + e);
+        return "-1";
+    }
+}
+// -------------------------语音通话(VoIP)分区-------------------------
+
 rpc.exports = {
     hydrateCdnVideoCache: hydrateCdnVideoCache,
     triggerSendImgMessage: triggerSendImgMessage,
@@ -2314,6 +2397,8 @@ rpc.exports = {
     triggerSendFileUploadMessage: triggerSendFileUploadMessage,
     triggerUploadFile: triggerUploadFile,
     triggerUploadAppAttach: triggerUploadAppAttach,
+    triggerVoipCall: triggerVoipCall,
+    triggerVoipHangup: triggerVoipHangup,
 };
 
 // -------------------------发送图片消息分区-------------------------

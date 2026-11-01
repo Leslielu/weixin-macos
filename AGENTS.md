@@ -59,7 +59,7 @@ for programmatic message sending and receiving.
 - `tools/addrfind`: cross-version address finder (structVer switch).
   Methodology and workflow: `docs/version-upgrade.md`.
 - `tools/voip`: VoIP-call reverse-engineering toolchain (`strxref`/`voipwalk`/
-  `voipclimb` static analysis, `voipprobe` frida-go runner, probe1–32 session
+  `voipclimb` static analysis, `voipprobe` frida-go runner, probe1–41 session
   scripts, `run_probe.py` probe driver, `invite_payload.py` invite template
   splicer, per-session logs). Dev clone: `~/Applications/WeChat-4.1.13.app`
   (same 4.1.13.63 binary as production, addresses transfer 1:1). Run probes
@@ -72,9 +72,15 @@ for programmatic message sending and receiving.
   (svc, 1, 0)`. The older `0x1fcaf64(svc, selector=34, 0, payload, len, 0)`
   injection (§10) only makes the peer ring — it cannot connect, because it
   bypasses ConfSDK's session state machine. Also documented there: audio
-  beacons (`0x5470688`/`0x547070c`, local audio only — not a "peer is ringing"
-  signal), and the probe pitfalls (Stalker always crashes this process;
-  SubmitCgi payload is x1 not x0).
+  probe pitfalls (Stalker always crashes this process; SubmitCgi payload is x1
+  not x0). **Audio is still open (§12)**: a `vt[6]` dial rings and connects but
+  starts no local audio engine, no call window and none of WeChat's own call
+  state machine (`0x434dc00`) — ConfSDK is only the transport. WeChat's VoIP
+  client layer (`0x1fc07f4`, object vtable `wechat.dylib+0x98cbac8`) has a
+  one-shot guard byte at `obj+0x28`, so a spent object cannot be replayed.
+  **Never hook `0x546a558/0x5470f7c/0x54704e4/0x5470644/0x5470688`** — they are
+  PAC-signed indirect call targets and hooking them SIGBUSes AudioIOThread
+  (`0xac4400000002`, 0xac44 = 44100).
 - `idapro/`, `diaphora/`: static analysis scripts and notes.
 - `docs/`: operational documentation. Read `docs/crash-history.md` before any
   crash investigation; it records fingerprints, root causes, shipped fixes,
