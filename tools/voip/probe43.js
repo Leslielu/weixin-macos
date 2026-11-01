@@ -204,9 +204,14 @@ function engineInfo() {
         return info;
     } catch (e) { return { error: String(e) }; }
 }
-// w24 复刻(实测字段值 frameMs=20, f1=48000, f2=1 → 960B/帧):
-//   w24 = [mv-8+0x234] * [0x254] * [0x258] / 1000
-// 声明采样率按 s16 mono 反推: rate = w24*1000/frameMs/2 (=24000)
+// 引擎每帧拷贝长度(样本数, **不是字节数**):
+//   samples = [mv-8+0x234](frameMs) * [0x254](采样率) * [0x258](声道) / 1000
+//   bytes   = samples * 2  (s16le)
+// 实测: 16k/1ch → 320 样本 = 640B; 48k/1ch → 960 样本 = 1920B。
+// 早先版本把 samples 直接当字节用, 16k 通话下 320 样本≈640B(碰巧), 表现为
+// "引擎吃前 640B"; 一旦设备跑 48k(如打手机), 引擎仍拷 1920B 而缓冲里只有
+// 640B 真实内容 → 每帧 20ms 只有 1/3 有声, 其余是零 → 对方听到 20ms 空白。
+// 现按引擎实际采样率重采样内容并按真实字节数推送。
 function engineFrame() {
     try {
         var impl = svc.add(8).readPointer();
@@ -214,18 +219,19 @@ function engineFrame() {
         if (mv.isNull()) return null;
         var av = mv.sub(8);
         var frameMs = av.add(0x234).readU32();
-        var f1 = av.add(0x254).readU32();
-        var f2 = av.add(0x258).readU32();
-        var w24 = Math.floor(frameMs * f1 * f2 / 1000);
-        // 终版标定(2026-11-01, 录音测量 tempo=1.0000 + 耳测确认):
-        //   帧结构 = 960B(640B 16k 内容载荷 + 320B 零尾), 20ms/帧, 声明 24000。
-        //   引擎吃前 640B(320样本=20ms@16k)恰 1:1; 零尾被丢弃。
-        //   24k 内容会每帧富余 160 样本→缓冲积压→周期性清空=滋滋杂音(已实测)。
-        if (frameMs >= 10 && frameMs <= 60 && w24 >= 100 && w24 <= 4096)
-            return { frameMs: 20, frameBytes: 960, payloadBytes: 640,
-                     rate: 24000, contentRate: 16000, channels: 1,
-                     raw: [frameMs, f1, f2, w24] };
-    } catch (e) {}
+        var engRate = av.add(0x254).readU32();
+        var engCh = av.add(0x258).readU32();
+        if (!(frameMs >= 5 && frameMs <= 60)) return null;
+        if (!(engRate >= 8000 && engRate <= 96000)) return null;
+        if (engCh !== 1 && engCh !== 2) engCh = 1;
+        var samples = Math.floor(frameMs * engRate * engCh / 1000);
+        var contentBytes = samples * 2;
+        if (contentBytes < 100 || contentBytes > 8192) return null;
+        return { frameMs: frameMs, frameBytes: Math.max(contentBytes, 960),
+                 payloadBytes: contentBytes, rate: 24000,
+                 contentRate: engRate, channels: engCh,
+                 raw: [frameMs, engRate, engCh, samples, contentBytes] };
+    } catch (e) { log("engineFrame err: " + e); }
     return null;
 }
 
@@ -282,31 +288,56 @@ function loadPreResampled(rate, chn) {
         return new Uint8Array(b);
     } catch (e) { return resample16k(rate, chn); }
 }
+// 载荷: 优先 /tmp/voip_payload_<rate>_<ch>.pcm(按引擎实际采样率预生成),
+// 其次 16k mono 的老文件, 最后才用 JS 线性插值现场重采样。
+function loadPayload(contentRate, chn) {
+    var tries = ["/tmp/voip_payload_" + contentRate + "_" + chn + ".pcm"];
+    if (contentRate === 16000 && chn === 1) tries.push("/tmp/voip_payload.pcm");
+    for (var i = 0; i < tries.length; i++) {
+        try { var f = new File(tries[i], "rb"); var b = f.readBytes(); f.close();
+              log("payload loaded " + b.byteLength + "B from " + tries[i]);
+              return new Uint8Array(b); } catch (e) {}
+    }
+    if (contentRate === 16000 && chn === 1 && pcmBuf !== null)
+        return new Uint8Array(pcmBuf);
+    return loadPreResampled(contentRate, chn);
+}
+var frameCap = 0;
 function startPcm(reason) {
     if (streaming || pcmBuf === null) return;
-    var ef = engineFrame();
-    var rate = ef ? ef.rate : 24000;                 // API 声明值(必须 24000)
-    var contentRate = ef ? (ef.contentRate || ef.rate) : 16000; // 内容重采样率
-    var chn = ef ? ef.channels : 1;
-    var frameBytes = ef ? ef.frameBytes : 960;       // memcpy 总长
-    var payloadBytes = ef ? (ef.payloadBytes || ef.frameBytes) : 640; // 有效数据
-    var frameMs = ef ? ef.frameMs : 20;
-    playU8 = (contentRate === 16000 && chn === 1)
-        ? (function () {   // 每轮重读载荷文件, 支持 A/B 换内容不重启
-            try { var f = new File("/tmp/voip_payload.pcm", "rb");
-                  var b = f.readBytes(); f.close();
-                  log("payload loaded " + b.byteLength + "B");
-                  return new Uint8Array(b); }
-            catch (e) { return new Uint8Array(pcmBuf); }
-          })()
-        : loadPreResampled(contentRate, chn);
-    playMeta = { rate: rate, contentRate: contentRate, channels: chn,
-                 frameBytes: frameBytes, payloadBytes: payloadBytes, frameMs: frameMs };
-    // 预留整页余量并清零：曾出现首帧访问帧后一页边界(0x...0000)的
-    // access violation；只分配 960B 时无法承受 SDK 的任何越界读。
-    frame = Memory.alloc(8192);
-    KEEP.push(frame);
-    frame.writeByteArray(new Uint8Array(8192));
+    var rate = 24000, contentRate = 16000, chn = 1;
+    var frameBytes = 960, payloadBytes = 640, frameMs = 20;
+    var stage = new Uint8Array(frameBytes);
+    var fmtApplied = false;
+
+    // 引擎格式必须在**接通之后**读: 拨号前 mvqqEngine 还是 0x0, 读出来是空。
+    // 每次拿到新格式就按它重载载荷/重建暂存, 并从文件头重新开播(等待期未消耗数据)。
+    function applyEngineFormat(tag) {
+        var ef = engineFrame();
+        if (ef) {
+            rate = ef.rate; contentRate = ef.contentRate; chn = ef.channels;
+            frameBytes = ef.frameBytes; payloadBytes = ef.payloadBytes;
+            frameMs = ef.frameMs;
+        }
+        playU8 = loadPayload(contentRate, chn);
+        playMeta = { rate: rate, contentRate: contentRate, channels: chn,
+                     frameBytes: frameBytes, payloadBytes: payloadBytes, frameMs: frameMs };
+        var need = Math.max(16384, frameBytes * 4);
+        if (!frame || need > frameCap) {
+            frame = Memory.alloc(need);
+            KEEP.push(frame);
+            frameCap = need;
+        }
+        frame.writeByteArray(new Uint8Array(frameCap)); // 整块清零, 防越界读脏数据
+        stage = new Uint8Array(frameBytes);
+        pcmOff = 0; idx = 0; t0 = Date.now();
+        fmtApplied = !!ef;
+        send({ type: "fmt", tag: tag, meta: playMeta, engine: ef,
+               engineNow: engineInfo(), ts: Date.now() });
+        return ef;
+    }
+    var t0 = Date.now(), idx = 0, waiting = 0;
+    applyEngineFormat("start");
     // 静音 SDK 内部麦克风: 上行若混入采集环境声, 此调用应消除叠加杂音
     var micMute = null;
     try { micMute = muteMicFn(svc.add(8).readPointer().add(0xa10), 1); }
@@ -314,12 +345,16 @@ function startPcm(reason) {
     streaming = true; pcmOff = 0; pcmCalls = 0; negativeRets = 0; lastRet = null;
     maxLate = 0; lateCnt3 = 0;
     send({ type: "pcmStart", reason: reason, bytes: playU8.length,
-           meta: playMeta, engine: ef, engineNow: engineInfo(), micMute: micMute,
-           svc: String(svc), entry: String(CONF.base.add("0x7a370")), ts: Date.now() });
-    var stage = new Uint8Array(frameBytes); // 预配暂存+零尾, 每帧只写前 payloadBytes
-    var t0 = Date.now(), idx = 0, waiting = 0;
+           meta: playMeta, fmtApplied: fmtApplied, engineNow: engineInfo(),
+           micMute: micMute, svc: String(svc),
+           entry: String(CONF.base.add("0x7a370")), ts: Date.now() });
     function tick() {
         if (!streaming) return;
+        // 启动时引擎还没起来(拨号前 mvqqEngine=0x0)会读到空格式; 这种情况
+        // putExternal 仍返回 0 但数据被丢弃, 所以没有 pcmGo 机会。这里在最初
+        // 若干帧内持续重试读格式, 一旦成功就按真实采样率重建整条管线。
+        if (!fmtApplied && pcmCalls < 40 && engineFrame() !== null)
+            applyEngineFormat("retry-early");
         if (pcmOff >= playU8.length) { stopPcm("eof"); return; }
         var take = Math.min(payloadBytes, playU8.length - pcmOff);
         if (take < payloadBytes) stage.fill(0, 0, payloadBytes); // 尾帧清零
@@ -342,7 +377,8 @@ function startPcm(reason) {
         if (waiting > 0) {
             send({ type: "pcmGo", waitedMs: waiting * 200, ts: Date.now() });
             waiting = 0;
-            t0 = Date.now(); idx = 0; // 节奏从接通瞬间起算
+            // 接通瞬间重读引擎格式并按它重载载荷/帧长(等待期没消耗数据, 从头播)
+            applyEngineFormat("answered");
         }
         pcmOff += take;
         pcmCalls++;

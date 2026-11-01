@@ -75,15 +75,19 @@ for programmatic message sending and receiving.
   pb, 50)` (field7 may be 0), hang up `vt[12] = ConfSDKdyn+0x79dfc(svc,1,0)`.
   The older `0x1fcaf64(svc, selector=34, ...)` injection (§10) only rings the
   peer — historical. **Outbound audio injection is solved (§13)**: play PCM to
-  the callee via `ConfSDKdyn+0x7a370(svc, pcm, len, 24000, 1)`. Iron rules
-  (verified by recording-measurement tempo=1.0000): frame = 960 B = **640 B of
-  16 kHz mono s16 content + 320 B zero tail** (the engine eats the first 640 B
-  and drops the tail), push 640 B of fresh data every 20 ms (absolute-deadline
-  pacing), declared rate must be 24000, and after answer call `MuteMicPhone`
-  (`ConfSDKdyn+0x662e0(confEngine, 1)`, confEngine = `[svc+8]+0xa10`) or pitch
-  is ×1.5 too fast. Never feed full 24k frames — the engine consumes only 320
-  of 480 samples per frame and the surplus buffers up into periodic crackle +
-  ×2/3 slow+deep playback. `-405447` = not answered yet (retry 200 ms,
+  the callee via `ConfSDKdyn+0x7a370(svc, pcm, len, 24000, 1)`. Iron rules:
+  **frame length is computed per call from the negotiated engine format** —
+  `frameMs × engineRate × channels / 1000` is a **sample count**, double it for
+  bytes (16k → 960 B = 640 B content + 320 B zero tail; 48k → 1920 B, no tail),
+  and content must be resampled to that rate. Declared rate is always 24000,
+  push one frame every 20 ms (absolute-deadline pacing), and after answer call
+  `MuteMicPhone` (`ConfSDKdyn+0x662e0(confEngine, 1)`, confEngine =
+  `[svc+8]+0xa10`) or pitch is ×1.5 too fast. Read the format from the mvq
+  object at `[svc+8]+0xa10`+8, offsets `-8+0x234 / -8+0x254 / -8+0x258`; it is
+  empty before dialing, so retry during the first 40 ticks and **re-read on
+  answer** — the device sample rate is negotiated per call (both 16000 and
+  48000 observed), and a hardcoded 960 B frame on a 48k call produces
+  intermittent dropouts. `-405447` = not answered yet (retry 200 ms,
   auto-starts on answer). Known variable: one same-config round was noisy
   (suspect SDK recorder device contention — try holding the built-in mic if
   noise recurs); inbound receive API `GetExternalHybridPlayData(+0x7a388)` is
