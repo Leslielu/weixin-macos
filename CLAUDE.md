@@ -22,7 +22,7 @@ WeChat macOS reverse engineering project. Hooks WeChat's underlying message send
 - `onebot/` - Go service implementing OneBot protocol (HTTP/WebSocket)
 - `tools/` - 逆向/分析工具：
   - `addrfind` - 跨版本地址迁移（方法论见 docs/version-upgrade.md）
-  - `voip` - VoIP 语音通话逆向工具链（strxref/voipwalk/voipclimb 静态分析 + voipprobe runner + probe1-41 探针演进 + run_probe.py 探针驱动 + invite_payload.py 报文拼装），做通话相关工作先读 docs/VOIP-CALL-STATUS.md
+  - `voip` - VoIP 语音通话逆向工具链（strxref/voipwalk/voipclimb 静态分析 + voipprobe runner + probe1-43 探针演进 + run_probe.py 探针驱动 + invite_payload.py 报文拼装），做通话相关工作先读 docs/VOIP-CALL-STATUS.md
 - `idapro/` - IDA Pro Python analysis scripts
 - `wechat_version/` - Memory address configs for different WeChat versions (JSON)
 - `frida-gadget/` - Alternative approach for systems without SIP disabled
@@ -104,7 +104,10 @@ curl -X POST -H "Content-Type:application/json" \
 **先读 `docs/crash-history.md`** —— 历次崩溃的指纹、根因、已上线修复和遗留问题都在里面，别从零开始。
 
 ### 语音通话（VoIP）相关工作
-**先读 `docs/VOIP-CALL-STATUS.md`** —— 通话信令全图、`0x1fdc80c` 统一发送函数、**能拨号+接通+挂断的原生入口（§11）：`svc=GetWXConfService(0x1352707)`，拨出 `vt[6]=ConfSDKdyn+0x79ab4(svc, pb, 50)`（pb 第一字段即被叫 wxid），挂断 `vt[12]=ConfSDKdyn+0x79dfc(svc,1,0)`**；§10 的 `0x1fcaf64` selector 34 注入口只能让对方响铃、接不通（已标为历史路线）。**音频仍未通（§12）**：`vt[6]` 拨号能响铃能接通，但本机音频引擎、通话窗口、微信自己的通话状态机（`0x434dc00`）一个都不启动——ConfSDK 只是传输层。微信 VoIP 客户端层是 `0x1fc07f4`（对象 vtable `wechat.dylib+0x98cbac8`），其对象 `+0x28` 有一次性门禁字节，用过的实例回放会被拒（ret=1）。**0x546a558/0x5470f7c/0x54704e4/0x5470644/0x5470688 一律禁止挂钩子**：它们是 PAC 签名间接调用目标，挂上必崩 AudioIOThread（毒值 `0xac4400000002`，0xac44=44100）。探针踩坑（Stalker 必崩、SubmitCgi 读 x1、fixup 编码）都在里面。探针用 `run_probe.py` 跑（frida CLI 重定向有缓冲，日志会滞后）。开发副本 = 本机 `~/Applications/WeChat-4.1.13.app`（与生产同版本，地址直接通用）。
+**先读 `docs/VOIP-CALL-STATUS.md`** —— 通话信令全图、`0x1fdc80c` 统一发送函数、原生入口与音频注入全标定。核心入口（§11/§13）：
+- **拨号**：静态单例 `CLIENT=BASE+0x9b93ab8`，`0x1fc07f4(client, 被叫cstr, vector<string>*, 1, 0, 0x2e6981b3)`，ret=1 即成功；`+0x28` 是初始化标志不是一次性门禁（§12.4 旧结论已作废）。简化版：`svc=GetWXConfService(0x1352707)`，拨出 `vt[6]=ConfSDKdyn+0x79ab4(svc, pb, 50)`（pb 第一字段=被叫 wxid，field7 可填 0），挂断 `vt[12]=ConfSDKdyn+0x79dfc(svc,1,0)`。§10 的 selector 34 注入口只能响铃接不通（历史路线）。
+- **给对方播放语音（§13 已打通）**：`ConfSDKdyn+0x7a370(svc, pcm, len, 24000, 1)` 外部 PCM 注入。铁律标定（录音测量 tempo=1.0000）：帧 = **960B（前 640B 为 16kHz mono s16 内容 + 后 320B 零尾）**、每 20ms 推 640B 新数据（绝对时间线节拍）、声明采样率必须 24000、接通后必须调 `MuteMicPhone`（`ConfSDKdyn+0x662e0(confEngine,1)`，confEngine=`[svc+8]+0xa10`），否则音调 ×1.5 偏快。内容切勿用 24k 整帧——引擎每帧只吃前 320 样本，多余会积压成周期性滋滋杂音+×2/3 慢放。`-405447`=未接通（200ms 重试自动等接听）。遗留疑点：同配置偶发一轮杂音（嫌疑 SDK 录音器设备竞争，复现时先占住内建麦克风）；入站接收接口 `GetExternalHybridPlayData(+0x7a388)` 未接线。
+- **0x546a558/0x5470f7c/0x54704e4/0x5470644/0x5470688 一律禁止挂钩子**：PAC 签名间接调用目标，挂上必崩 AudioIOThread（毒值 `0xac4400000002`）。Stalker 必崩；SubmitCgi 读 x1。探针用 `run_probe.py` 跑（日志追加写，等待循环要按行号偏移 grep；触发文件边沿触发，每轮两个都要刷新）。开发副本 = 本机 `~/Applications/WeChat-4.1.13.app`（与生产同版本，地址直接通用）。
 
 ### Version-Specific Memory Addresses
 Each WeChat version requires specific memory offsets in `wechat_version/*.json`. When adding new versions:

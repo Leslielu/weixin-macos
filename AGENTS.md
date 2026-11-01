@@ -59,27 +59,38 @@ for programmatic message sending and receiving.
 - `tools/addrfind`: cross-version address finder (structVer switch).
   Methodology and workflow: `docs/version-upgrade.md`.
 - `tools/voip`: VoIP-call reverse-engineering toolchain (`strxref`/`voipwalk`/
-  `voipclimb` static analysis, `voipprobe` frida-go runner, probe1–41 session
+  `voipclimb` static analysis, `voipprobe` frida-go runner, probe1–43 session
   scripts, `run_probe.py` probe driver, `invite_payload.py` invite template
   splicer, per-session logs). Dev clone: `~/Applications/WeChat-4.1.13.app`
   (same 4.1.13.63 binary as production, addresses transfer 1:1). Run probes
-  with `run_probe.py` (the frida CLI buffers redirected output).
+  with `run_probe.py` (the frida CLI buffers redirected output; its log is
+  append-only — offset grep by line number for fresh events; trigger files
+  are edge-triggered, refresh both every round).
   Read `docs/VOIP-CALL-STATUS.md` before any voip work: it maps the signaling
-  flow (voipilinkinvite/livesync/cancel), the unified sender `0x1fdc80c`, and
-  the **native entries that dial, connect and hang up** (§11):
-  `svc = GetWXConfService(0x1352707)`, dial = `vt[6] = ConfSDKdyn+0x79ab4(svc,
-  pb, 50)` (pb field1 = callee wxid), hang up = `vt[12] = ConfSDKdyn+0x79dfc
-  (svc, 1, 0)`. The older `0x1fcaf64(svc, selector=34, 0, payload, len, 0)`
-  injection (§10) only makes the peer ring — it cannot connect, because it
-  bypasses ConfSDK's session state machine. Also documented there: audio
-  probe pitfalls (Stalker always crashes this process; SubmitCgi payload is x1
-  not x0). **Audio is still open (§12)**: a `vt[6]` dial rings and connects but
-  starts no local audio engine, no call window and none of WeChat's own call
-  state machine (`0x434dc00`) — ConfSDK is only the transport. WeChat's VoIP
-  client layer (`0x1fc07f4`, object vtable `wechat.dylib+0x98cbac8`) has a
-  one-shot guard byte at `obj+0x28`, so a spent object cannot be replayed.
-  **Never hook `0x546a558/0x5470f7c/0x54704e4/0x5470644/0x5470688`** — they are
-  PAC-signed indirect call targets and hooking them SIGBUSes AudioIOThread
+  flow (voipilinkinvite/livesync/cancel), the unified sender `0x1fdc80c`, the
+  native dial/answer/hangup entries (§11/§13): static singleton
+  `CLIENT = BASE+0x9b93ab8` via `0x1fc07f4(client, callee, vector, 1, 0,
+  scene)` (ret=1 = sent; `+0x28` is an init flag, NOT a one-shot guard), or
+  `svc = GetWXConfService(0x1352707)`, dial `vt[6] = ConfSDKdyn+0x79ab4(svc,
+  pb, 50)` (field7 may be 0), hang up `vt[12] = ConfSDKdyn+0x79dfc(svc,1,0)`.
+  The older `0x1fcaf64(svc, selector=34, ...)` injection (§10) only rings the
+  peer — historical. **Outbound audio injection is solved (§13)**: play PCM to
+  the callee via `ConfSDKdyn+0x7a370(svc, pcm, len, 24000, 1)`. Iron rules
+  (verified by recording-measurement tempo=1.0000): frame = 960 B = **640 B of
+  16 kHz mono s16 content + 320 B zero tail** (the engine eats the first 640 B
+  and drops the tail), push 640 B of fresh data every 20 ms (absolute-deadline
+  pacing), declared rate must be 24000, and after answer call `MuteMicPhone`
+  (`ConfSDKdyn+0x662e0(confEngine, 1)`, confEngine = `[svc+8]+0xa10`) or pitch
+  is ×1.5 too fast. Never feed full 24k frames — the engine consumes only 320
+  of 480 samples per frame and the surplus buffers up into periodic crackle +
+  ×2/3 slow+deep playback. `-405447` = not answered yet (retry 200 ms,
+  auto-starts on answer). Known variable: one same-config round was noisy
+  (suspect SDK recorder device contention — try holding the built-in mic if
+  noise recurs); inbound receive API `GetExternalHybridPlayData(+0x7a388)` is
+  located but not wired. Also documented there: audio probe pitfalls (Stalker
+  always crashes this process; SubmitCgi payload is x1 not x0). **Never hook
+  `0x546a558/0x5470f7c/0x54704e4/0x5470644/0x5470688`** — they are PAC-signed
+  indirect call targets and hooking them SIGBUSes AudioIOThread
   (`0xac4400000002`, 0xac44 = 44100).
 - `idapro/`, `diaphora/`: static analysis scripts and notes.
 - `docs/`: operational documentation. Read `docs/crash-history.md` before any
