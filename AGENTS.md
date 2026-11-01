@@ -49,8 +49,8 @@ for programmatic message sending and receiving.
 - `onebot/`: Go service implementing the OneBot protocol. HTTP server on
   127.0.0.1:58080; message callback to wxgate on 127.0.0.1:36060; WebSocket
   via `-conn_type=websocket`; gadget mode via `-type=gadget
-  -gadget_addr=127.0.0.1:27042`. Voice calls (implemented 2026-11-01, **not
-  deployed**): `POST /send_voice_call` `{user_id, voice|<text>, async?,
+  -gadget_addr=127.0.0.1:27042`. Voice calls (implemented and deployed
+  2026-11-01): `POST /send_voice_call` `{user_id, voice|<text>, async?,
   hangup?, max_seconds?, timeout?}` dials, waits for answer, plays the given
   audio or TTS, then hangs up; plus `GET /voice_call_status` and
   `POST /hangup_voice_call`. One call at a time, outbound only. Code:
@@ -164,9 +164,20 @@ Operational rules:
 
 Safety-critical invariants learned from production incidents:
 
-- **Never kill onebot while its WeChat is alive.** The gadget session attach
-  is one-shot; a detached/onebot-killed chain must go through a full chain
-  restart to recover.
+- **Never kill onebot while its WeChat is alive.** Detaching a gadget session
+  races with the teardown path and crashes WeChat (class G), and repeated
+  restarts exhaust gadget sessions (class F, ~9 per WeChat lifetime measured).
+  After changing `script.js` or the binary the procedure is: change → restart
+  WeChat → log in → start the new onebot. Do not restart onebot alone,
+  repeatedly, on a live WeChat.
+- **Run Frida probes only against the dev copy.** Extra clients on the
+  production WeChat degrade interceptor state, after which
+  `Interceptor.attach` fails on individual addresses
+  (`unable to intercept function at 0x...` — resp-dispatch / download hooks)
+  and the bot silently stops receiving messages while WeChat keeps
+  downloading. Startup logs then show an ERROR "关键 hook 挂载失败". The only
+  fix is a WeChat restart; restarting onebot on the old process makes it
+  worse.
 - **Hooks only attach, never detach.** Removing an installed hook mid-flight
   crashes WeChat (TLS affinity is known technical debt).
 - **Dequeue pump boundaries are fixed.** The persistent pump and its

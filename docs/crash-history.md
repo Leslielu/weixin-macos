@@ -1,7 +1,7 @@
 # 微信 Bot 崩溃档案与排查手册
 
 > 排查任何崩溃/发送异常前**先读本文**。记录历次崩溃的指纹、根因分析、已上线的修复和遗留问题。
-> 最后更新：2026-09-21
+> 最后更新：2026-11-01
 
 ## 速查：排查动作清单
 
@@ -160,7 +160,7 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 
 **修复**：模块表优先（真身是全进程唯一 >50MB 的 wechat.dylib，无竞态）；字符串扫描仅兜底且必须校验 range 含可执行权限。注意修复本身曾引入 D 类 bug——见上条，两个改动必须一起回看的教训就在这。
 
-**F. gadget 会话耗尽（运维约束）**：反复重启 onebot（一个下午 4-5 次）会耗尽 gadget 内部会话资源 → 控制通道整体卡死（frida-ps 都 hang）→ 只能重启微信进程恢复。**改 script.js 要批量改完再重启，别改一处重启一次。**另外 macOS 按 bundle ID 单例激活：日常 4.1.13 在跑时 `open` 4.1.12 是空操作，必须 `open -n`。（2026-09-21 实测预算 ~9 次/微信生命周期。）
+**F. gadget 会话耗尽（运维约束）**：反复重启 onebot（一个下午 4-5 次）会耗尽 gadget 内部会话资源 → 控制通道整体卡死（frida-ps 都 hang）→ 只能重启微信进程恢复。**2026-11-01 又见第二种形态：整体不卡，但个别地址 `Interceptor.attach` 报 `unable to intercept function at 0x...`（resp-dispatch/下载 hook），表现为静默收不到消息** —— 见下方 2026-11-01 条目。**改 script.js 要批量改完再重启，别改一处重启一次。**另外 macOS 按 bundle ID 单例激活：日常 4.1.13 在跑时 `open` 4.1.12 是空操作，必须 `open -n`。（2026-09-21 实测预算 ~9 次/微信生命周期。）
 
 **G. gadget 会话拆除竞态崩宿主（2026-09-21 08:48 实锤，新铁律）**：
 ```
@@ -189,9 +189,39 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 合法 tid 门）+ 保质期 30s→85s + Go ctx 90s + HTTP 91s + OnPush 第 4 出队点。
 详见 docs/4.1.13-submitcgi-analysis.md §8。
 
+### 2026-11-01 21:32–21:53 —— F/G 类复发 + 新症状「部分 hook 挂不上 → 静默收不到消息」
 
+**背景**：同日部署 onebot 语音通话接口（`send_voice_call`），为验证在**同一个微信进程**
+（PID 10357，已连续运行 18 天）上做了 3 次链重启（21:32/21:34/21:36），此前还挂着探针会话。
+
+**新症状（此前没记过的形态）**：重启后 onebot 照常"已就绪"，但 `Interceptor.attach`
+在**个别地址**抛 `Error: unable to intercept function at 0x...`：
+- 21:32 轮：downloadFile/Imag/Video 三个挂不上，收消息 hook 正常；
+- 21:34、21:36 轮：连 `respDispatchAddr`（收消息主路）也挂不上。
+
+失败是**静默**的：日志只有 INFO 级 `[!] xxx hook 挂载失败`，没有 ERROR，看门狗不告警。
+后果是 21:32–21:48 之间**收到的消息全部丢掉**（实测：外部账号发图，微信侧已下载
+`下载hook回填 uploadGlobalX0`，但 resp-dispatch 没挂 → 零转发）。
+
+**恢复**：`kill -9 微信` → 看门狗自动全链路恢复（OCR 点允许 + 回车登录 + 链重启，约
+2 分钟）→ **全新进程里所有 hook 一次挂全，零失败**。恢复后验证：外部发图/发文本均正常
+转发到 wxgate，`POST /send_voice_call` 实测接通并播完（195 帧 / reason=eof / maxLate=0）。
+
+**同时又踩 G 类**：21:51 那次 `start.sh restart`（单独 kill 存活微信上的 onebot）
+把微信拆崩了 —— `.ips` 指纹与此前 G 类完全一致：crashedThread =
+`frida-gadget-tcp-27042`，KERN_INVALID_ADDRESS 野地址 `0x146608038`，
+后续帧 `FridaGadget.dylib +0x1d1d38 / +0x1d1f40`。看门狗照例自动恢复。
+
+**结论 / 加固**：
+1. F 类（gadget 会话耗尽）**不止表现为整体卡死**，还会表现为"部分地址挂不上"。
+   判据：启动日志出现 `unable to intercept function at 0x...`。
+2. 处置只有一个：**重启微信**（拿全新进程）。在旧进程上再重启 onebot 没用，只会更糟。
+3. 同机挂多个 frida client（探针 + onebot）会加速状态劣化；**探针只在开发副本跑**。
+4. 已加固：script.js 把三个下载 hook 的失败登记下来，开机 5s 后以 `type:"error"`
+   上报，日志出现 **ERROR 级「关键 hook 挂载失败: …」**，不再静默。
 
 | commit | 仓库 | 内容 |
+|---|---|---|
 |---|---|---|
 | `1f46848` | weixin-macos | pendingBuf2RespTasks 任务表 + 10s 超时兜底复原原始指针；大 range 扫描失败的模块表兜底 |
 | `74af55e` | weixin-macos | 兜底超时 10s→3s，赶在 mars ~5s 失败窗口前 |

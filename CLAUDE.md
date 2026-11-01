@@ -103,6 +103,16 @@ curl -X POST -H "Content-Type:application/json" \
 ### 崩溃/发送异常排查
 **先读 `docs/crash-history.md`** —— 历次崩溃的指纹、根因、已上线修复和遗留问题都在里面，别从零开始。
 
+两条血泪规程（2026-11-01 复现）：
+- **别单独重启存活微信上的 onebot**。gadget 会话拆除有竞态（G 类，实测会 SIGSEGV 崩微信），
+  且反复重启会耗尽 gadget 会话（F 类，实测预算约 9 次/微信生命周期）。改 `script.js` 或二进制的
+  规程是**改好 → 重启微信 → 登录 → 起新 onebot**，一次到位别反复。
+- **探针只在开发副本跑**。生产微信上再挂 frida client 会让拦截器状态劣化，之后
+  `Interceptor.attach` 在个别地址报 `unable to intercept function at 0x...`（resp-dispatch /
+  下载 hook）→ **静默收不到消息**（微信侧照常下载，onebot 零转发）。启动日志出现 ERROR 级
+  「关键 hook 挂载失败」就是它。处置只有一条：**重启微信**拿全新进程，在旧进程上再重启
+  onebot 只会更糟。
+
 ### 语音通话（VoIP）相关工作
 **先读 `docs/VOIP-CALL-STATUS.md`** —— 通话信令全图、`0x1fdc80c` 统一发送函数、原生入口与音频注入全标定。核心入口（§11/§13）：
 - **拨号**：静态单例 `CLIENT=BASE+0x9b93ab8`，`0x1fc07f4(client, 被叫cstr, vector<string>*, 1, 0, 0x2e6981b3)`，ret=1 即成功；`+0x28` 是初始化标志不是一次性门禁（§12.4 旧结论已作废）。简化版：`svc=GetWXConfService(0x1352707)`，拨出 `vt[6]=ConfSDKdyn+0x79ab4(svc, pb, 50)`（pb 第一字段=被叫 wxid，field7 可填 0），挂断 `vt[12]=ConfSDKdyn+0x79dfc(svc,1,0)`。§10 的 selector 34 注入口只能响铃接不通（历史路线）。
@@ -124,7 +134,7 @@ Each WeChat version requires specific memory offsets in `wechat_version/*.json`.
 - Default HTTP server: `127.0.0.1:58080`
 - Message callback URL: `http://127.0.0.1:36060/onebot` (configurable)
 - Supports both HTTP and WebSocket connections (`-conn_type=websocket`)
-- 语音通话（2026-11-01 实现，**尚未部署**）：`POST /send_voice_call`
+- 语音通话（2026-11-01 实现并部署 mac-m1）：`POST /send_voice_call`
   `{user_id, voice|<text>, async?, hangup?, max_seconds?, timeout?}` — 拨号、等接听、播放给定音频
   或 TTS、播完挂断；配 `GET /voice_call_status`、`POST /hangup_voice_call`。同一时刻只允许一通，
   只支持出站。实现见 `onebot/voice_call.go` + `onebot/script.js` 的 VoIP 分区，

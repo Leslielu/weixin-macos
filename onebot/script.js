@@ -157,6 +157,7 @@ function initAddresses() {
     setImmediate(setupDownloadFileDynamic);
     setImmediate(armVoiceForceLegacy);
     setImmediate(setReceiver);
+    setTimeout(reportHookFails, 5000); // hook 挂载失败统一 ERROR 上报
 }
 
 // -------------------------基础函数分区-------------------------
@@ -417,6 +418,30 @@ var downloadImagAddr;
 var startDownloadMedia;
 var downloadFileAddr;
 var downloadVideoAddr;
+
+// 关键 hook 挂载失败登记(2026-11-01 生产事故): gadget 被多个 client 反复接管后会
+// 遗留失效的 trampoline, 之后 Interceptor.attach 在个别地址失败 —— 表现为静默失去
+// 收消息/媒体下载能力(日志只有 INFO 级 "[!]", 看门狗不告警)。这里把失败登记下来,
+// 开机 5s 后统一以 ERROR 级别上报给 Go 侧, 让故障可见。
+var hookFailNames = [];
+
+function noteHookFail(name, e) {
+    hookFailNames.push(name);
+    console.error("[!] " + name + " hook 挂载失败: " + e);
+}
+
+function reportHookFails() {
+    if (hookFailNames.length === 0) {
+        return;
+    }
+    var msg = "关键 hook 挂载失败: " + hookFailNames.join(",") +
+        " —— 收消息/媒体下载将不可用; 只能重启微信恢复(Frida 拦截器已损坏)";
+    console.error("[!] " + msg);
+    try {
+        send({ type: "error", description: msg });
+    } catch (e) {
+    }
+}
 
 var downloadGlobalX0;
 var downloadFileX1 = ptr(0)
@@ -2838,7 +2863,7 @@ function setReceiver() {
         }
     });
     } catch (e) {
-        console.error("[!] downloadFile hook 挂载失败: " + e);
+        noteHookFail("downloadFile", e);
     }
 
     try {
@@ -2853,7 +2878,7 @@ function setReceiver() {
         }
     });
     } catch (e) {
-        console.error("[!] downloadImag hook 挂载失败: " + e);
+        noteHookFail("downloadImag", e);
     }
 
     try {
@@ -2885,7 +2910,7 @@ function setReceiver() {
         }
     });
     } catch (e) {
-        console.error("[!] downloadVideo hook 挂载失败: " + e);
+        noteHookFail("downloadVideo", e);
     }
 }
 
