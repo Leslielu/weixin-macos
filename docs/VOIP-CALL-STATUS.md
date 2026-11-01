@@ -16,7 +16,7 @@
 | 工具链 | ✅ 入库 `tools/voip/` | §7 |
 | **程序化拨号(对方响铃)** | ✅ 已打通并参数化 | §10 `0x1fcaf64` selector 34 |
 | **程序化拨号 + 接通 + 挂断(原生全流程)** | ✅ **2026-11-01 打通并人工实测** | §11 ConfSDK `vt[6]`/`vt[12]` |
-| 本机标识字段(field7)自动获取 | ⏳ 挖 `0x1fc07f4` 中 | §11 末尾 |
+| 本机标识字段(field7) | ✅ 可填 0, 无需常量 | §11.2 实测 |
 | onebot 端点 / 生产部署 | ⏳ 下一步 | §9 |
 
 ## 1. 通话信令架构(结论)
@@ -241,13 +241,17 @@ ConfSDK 自己的 worker 线程驱动 wechat.dylib 完成——这就是能接�
 10 02                    field2 = 2      (音频通话)
 18 00                    field3 = 0
 20 04                    field4 = 4
-38 f3c1a4f302            field7 本机标识 varint (本机实测 0x20E6F20F3, 多次拨号稳定)
+38 f3c1a4f302            field7 本机标识 varint (UI 拨号填的是本机值 0x20E6F20F3)
 42 06 "wechat"           field8 appid
 4a 07 "voip-2p"          field9 domain
 ```
 
 只有 field1 需要按目标替换(在 buf 最前面, 改长度即可, 无嵌套长度要重算)。
-field7 是**每账号的本机值**, 生产机需另取(见 11.5)。
+
+**field7 可以填 0** —— 2026-11-01 09:28 实测: `38 00` 照样响铃、照样接通
+(`SEL 21 26B→32B` / `SEL 22` / `SEL 29×4`), 唯一差别是下游报文长度略变
+(SEL 39 27B→28B、invite 273B→274B、SEL 5 66B→70B), 不影响通话。
+⇒ **生产不需要抓任何本机常量**, 模板固定即用。
 
 ### 11.3 实测时间轴(2026-11-01 09:16, 开发副本, 人工接听确认)
 
@@ -278,17 +282,24 @@ field7 是**每账号的本机值**, 生产机需另取(见 11.5)。
 ### 11.4 顺带确认的行为
 
 - 通话中再投递 `vt[6]` **不会**起第二通(ConfSDK 内部单会话保护), 只回一包 `SEL 6/34`。
-- `wechat.dylib+0x1fc07f4` 是 UI 侧「拼 50B pb → 调 vt[6]」的函数
-  (`1fc1238: bl 0x5706804` 序列化到栈上 std::string, 再 `ldr x8,[x0]`/`ldr x8,[x8,#0x30]`
-  即 vtable slot 6, `blr x8`; svc 取自 `[x4+0x20]`)。
+- `wechat.dylib+0x1fc07f4` 是 UI 侧「拼 50B pb → 调 vt[6]」的原生拨号函数
+  (`1fc1240: bl 0x5706804` 序列化到栈上 std::string, 再 `ldr x8,[x0]`/`ldr x8,[x8,#0x30]`
+  即 vtable slot 6, `blr x8`)。**入参实测**(probe33, 09:26 手动拨号):
+  ```
+  x0 = 0x123877ab8            wechat.dylib 服务对象(与 §10 抓的 svc 同一地址)
+  x1 = "wxid_3dpoduq17tvc12"  被叫 wxid, 纯 C 字符串
+  x2 = std::vector<std::string>* 参与者列表(元素 24B = libc++ string), 1 项
+  x3 = 1   x4 = 0   x5 = 0x2e6953e3 (scene)
+  ```
+  ⇒ 想走「原生入口自填本机标识」的路, 可以直接调它(需自建那个 vector)。
+  但既然 field7=0 已够用(11.2), 这条只是备选。
 - arm64 切片: `lipo -thin arm64`; 该 dylib `__TEXT vmaddr=0` ⇒ **文件偏移 = VM 地址**。
 
 ### 11.5 遗留
 
-**field7 本机标识**: 目标机首次需要拿到自己账号的值。三条路(优先级序):
-1. 解析 `0x1fc07f4` 入参后直接调它(它自己填本机值, 最干净);
-2. 每机器手动拨一次, 用 `probe29`/`probe32` 抓模板, 写入 `wechat_version/*.json` 的账号段;
-3. 读 wechat.dylib 账号对象的 uin 字段自行编码。
+~~field7 本机标识~~ **已消解**: field7 填 0 即可正常拨号+接通(11.2 实测),
+不需要任何按机器/按账号的常量。若将来要报文与原生逐字节一致, 再走 11.4 的
+`0x1fc07f4` 原生入口。
 
 ### 11.6 工具(本轮新增)
 
@@ -301,7 +312,14 @@ field7 是**每账号的本机值**, 生产机需另取(见 11.5)。
 | `probe29.js` | 深挖 `vt[6]` 入参 → 得到 50B pb 结构 |
 | `probe30.js` | 首次用 `vt[6]` 原生拨号(响铃成功) |
 | `probe31.js` | `vt[6]` 拨出 + `vt[12]` 挂断双入口(文件触发, 用于全流程实测) |
-| `probe32.js` | 抓 `wechat.dylib+0x1fc07f4` 入参(挖本机标识自动获取) |
+| `probe32.js` | 抓 `wechat.dylib+0x1fc07f4` 入参(首次没挂上: `script.load()` RPC 超时) |
+| `probe33.js` | 双保险重抓 → 拿到原生拨号函数签名 `(svc, wxid, vector*, 1, 0, scene)` |
+| `probe34.js` | 内存扫描: field7 值不在任何模块数据段(运行时取), 无静态来源 |
+| `probe35.js` | 想抓序列化入参结构体, 但 `0x1fc1240` 是函数中段, Frida 拒绝 attach |
+| `probe36.js` | **field7=0 拨号验证**(09:28 实测可接通) |
+
+`run_probe.py` 注意: `script.load()` 偶发 RPC 超时(探针 32 那次), 驱动已改成
+超时不再退出, 否则脚本虽在进程里跑、会话却被拆掉, 后续手动操作全抓不到。
 
 触发约定: `/tmp/voip_replay.req` 写新内容 = 拨号(目标读 `/tmp/voip_target.txt`),
 `/tmp/voip_hangup.req` 写新内容 = 挂断。

@@ -30,8 +30,13 @@ def on_message(message, data):
 
 
 script.on("message", on_message)
-script.load()
-print(f"LOADED {probe} -> {logfile}", flush=True)
+try:
+    script.load()
+    print(f"LOADED {probe} -> {logfile}", flush=True)
+except Exception as exc:  # noqa: BLE001
+    # load 的 RPC 超时不代表脚本没跑: JS 已在进程里执行(就绪消息会先到)。
+    # 保持会话不退出, 否则钩子被拆, 后续手动操作全部抓不到。
+    print(f"WARN load 未正常返回({exc!r}); 保持会话, 看日志是否已有就绪行", flush=True)
 
 
 def bye(*_):
