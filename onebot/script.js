@@ -2436,6 +2436,21 @@ function voipHangupNative(svc) {
     return new NativeFunction(fn, "int", ["pointer", "int", "int"])(s, 1, 0);
 }
 
+// 静音 SDK 内部采集(不调则音调 ×1.5 偏快)。拨号前调一次常见返回负码
+// (-405652 / -405662) —— 那时会话还没就绪; 接通瞬间必须再调一次, 正常应回 0。
+function voipMuteMic(svc, tag) {
+    try {
+        var mf = new NativeFunction(voipConfModule().base.add(VOIP_MUTE_OFF), "int",
+            ["pointer", "int"]);
+        var r = mf(svc.add(8).readPointer().add(0xa10), 1);
+        console.log("[voip] muteMic(" + tag + ") ret=" + r);
+        return r;
+    } catch (e) {
+        console.log("[voip] muteMic(" + tag + ") 异常: " + e);
+        return null;
+    }
+}
+
 function triggerVoipHangup() {
     try {
         if (voipCall) voipStop("hangup");
@@ -2577,11 +2592,7 @@ function voipPlay(prefix, optsJson) {
         console.log("[-] voip 注入初始化失败: " + e);
         return "err:" + e;
     }
-    try { // 静音 SDK 内部采集, 否则音调 ×1.5 偏快
-        var mf = new NativeFunction(voipConfModule().base.add(VOIP_MUTE_OFF), "int",
-            ["pointer", "int"]);
-        console.log("[voip] muteMic ret=" + mf(c.svc.add(8).readPointer().add(0xa10), 1));
-    } catch (e) { console.log("[voip] muteMic 失败: " + e); }
+    voipMuteMic(c.svc, "start"); // 拨号前大概率还没就绪, 接通瞬间还会再调一次
 
     var putExternal = new NativeFunction(voipConfModule().base.add(VOIP_PUT_OFF), "int",
         ["pointer", "pointer", "int", "int", "int"]);
@@ -2617,6 +2628,7 @@ function voipPlay(prefix, optsJson) {
             c.waiting = 0;
             c.answered = true;
             voipApplyFormat(c, "answered");
+            voipMuteMic(c.svc, "answered"); // 会话已就绪, 这次必须静音成功
         }
         c.off += take;
         c.calls++;
