@@ -40,6 +40,11 @@ func main() {
 	http.HandleFunc("/send_group_msg", sendHandler)
 	http.HandleFunc("/download_cdn", downloadCdnHandler)
 
+	// 语音通话(docs/VOIP-CALL-STATUS.md §13): 拨号 → 给对方播放一段语音 → 挂断
+	http.HandleFunc("/send_voice_call", voiceCallHandler)
+	http.HandleFunc("/voice_call_status", voiceCallStatusHandler)
+	http.HandleFunc("/hangup_voice_call", voiceCallHangupHandler)
+
 	http.HandleFunc("/ws", handleWebSocket)
 	http.HandleFunc("/test_ws", testWebSocket)
 

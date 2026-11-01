@@ -2300,17 +2300,34 @@ function triggerSendVoiceMessage(taskId, sender, receiver, protoHex, payloadHex)
 // -------------------------发送语音消息分区-------------------------
 
 // -------------------------语音通话(VoIP)分区-------------------------
-// 2026-11-01 里程碑(docs/VOIP-CALL-STATUS.md §11): 走 ConfSDK 原生入口,
-// 不再用 wechat.dylib+0x1fcaf64 selector 34 注入口(§10 历史路线, 只能响铃接不通)。
-//   拨出: GetWXConfService(0x1352707) 取单例 → vt[6](svc, pb, len) → ConfSDKdyn+0x79ab4
-//   挂断: vt[12](svc, 1, 0)                                      → ConfSDKdyn+0x79dfc
-// pb(50B) = 0a <len> <被叫wxid> 10 02 18 00 20 04 38 00 42 06 "wechat" 4a 07 "voip-2p"
-// field7(本机uin)填 0 实测可正常振铃+接通, 不依赖任何本机常量。
-// 服务单例按调用现取: 通话结束后 SDK 可能重建, 缓存指针有悬空风险。
-// ⚠️ 已知未闭环(docs/VOIP-CALL-STATUS.md §12): 这条路径只发信令, 微信自己的
-// VoIP 客户端层(通话窗口/状态机/音频引擎)不会启动 ⇒ 能响铃能接通但双方静音。
-// Go 侧暂未接 /voip_call 路由, 等音频方案定了再开。
-var VOIP_GET_SVC_ARG = 0x1352707;
+// 2026-11-01 里程碑(docs/VOIP-CALL-STATUS.md §11/§13): 拨号 → 接通 → 给对方
+// 播一段 PCM → 挂断, 全链路走原生入口, 不需要通话窗口/麦克风/虚拟声卡。
+//   拨出: 0x1fc07f4(CLIENT, 被叫cstr, vector<string>*, 1, 0, "0x2e6981b3")
+//         CLIENT = baseAddr+0x9b93ab8 静态单例; [+0x28]=1 表示初始化完成,
+//         为 0 时进入未初始化返回路径(不拨号) ⇒ 这里先查, 为 0 直接报错。
+//   挂断: ConfSDK svc->vt[12](svc, 1, 0)
+//   注入: ConfSDKdyn+0x7a370(svc, pcm, len, 24000, 1)   ← 声明采样率恒 24000
+//   静音麦克风: ConfSDKdyn+0x662e0([svc+8]+0xa10, 1)    ← 不调音调 ×1.5 偏快
+//
+// ⚠️ 帧长**每通电话现算**, 不能写死: 引擎格式从 [svc+8]+0xa10(地址)+8 取 mvq,
+//    再 mvq-8 读 +0x234(frameMs) / +0x254(采样率) / +0x258(声道);
+//    每帧样本数 = frameMs*采样率*声道/1000, 字节数 = 样本数*2(s16le)。
+//    设备采样率是每通协商出来的(实测 16000 / 48000 都出现), 写死 960B 打 48k
+//    通话会导致每 20ms 只有 1/3 有声 → 对方听到间歇空白。
+// ⚠️ 不挂钩子: 音频引擎相关入口是 PAC 间接调用目标, 一挂必崩 AudioIOThread。
+var VOIP_CLIENT_OFF = "0x9b93ab8";
+var VOIP_DIAL_OFF = "0x1fc07f4";
+var VOIP_CONF_ARG = 0x1352707;
+var VOIP_PUT_OFF = "0x7a370";
+var VOIP_MUTE_OFF = "0x662e0";
+var voipKeep = [];
+var voipCall = null; // 当前注入会话
+var voipLast = null; // 上一通注入的结果摘要(供 Go 侧轮询收尾)
+
+function voipClientAddr() {
+    if (!baseAddr) throw new Error("wechat.dylib 基址未就绪");
+    return baseAddr.add(VOIP_CLIENT_OFF);
+}
 
 function voipConfModule() {
     var cands = Process.enumerateModules().filter(function (m) {
@@ -2320,7 +2337,8 @@ function voipConfModule() {
     return cands.length ? cands[0] : null;
 }
 
-function voipGetService() {
+// 服务单例按调用现取: 通话结束后 SDK 可能重建, 缓存指针有悬空风险
+function voipService() {
     var conf = voipConfModule();
     if (!conf) throw new Error("ConfSDKdyn 未加载");
     var getter = null;
@@ -2328,9 +2346,17 @@ function voipGetService() {
         if (e.name === "GetWXConfService") getter = e.address;
     });
     if (!getter) throw new Error("ConfSDKdyn 缺少 GetWXConfService 导出");
-    var svc = new NativeFunction(getter, "pointer", ["int"])(VOIP_GET_SVC_ARG);
+    var svc = new NativeFunction(getter, "pointer", ["int"])(VOIP_CONF_ARG);
     if (svc.isNull()) throw new Error("GetWXConfService 返回空");
     return svc;
+}
+
+function voipClientState() {
+    try {
+        var c = voipClientAddr();
+        return { obj: String(c), vt: String(c.readPointer()),
+                 initialized: c.add(0x28).readU8() };
+    } catch (e) { return { error: String(e) }; }
 }
 
 function voipEncodeVarint(n) {
@@ -2351,34 +2377,279 @@ function voipBuildInvitePb(wxid) {
     return [0x0a].concat(voipEncodeVarint(w.length), w, tail);
 }
 
+// participants vector 元素 = libc++ std::string(24B), 本进程布局:
+// 短串文本在 +0、长度存 +0x17; 长串 ptr@+0、size@+8、+0x17 bit7=1。
+// Frida 的 Memory.alloc 由 JS GC 管理 ⇒ 拨号参数必须保活, 否则 pb 退化为 0a00。
+function voipBuildVec(wxid) {
+    var sb = Memory.alloc(24);
+    voipKeep.push(sb);
+    var bytes = new Array(24);
+    for (var i = 0; i < 24; i++) bytes[i] = 0;
+    if (wxid.length <= 22) {
+        for (i = 0; i < wxid.length; i++) bytes[i] = wxid.charCodeAt(i) & 0xff;
+        bytes[0x17] = wxid.length;
+        sb.writeByteArray(bytes);
+        var vec = Memory.alloc(24);
+        voipKeep.push(vec);
+        vec.writePointer(sb);
+        vec.add(8).writePointer(sb.add(24));
+        vec.add(16).writePointer(sb.add(24));
+        return vec;
+    }
+    var data = Memory.allocUtf8String(wxid);
+    voipKeep.push(data);
+    sb.writePointer(data);
+    sb.add(8).writeU64(wxid.length);
+    sb.add(0x17).writeU8(0x80);
+    var vecLong = Memory.alloc(24);
+    voipKeep.push(vecLong);
+    vecLong.writePointer(sb);
+    vecLong.add(8).writePointer(sb.add(24));
+    vecLong.add(16).writePointer(sb.add(24));
+    return vecLong;
+}
+
 function triggerVoipCall(targetId) {
     try {
         if (!targetId) throw new Error("被叫 wxid 为空");
-        var svc = voipGetService();
-        var fn = svc.readPointer().add(6 * 8).readPointer();
-        var pb = voipBuildInvitePb(targetId);
-        var mem = Memory.alloc(pb.length);
-        mem.writeByteArray(pb);
-        var r = new NativeFunction(fn, "int", ["pointer", "pointer", "int"])(svc, mem, pb.length);
-        console.log("[+] voip 拨出 target=" + targetId + " pb=" + pb.length + "B ret=" + r);
-        return r === 0 ? "0" : String(r);
+        var client = voipClientAddr();
+        if (client.add(0x28).readU8() !== 1)
+            throw new Error("VoIP 客户端未初始化([+0x28]!=1)");
+        voipKeep.length = 0; // 上一通电话的参数已无用, 释放保活
+        var cstr = Memory.allocUtf8String(targetId);
+        voipKeep.push(cstr);
+        var vec = voipBuildVec(targetId);
+        var fn = new NativeFunction(baseAddr.add(VOIP_DIAL_OFF), "int",
+            ["pointer", "pointer", "pointer", "pointer", "int", "pointer"]);
+        var r = fn(client, cstr, vec, ptr(1), 0, ptr("0x2e6981b3"));
+        console.log("[+] voip 拨出 target=" + targetId + " ret=" + r);
+        return r === 1 ? "0" : String(r);
     } catch (e) {
         console.log("[-] voip 拨出失败: " + e);
-        return "-1";
+        return "-1:" + e;
     }
+}
+
+function voipHangupNative(svc) {
+    var s = svc || voipService();
+    var fn = s.readPointer().add(12 * 8).readPointer();
+    return new NativeFunction(fn, "int", ["pointer", "int", "int"])(s, 1, 0);
 }
 
 function triggerVoipHangup() {
     try {
-        var svc = voipGetService();
-        var fn = svc.readPointer().add(12 * 8).readPointer();
-        var r = new NativeFunction(fn, "int", ["pointer", "int", "int"])(svc, 1, 0);
+        if (voipCall) voipStop("hangup");
+        var r = voipHangupNative(null);
         console.log("[+] voip 挂断 ret=" + r);
         return r === 0 ? "0" : String(r);
     } catch (e) {
         console.log("[-] voip 挂断失败: " + e);
-        return "-1";
+        return "-1:" + e;
     }
+}
+
+// 引擎每帧长度(样本数, **不是字节数**), 见文件头说明。
+// 拨号前 mvqqEngine 还是 0x0, 读不到 ⇒ 返回 null, 调用方稍后重试。
+function voipEngineFrame(svc) {
+    try {
+        var mv = svc.add(8).readPointer().add(0xa10).add(8).readPointer();
+        if (mv.isNull()) return null;
+        var av = mv.sub(8);
+        var frameMs = av.add(0x234).readU32();
+        var engRate = av.add(0x254).readU32();
+        var engCh = av.add(0x258).readU32();
+        if (!(frameMs >= 5 && frameMs <= 60)) return null;
+        if (!(engRate >= 8000 && engRate <= 96000)) return null;
+        if (engCh !== 1 && engCh !== 2) engCh = 1;
+        var samples = Math.floor(frameMs * engRate * engCh / 1000);
+        var contentBytes = samples * 2;
+        if (contentBytes < 100 || contentBytes > 8192) return null;
+        return { frameMs: frameMs, frameBytes: Math.max(contentBytes, 960),
+                 payloadBytes: contentBytes, rate: 24000,
+                 contentRate: engRate, channels: engCh,
+                 raw: [frameMs, engRate, engCh, samples, contentBytes] };
+    } catch (e) { console.log("[voip] engineFrame err: " + e); }
+    return null;
+}
+
+// 载荷优先取 ffmpeg 预生成的同采样率文件(<prefix>_<rate>_1.pcm), 否则拿 16k
+// 源做线性插值(有频谱镜像, 只作兜底)。
+function voipLoadPayload(prefix, rate, chn) {
+    try {
+        var f = new File(prefix + "_" + rate + "_1.pcm", "rb");
+        var b = f.readBytes();
+        f.close();
+        console.log("[voip] payload " + b.byteLength + "B @" + rate + "Hz");
+        return new Uint8Array(b);
+    } catch (e) {}
+    var src = null, srcRate = 16000;
+    try {
+        var f2 = new File(prefix + "_16000_1.pcm", "rb");
+        src = new Uint8Array(f2.readBytes());
+        f2.close();
+    } catch (e) { throw new Error("载荷读取失败: " + prefix + "_16000_1.pcm"); }
+    console.log("[voip] payload 兜底线性重采样 " + srcRate + "→" + rate + "Hz ch=" + chn);
+    var n = Math.max(1, Math.floor(src.length / 2 * rate / srcRate));
+    var s = new Int16Array(src.buffer, src.byteOffset, Math.floor(src.length / 2));
+    var outCh = chn === 2 ? 2 : 1;
+    var dst = new Int16Array(n * outCh);
+    for (var i = 0; i < n; i++) {
+        var t = i * srcRate / rate;
+        var i0 = Math.floor(t), frac = t - i0;
+        var a = s[i0], b2 = (i0 + 1 < s.length) ? s[i0 + 1] : a;
+        var v = Math.round(a + (b2 - a) * frac);
+        v = v < -32768 ? -32768 : (v > 32767 ? 32767 : v);
+        dst[i * outCh] = v;
+        if (outCh === 2) dst[i * 2 + 1] = v;
+    }
+    return new Uint8Array(dst.buffer);
+}
+
+function voipStop(reason) {
+    var c = voipCall;
+    if (!c) return;
+    voipCall = null;
+    if (c.timer !== null) { clearTimeout(c.timer); c.timer = null; }
+    c.stopReason = reason;
+    voipLast = {
+        prefix: c.prefix, reason: reason, answered: c.answered, calls: c.calls,
+        bytesSent: c.off, totalBytes: c.playU8 ? c.playU8.length : 0,
+        contentRate: c.contentRate, channels: c.channels, frameMs: c.frameMs,
+        frameBytes: c.frameBytes, maxLateMs: c.maxLate, lateOver3ms: c.lateOver3,
+        lastRet: c.lastRet, error: c.error
+    };
+    console.log("[voip] 注入结束 reason=" + reason + " calls=" + c.calls +
+                " bytes=" + c.off + " answered=" + c.answered +
+                " maxLate=" + c.maxLate + "ms over3ms=" + c.lateOver3 +
+                (c.error ? " err=" + c.error : ""));
+}
+
+// 按当前引擎格式(重)建注入管线。拨号前拿到 null ⇒ 用默认值先起步,
+// 之后在最初若干帧内重试; **接通瞬间必须再调一次**, 协商结果那时才落定。
+function voipApplyFormat(c, tag) {
+    var ef = voipEngineFrame(c.svc);
+    if (ef) {
+        c.contentRate = ef.contentRate;
+        c.channels = ef.channels;
+        c.frameBytes = ef.frameBytes;
+        c.payloadBytes = ef.payloadBytes;
+        c.frameMs = ef.frameMs;
+    }
+    c.playU8 = voipLoadPayload(c.prefix, c.contentRate, c.channels);
+    var need = Math.max(16384, c.frameBytes * 4);
+    if (!c.frameBuf || need > c.frameCap) {
+        c.frameBuf = Memory.alloc(need);
+        voipKeep.push(c.frameBuf);
+        c.frameCap = need;
+    }
+    c.frameBuf.writeByteArray(new Uint8Array(c.frameCap)); // 整块清零防脏数据
+    c.stage = new Uint8Array(c.frameBytes);
+    c.off = 0; c.idx = 0; c.t0 = Date.now();
+    c.fmtApplied = !!ef;
+    console.log("[voip] fmt " + tag + " frame=" + c.frameBytes + "B payload=" +
+                c.payloadBytes + "B @" + c.contentRate + "Hz ch=" + c.channels +
+                " " + c.frameMs + "ms raw=" + (ef ? JSON.stringify(ef.raw) : "null"));
+    return ef;
+}
+
+// prefix: PCM 文件前缀(不含 _<rate>_1.pcm); opts: {maxSeconds}
+// 立即返回, 进度用 voipStatus() 轮询。
+function voipPlay(prefix, optsJson) {
+    if (voipCall) return "busy:" + voipCall.prefix;
+    var opts = {};
+    try { opts = JSON.parse(optsJson || "{}"); } catch (e) {}
+    var maxSec = opts.maxSeconds > 0 ? opts.maxSeconds : 300;
+    var c = {
+        prefix: prefix, svc: null, playU8: null, frameBuf: null, frameCap: 0,
+        stage: null, off: 0, idx: 0, t0: 0, calls: 0, lastRet: null,
+        maxLate: 0, lateOver3: 0, waiting: 0, answered: false,
+        fmtApplied: false, timer: null, error: null, stopReason: "",
+        rate: 24000, contentRate: 16000, channels: 1,
+        frameMs: 20, frameBytes: 960, payloadBytes: 640, maxSec: maxSec
+    };
+    voipCall = c;
+    try {
+        c.svc = voipService();
+        voipApplyFormat(c, "start");
+    } catch (e) {
+        // 初始化失败必须回滚, 否则 voipCall 卡住, 之后每通都得重启微信
+        voipCall = null;
+        console.log("[-] voip 注入初始化失败: " + e);
+        return "err:" + e;
+    }
+    try { // 静音 SDK 内部采集, 否则音调 ×1.5 偏快
+        var mf = new NativeFunction(voipConfModule().base.add(VOIP_MUTE_OFF), "int",
+            ["pointer", "int"]);
+        console.log("[voip] muteMic ret=" + mf(c.svc.add(8).readPointer().add(0xa10), 1));
+    } catch (e) { console.log("[voip] muteMic 失败: " + e); }
+
+    var putExternal = new NativeFunction(voipConfModule().base.add(VOIP_PUT_OFF), "int",
+        ["pointer", "pointer", "int", "int", "int"]);
+
+    function tick() {
+        if (voipCall !== c) return;
+        // 拨号前 mvqqEngine=0x0 读不到格式 ⇒ 最初若干帧持续重试
+        if (!c.fmtApplied && c.calls < 40 && voipEngineFrame(c.svc) !== null)
+            voipApplyFormat(c, "retry-early");
+        if (c.off >= c.playU8.length) { voipStop("eof"); return; }
+        if (c.t0 > 0 && (Date.now() - c.t0) > c.maxSec * 1000) {
+            voipStop("maxSeconds"); return;
+        }
+        var take = Math.min(c.payloadBytes, c.playU8.length - c.off);
+        if (take < c.payloadBytes) c.stage.fill(0, 0, c.payloadBytes); // 尾帧清零
+        for (var i = 0; i < take; i++) c.stage[i] = c.playU8[c.off + i];
+        var ret = null, err = null;
+        try {
+            c.frameBuf.writeByteArray(c.stage);
+            ret = putExternal(c.svc, c.frameBuf, c.frameBytes, c.rate, c.channels);
+        } catch (e) { err = String(e); }
+        // -405447 = NoMember is Active(未接听) / -405471 = 会话未就绪:
+        // 原地等待不消耗数据, 接通瞬间自动从文件头开播
+        if ((ret === -405447 || ret === -405471) && err === null) {
+            c.waiting++;
+            if (c.waiting > Math.floor(c.maxSec * 5)) { voipStop("answer timeout"); return; }
+            c.lastRet = ret;
+            c.timer = setTimeout(tick, 200);
+            return;
+        }
+        if (c.waiting > 0) {
+            console.log("[voip] 接通(等待 " + (c.waiting * 200) + "ms), 重读格式后开播");
+            c.waiting = 0;
+            c.answered = true;
+            voipApplyFormat(c, "answered");
+        }
+        c.off += take;
+        c.calls++;
+        var late = Date.now() - (c.t0 + (c.idx + 1) * c.frameMs);
+        if (late > c.maxLate) c.maxLate = late;
+        if (late > 3) c.lateOver3++;
+        c.lastRet = ret;
+        c.idx++;
+        if (err !== null) { c.error = err; voipStop("exception"); return; }
+        if (ret !== null && ret !== 0) {
+            c.negRets = (c.negRets || 0) + 1;
+            if (c.negRets >= 20) { c.error = "ret=" + ret; voipStop("20 negative returns"); return; }
+        } else { c.negRets = 0; }
+        var deadline = c.t0 + c.idx * c.frameMs;
+        var d = deadline - Date.now();
+        if (d > 6) { c.timer = setTimeout(tick, d - 5); return; }
+        while (Date.now() < deadline) { } // 临界自旋: 消除 setTimeout 的毫秒级抖动
+        c.timer = setTimeout(tick, 0);
+    }
+    tick();
+    return "ok";
+}
+
+function voipStatus() {
+    var c = voipCall;
+    if (!c) return JSON.stringify({ active: false, last: voipLast });
+    return JSON.stringify({
+        active: true, prefix: c.prefix, answered: c.answered,
+        calls: c.calls, bytesSent: c.off, totalBytes: c.playU8 ? c.playU8.length : 0,
+        contentRate: c.contentRate, channels: c.channels, frameMs: c.frameMs,
+        frameBytes: c.frameBytes, maxLateMs: c.maxLate, lateOver3ms: c.lateOver3,
+        lastRet: c.lastRet, error: c.error, last: null
+    });
 }
 // -------------------------语音通话(VoIP)分区-------------------------
 
@@ -2399,6 +2670,8 @@ rpc.exports = {
     triggerUploadAppAttach: triggerUploadAppAttach,
     triggerVoipCall: triggerVoipCall,
     triggerVoipHangup: triggerVoipHangup,
+    voipPlay: voipPlay,
+    voipStatus: voipStatus,
 };
 
 // -------------------------发送图片消息分区-------------------------

@@ -49,7 +49,13 @@ for programmatic message sending and receiving.
 - `onebot/`: Go service implementing the OneBot protocol. HTTP server on
   127.0.0.1:58080; message callback to wxgate on 127.0.0.1:36060; WebSocket
   via `-conn_type=websocket`; gadget mode via `-type=gadget
-  -gadget_addr=127.0.0.1:27042`.
+  -gadget_addr=127.0.0.1:27042`. Voice calls (implemented 2026-11-01, **not
+  deployed**): `POST /send_voice_call` `{user_id, voice|<text>, async?,
+  hangup?, max_seconds?, timeout?}` dials, waits for answer, plays the given
+  audio or TTS, then hangs up; plus `GET /voice_call_status` and
+  `POST /hangup_voice_call`. One call at a time, outbound only. Code:
+  `onebot/voice_call.go` and the VoIP section of `onebot/script.js`;
+  calibration in `docs/VOIP-CALL-STATUS.md` §13.5.
 - `watchdog/`: authoritative copy of the auto-restart watchdog
   (`wechat-watchdog.sh` + `ocr_allow.py` + `ocr_selftest.sh`). The deployed
   copy lives at `~/Prog/wxgate/` on mac-m1; keep both in sync.

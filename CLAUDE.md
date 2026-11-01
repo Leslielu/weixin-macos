@@ -124,6 +124,11 @@ Each WeChat version requires specific memory offsets in `wechat_version/*.json`.
 - Default HTTP server: `127.0.0.1:58080`
 - Message callback URL: `http://127.0.0.1:36060/onebot` (configurable)
 - Supports both HTTP and WebSocket connections (`-conn_type=websocket`)
+- 语音通话（2026-11-01 实现，**尚未部署**）：`POST /send_voice_call`
+  `{user_id, voice|<text>, async?, hangup?, max_seconds?, timeout?}` — 拨号、等接听、播放给定音频
+  或 TTS、播完挂断；配 `GET /voice_call_status`、`POST /hangup_voice_call`。同一时刻只允许一通，
+  只支持出站。实现见 `onebot/voice_call.go` + `onebot/script.js` 的 VoIP 分区，
+  标定见 `docs/VOIP-CALL-STATUS.md` §13.5
 - For OpenClaw integration, see `onebot/readme.md`
 
 ## IDA Pro Usage

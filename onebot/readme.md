@@ -43,6 +43,36 @@ curl -i -X POST \
 
 ```
 
+### 语音通话（拨号给对方播放一段语音）
+
+给指定 wxid 拨一通微信语音通话，接通后播放给定的音频（或 TTS 合成的语音），播完挂断。
+
+```
+# 播放本地音频文件（wav/mp3/aiff 均可，内部用 ffmpeg 转 PCM）
+curl -X POST -H "Content-Type:application/json" \
+  -d '{"user_id":"wxid_xxx","voice":"/tmp/hello.wav"}' \
+  http://127.0.0.1:58080/send_voice_call
+
+# 或直接给一段要念的话（macOS say 合成，默认音色 Tingting）
+curl -X POST -H "Content-Type:application/json" \
+  -d '{"user_id":"wxid_xxx","text":"你好，这是一通语音播报"}' \
+  http://127.0.0.1:58080/send_voice_call
+```
+
+可选参数：`tts_voice`（say 音色）、`hangup`（播完是否挂断，默认 true）、
+`async`（true = 立即返回，通话在后台跑完）、`max_seconds`（播放上限，默认 120）、
+`timeout`（等接听秒数，默认 60）。
+
+返回：`{"status":"ok","retcode":0,"data":{"answered":true,"reason":"eof","frames":522,...}}`
+
+配套接口：
+
+- `GET  /voice_call_status` — 查询是否在通话中及上一通的注入摘要
+- `POST /hangup_voice_call` — 手动挂断
+
+注意：同一时刻只允许一通；只支持出站（给对方放音），入站接收尚未接线。
+链路细节与标定见 [docs/VOIP-CALL-STATUS.md](../docs/VOIP-CALL-STATUS.md) §13。
+
 ## 接入openclaw
 ```
 # 进入插件目录
