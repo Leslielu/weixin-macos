@@ -22,7 +22,7 @@ WeChat macOS reverse engineering project. Hooks WeChat's underlying message send
 - `onebot/` - Go service implementing OneBot protocol (HTTP/WebSocket)
 - `tools/` - 逆向/分析工具：
   - `addrfind` - 跨版本地址迁移（方法论见 docs/version-upgrade.md）
-  - `voip` - VoIP 语音通话逆向工具链（strxref/voipwalk/voipclimb 静态分析 + voipprobe runner + probe1-22 探针演进 + invite_payload.py 报文拼装），做通话相关工作先读 docs/VOIP-CALL-STATUS.md
+  - `voip` - VoIP 语音通话逆向工具链（strxref/voipwalk/voipclimb 静态分析 + voipprobe runner + probe1-32 探针演进 + run_probe.py 探针驱动 + invite_payload.py 报文拼装），做通话相关工作先读 docs/VOIP-CALL-STATUS.md
 - `idapro/` - IDA Pro Python analysis scripts
 - `wechat_version/` - Memory address configs for different WeChat versions (JSON)
 - `frida-gadget/` - Alternative approach for systems without SIP disabled
@@ -104,7 +104,7 @@ curl -X POST -H "Content-Type:application/json" \
 **先读 `docs/crash-history.md`** —— 历次崩溃的指纹、根因、已上线修复和遗留问题都在里面，别从零开始。
 
 ### 语音通话（VoIP）相关工作
-**先读 `docs/VOIP-CALL-STATUS.md`** —— 通话信令全图、`0x1fdc80c` 统一发送函数、**已打通的程序化拨号入口 `0x1fcaf64(svc, selector=34, 0, payload, len, 0)`（§10，被叫 wxid 在 payload 里）**、音频引擎 beacon（0x5470688/0x547070c，只反映本机音频，不能判对方振铃）、探针踩坑（Stalker 必崩、SubmitCgi 读 x1、fixup 编码）都在里面。开发副本 = 本机 `~/Applications/WeChat-4.1.13.app`（与生产同版本，地址直接通用）。
+**先读 `docs/VOIP-CALL-STATUS.md`** —— 通话信令全图、`0x1fdc80c` 统一发送函数、**能拨号+接通+挂断的原生入口（§11）：`svc=GetWXConfService(0x1352707)`，拨出 `vt[6]=ConfSDKdyn+0x79ab4(svc, pb, 50)`（pb 第一字段即被叫 wxid），挂断 `vt[12]=ConfSDKdyn+0x79dfc(svc,1,0)`**；§10 的 `0x1fcaf64` selector 34 注入口只能让对方响铃、接不通（已标为历史路线）。音频引擎 beacon（0x5470688/0x547070c，只反映本机音频，不能判对方振铃）、探针踩坑（Stalker 必崩、SubmitCgi 读 x1、fixup 编码）都在里面。探针用 `run_probe.py` 跑（frida CLI 重定向有缓冲，日志会滞后）。开发副本 = 本机 `~/Applications/WeChat-4.1.13.app`（与生产同版本，地址直接通用）。
 
 ### Version-Specific Memory Addresses
 Each WeChat version requires specific memory offsets in `wechat_version/*.json`. When adding new versions:

@@ -14,8 +14,10 @@
 | VoIP CGI 统一发送函数 + 服务单例 | ✅ 已定位并4次验证 | §4 `0x1fdc80c` |
 | 通话状态 beacon(可上生产) | ⚠️ 仅拨号方本机音频, **不能判对方振铃** | §5, §10 |
 | 工具链 | ✅ 入库 `tools/voip/` | §7 |
-| **程序化拨号(对方响铃)** | ✅ **已打通并参数化** | §10 `0x1fcaf64` selector 34 |
-| 挂断 / onebot 端点 | ⏳ 下一步 | §9 |
+| **程序化拨号(对方响铃)** | ✅ 已打通并参数化 | §10 `0x1fcaf64` selector 34 |
+| **程序化拨号 + 接通 + 挂断(原生全流程)** | ✅ **2026-11-01 打通并人工实测** | §11 ConfSDK `vt[6]`/`vt[12]` |
+| 本机标识字段(field7)自动获取 | ⏳ 挖 `0x1fc07f4` 中 | §11 末尾 |
+| onebot 端点 / 生产部署 | ⏳ 下一步 | §9 |
 
 ## 1. 通话信令架构(结论)
 
@@ -139,17 +141,21 @@ field2 = 各自业务体。
 
 ## 9. 下一步(实现路线)
 
-1. **挂断**: 同服务对象另一 selector(`0x2474 voipilinkcancel`); 先从真实挂断抓 payload+selector,
-   再决定是走服务虚分发器还是复用 invite 的调用形态。
-2. **svc 指针自取**: 现在靠真实拨号抓一次(同进程恒定)。生产化需要程序化获取 ——
-   ConfSDKdyn 导出 `_GetWXConfService`(3 个导出之一)是最直接的候选;
-   备选: wechat.dylib 内 0x1fd7bc0(ctx 工厂, vtable 0x98cbc38) 附近的持有者字段。
-3. onebot: `/voip_call` 端点 + 通话事件推送。
-4. 生产部署注意: TCC麦克风弹窗(开发副本全程未弹, 生产首次呼叫需观察/预授权);
+1. ~~挂断~~ ✅ 2026-11-01 打通: ConfSDK `vt[12]`(§11)。
+2. ~~svc 指针自取~~ ✅ `GetWXConfService(0x1352707)`(§11)。
+3. **本机标识(field7)自动获取**: 现在靠本机手动拨号抓一次常量。正解是找到
+   wechat.dylib 自己拼这个 pb 的函数 `0x1fc07f4`(§11 末尾), 它自己填本机值;
+   退路 = 每机器一次性抓包写进 `wechat_version/*.json`。
+4. onebot: `/voip_call` 端点 + 通话事件推送(接听/挂断仍复用 wxgate 气泡或 §11 的 selector 判据)。
+5. 生产部署注意: TCC麦克风弹窗(开发副本未弹, 生产首次呼叫需观察/预授权);
    看门狗对通话中崩溃的覆盖; VOIPWindow 在 dummy 主屏环境的表现待验。
-5. 回归: 每轮用 probe12 全量时间轴对照(信令序列不变即无回归)。
+6. 回归: 每轮用 probe23/24 全量时间轴对照(信令序列不变即无回归)。
 
 ## 10. 拨号入口已打通并参数化(probe16~22)
+
+> ⚠️ **本节是历史路线的中途站**: 这样注入能让对方**响铃**, 但**接不通**——
+> 它绕过了 ConfSDK 的会话状态机, 建房间/接听应答/媒体协商没人处理, 对方点接听
+> 只会一直转圈。**正确的入口见 §11**(同一版本, 2026-11-01 打通接通)。
 
 **以前的「UI侧入队缺口」是找错了模块**: UI 点击后真正提交邀请的不是 wechat.dylib 的
 界面代码, 而是通话 SDK **ConfSDKdyn.framework**(`Contents/Resources/ConfSDKdyn.framework/
@@ -200,3 +206,102 @@ voipwalk 会误判)。它调用 wechat.dylib 服务对象的**虚方法**提交�
 | `probe21.js` | 固定 payload 定点重放(文件触发 `/tmp/voip_replay.req`) |
 | `probe22.js` | 参数化: 读 `/tmp/voip_target.txt` 的 wxid → 重建 payload → 触发即拨号 |
 | `probe16~19.js` | 缺口定位过程(事件结构/任务 vtable/ctx 工厂/服务虚分发器), 结论已并入本节 |
+
+## 11. 里程碑: 接通打通 —— ConfSDK 原生入口 `vt[6]` 拨号 / `vt[12]` 挂断(2026-11-01)
+
+§10 的注入落在 **ConfSDK 下游**(wechat.dylib 的服务分发器), 只发出了 invite 一包,
+房间建立/接听应答/媒体协商全部缺席 ⇒ 对方响铃但接不通。正解是**上游一格**: 走通话
+SDK 自己的会话命令队列。
+
+### 11.1 入口
+
+```
+svc  = GetWXConfService(0x1352707)        // ConfSDKdyn 导出, 入参是魔数不是 0
+                                           // 错误魔数 → 打日志返回 0; 正确 → 惰性单例
+                                           // 实测 0x6000028d5fe0, 进程内恒定
+vt   = [svc]                               // 实测 ConfSDKdyn+0x7b9b0
+
+拨出: vt[6]  = ConfSDKdyn+0x79ab4
+      int f(void* svc, void* pb, int len)          // x3/x4 是调用方残留, 函数不读
+      // 反汇编: memcpy(pb,len) → std::string → 分配 task{vt,+0x10 填 3} → 投递给
+      //         [*(svc+8)+0x2b30] 的队列 → return 0    (pb 空 = -1, 无 impl = -2)
+
+挂断: vt[12] = ConfSDKdyn+0x79dfc
+      int f(void* svc, int a1, int a2)             // UI 挂断实测 (1, 0)
+      // 投递 type=7 任务 → return 0 / -2
+```
+
+两者都是**纯异步投递**, 返回即成功入队; 之后的建房间、接听处理、音频全部由
+ConfSDK 自己的 worker 线程驱动 wechat.dylib 完成——这就是能接通的原因。
+
+### 11.2 拨号 pb(50B, 抓自 UI 手动拨号)
+
+```
+0a 13 <被叫 wxid>        field1 被叫 wxid (19B)
+10 02                    field2 = 2      (音频通话)
+18 00                    field3 = 0
+20 04                    field4 = 4
+38 f3c1a4f302            field7 本机标识 varint (本机实测 0x20E6F20F3, 多次拨号稳定)
+42 06 "wechat"           field8 appid
+4a 07 "voip-2p"          field9 domain
+```
+
+只有 field1 需要按目标替换(在 buf 最前面, 改长度即可, 无嵌套长度要重算)。
+field7 是**每账号的本机值**, 生产机需另取(见 11.5)。
+
+### 11.3 实测时间轴(2026-11-01 09:16, 开发副本, 人工接听确认)
+
+```
+09:16:08.112  vt6(svc, pb, 50) → ret 0                        ← 程序化投递
+09:16:08.119  SEL 39  (27B)   会话建立            ConfSDKdyn+0x1f69c
+09:16:08.123  SEL 34  (273B)  invite 发出         ConfSDKdyn+0x241e4
+09:16:08.222  ConfSDK 内部又投递一次 vt6                       ← 原生自驱
+09:16:08.229  SEL 6   (0B)
+09:16:08.937  SEL 5   (66B)   房间 id
+09:16:08.938  SEL 20  (241B)
+09:16:08.938  SEL 21  (26B)
+09:16:08.950  SEL 34  (82B)
+09:16:09.363  SEL 34  (115B)  心跳, 每 6s
+--- 对方接听 ---
+09:16:17.324  SEL 21  (32B)   ← 长度 26→32 就是接听应答
+09:16:17.808  SEL 22  (30B)   媒体协商
+09:16:17.872  SEL 29  ×4      音频参数 (12/18/16/12B)
+09:16:23.381  SEL 34  (115B)  通话中心跳
+--- 程序化挂断 vt12(svc,1,0) ---
+09:16:57.607  SEL 25  (58B)   告别
+09:16:57.608  SEL 26  (30B)   释放
+```
+
+对照: 未接超时(~60s)是 `SEL 20 → SEL 25(56B) → SEL 7(0B) → SEL 34(210B cancel) → SEL 26(30B)`。
+**判据**: 出现 `SEL 22` + `SEL 29×4` = 真接通; 只有 `SEL 34` 心跳 = 还在响铃。
+
+### 11.4 顺带确认的行为
+
+- 通话中再投递 `vt[6]` **不会**起第二通(ConfSDK 内部单会话保护), 只回一包 `SEL 6/34`。
+- `wechat.dylib+0x1fc07f4` 是 UI 侧「拼 50B pb → 调 vt[6]」的函数
+  (`1fc1238: bl 0x5706804` 序列化到栈上 std::string, 再 `ldr x8,[x0]`/`ldr x8,[x8,#0x30]`
+  即 vtable slot 6, `blr x8`; svc 取自 `[x4+0x20]`)。
+- arm64 切片: `lipo -thin arm64`; 该 dylib `__TEXT vmaddr=0` ⇒ **文件偏移 = VM 地址**。
+
+### 11.5 遗留
+
+**field7 本机标识**: 目标机首次需要拿到自己账号的值。三条路(优先级序):
+1. 解析 `0x1fc07f4` 入参后直接调它(它自己填本机值, 最干净);
+2. 每机器手动拨一次, 用 `probe29`/`probe32` 抓模板, 写入 `wechat_version/*.json` 的账号段;
+3. 读 wechat.dylib 账号对象的 uin 字段自行编码。
+
+### 11.6 工具(本轮新增)
+
+| 文件 | 用途 |
+|---|---|
+| `run_probe.py` | **探针驱动**: `python3 run_probe.py probeN.js out.log` → gadget 连接 + 逐行 flush 落盘(替代 frida CLI, CLI 重定向有缓冲)。解释器用 `/Users/leslielu/.venvs/wechat-re/bin/python` |
+| `probe23/24.js` | 手动通话全量信令记录 / 各 selector 完整 payload |
+| `probe25.js` | 反证: 直接投 SEL39+SEL34 之后没有任何后续(说明必须走 ConfSDK) |
+| `probe26~28.js` | ConfSDKdyn 定位三连: 内部帧栈死路 → 导出函数只启动时调用 → **取服务对象挂全 vtable 48 方法** |
+| `probe29.js` | 深挖 `vt[6]` 入参 → 得到 50B pb 结构 |
+| `probe30.js` | 首次用 `vt[6]` 原生拨号(响铃成功) |
+| `probe31.js` | `vt[6]` 拨出 + `vt[12]` 挂断双入口(文件触发, 用于全流程实测) |
+| `probe32.js` | 抓 `wechat.dylib+0x1fc07f4` 入参(挖本机标识自动获取) |
+
+触发约定: `/tmp/voip_replay.req` 写新内容 = 拨号(目标读 `/tmp/voip_target.txt`),
+`/tmp/voip_hangup.req` 写新内容 = 挂断。
