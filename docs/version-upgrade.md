@@ -13,6 +13,7 @@
 | `docs/4.1.12-adaptation.md` | 4.1.12 细档: 实战全貌(难键攻略/漂移清单/适配期崩溃/验收) |
 | `docs/4.1.13-submitcgi-analysis.md` | 4.1.13 细档: 身份换位定案/V3 范式/蹦床铁律/媒体战报 |
 | `docs/crash-history.md` | 崩溃档案: 历次崩溃指纹/根因/修复, 排查先读 |
+| `docs/VOIP-CALL-STATUS.md` | 语音通话细档: 拨号/注入/采集全标定(§11/§13/§16), 通话类故障先读 |
 | `.claude/skills/.../SKILL.md` | skill 速查入口(本地, .gitignore 不入库), 指向本文 |
 
 **新版本适配完成时**: 产细档 `docs/4_1_XX_adaptation.md`(或范式级变化时
@@ -277,3 +278,65 @@ curl -X POST -H "Content-Type:application/json" \
   只能重启微信)。改 script.js 批量改完再重启, 别改一处重启一次
 - **bundle ID 单例**: 日常 4.1.13 在跑时 `open` 4.1.12 是空操作(只激活已有实例),
   必须 `open -n`; 登录前先 `ps` 确认进程路径是 WeChat-4.1.12.app
+
+## 语音通话地址迁移(2026-11-02 增补, 适配 4.1.13.63)
+
+> **盲区警告**: 语音通话的地址**不在 `wechat_version/*.json` 里**, 是 `onebot/script.js`
+> 顶部的硬编码常量(VoIP 分区 `VOIP_*_OFF`)——addrfind/JSON 流程管不到它们。
+> 每次升级除了 JSON 18 键, **必须人工迁移这一组**, 否则 `/send_voice_call` 直接坏
+> (拨号段错误/注入失败/采集 -1)。通话类故障先读 `docs/VOIP-CALL-STATUS.md`。
+
+### 地址清单(共 6 函数偏移 + 1 结构图, 分属两个二进制)
+
+**wechat.dylib(2 个, script.js `VOIP_CLIENT_OFF`/`VOIP_DIAL_OFF`)**:
+
+| 常量 | 值(4.1.13.63) | 语义 | 找法 |
+|---|---|---|---|
+| VOIP_CLIENT_OFF | `0x9b93ab8` | VoIP 客户端静态单例(__DATA) | 拨号函数的 adrp+add 装载目标(见下行) |
+| VOIP_DIAL_OFF | `0x1fc07f4` | 原生客户端拨号 `(client, 被叫cstr, vector*, 1, 0, 0x2e6981b3)` | **常量锚**: 函数内出现魔数 `0x2e6981b3`(movz/movk 拼装) + 读 `[x0+0x28]` 初始化标志 + 构造 24B string vector。全切片搜 `0x2e6981b3` 的立即数拼装序列, 目视确认调用形 |
+
+**ConfSDKdyn 框架(4 个函数偏移, script.js `VOIP_PUT_OFF` 等)**:
+版本升级会同时换掉 app 内的 `ConfSDKdyn.framework`, 这 4 个全部要重找。
+**锚 = 框架内嵌日志字符串**(每个函数体 `adr xN, <字符串>` 引用自己的名字):
+
+| 常量 | 值 | 函数 | 锚字符串(在 ConfSDKdyn 内搜) | 包装层 |
+|---|---|---|---|---|
+| VOIP_PUT_OFF | `0x7a370` | PutExternalRecordData(注入) | `PutExternalRecordData Error, Param invalid!` | **svc 包装**: 小 thunk `ldr x0,[x0,#8]; b X`(X 做 `+0xa10` 再跳 impl); 调用传 svc |
+| VOIP_MUTE_OFF | `0x662e0` | MuteMicPhone(防×1.5 变速) | `ConfEngine::MuteMicPhone Error, m_pMVQQEngine is NULL-Ptr` | 直传 ce |
+| VOIP_GETAUDIO_OFF | `0x4dba8` | GetAudioData(下行采集) | `ConfEngine::GetAudioData Error,no member` | 直传 ce |
+| VOIP_SETPLAY_OFF | `0x67fdc` | SetAudioPlayStatus(采集激活) | `SetAudioPlayStatus, member_id = %d, status = %d` | 直传 ce |
+
+版本免疫件(不用迁): `GetWXConfService` 是导出符号(运行时 enumerateExports 按名取);
+`0x1352707` 是服务 id 参数(协议常量, 变了从 wechat.dylib 调用点读 w0);
+挂断走 svc vtable 槽位 12(不落地址)。
+
+**结构偏移(同一套, 挂错=崩溃或读空)**:
+`svc → [svc+8] → +0xa10 = ce(confEngine) → ce+8 = mvq → av = mvq-8`;
+`ce+0x2c`=startTalkFlag(拨出响铃期即≥1, 接通话音以此为准不绝对);
+`av+0x234/0x248/0x254/0x258` = frameMs/recRate/bytesPerSample/recRate2(帧长公式用);
+`av+0x2320` = **每拉字节数**(采集 x2 参数, 传错恒 -1);
+`av+0x5418` = externalMode。
+
+### 查找流程(新版本)
+
+```
+1. lipo -thin arm64 ConfSDKdyn.framework/Versions/A/ConfSDKdyn -o /tmp/conf-new.dylib
+2. 每个 锚字符串 → 在切片里搜得偏移 S
+3. objdump 全量 | grep "adr.*<S>" 得引用点 → 向上回溯最近的
+   sub sp/stp x29 函数头 = 函数地址(带字符串的就是可调用体, Put 例外:
+   字符串落在 impl, 还要反向找谁 bl/b 到 impl 链上的 svc thunk)
+4. wechat.dylib: 搜 0x2e6981b3 立即数拼装 → 确认 dial fn → 读其 adrp+add 得 CLIENT
+5. 把 6 个新值改进 onebot/script.js VoIP 分区常量(值+锚注释都在)
+```
+
+### 验证(三级, 全过才算迁移完成)
+
+1. **静态**: 每个候选 objdump ±0x40, 对照 4.1.13.63 的调用形(参数寄存器/门禁序列)
+2. **运行时免呼**(本地 dev 副本, 探针只读): svc 非空; 任意通话后 ce+8 非空;
+   av 格式读出 frameMs∈[5,60]、rate∈[8000,96000]; av+0x2320∈(0,8192]
+3. **一通实测**(开发副本拨真号): dial ret=1 → 接通 → 注入对方**听得到** →
+   muteMic(answered) ret=0 → record 采集帧 ret≥0 且 WAV 有真人声 → 挂断干净无崩溃。
+   采集 -1 = x2/结构偏移错; 注入无声 = PUT_OFF/格式错; 拨号即崩 = DIAL_OFF/CLIENT 错。
+
+实测细节与全部坑(字节交换帧/静音帧/响铃期采集)见 `docs/VOIP-CALL-STATUS.md` §13/§16;
+通话中崩溃查 `docs/crash-history.md`(PAC 禁挂清单也在那/CLAUDE.md)。
