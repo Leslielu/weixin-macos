@@ -61,7 +61,16 @@ curl -X POST -H "Content-Type:application/json" \
 
 可选参数：`tts_voice`（say 音色）、`hangup`（播完是否挂断，默认 true）、
 `async`（true = 立即返回，通话在后台跑完）、`max_seconds`（播放上限，默认 120）、
-`timeout`（等接听秒数，默认 60）。
+`timeout`（等接听秒数，默认 60）、`record`（true = 采集对方声音，挂断后生成
+静音裁剪的 WAV 落 `voice_records/`，响应返回路径）、`record_seconds`（采集秒数，
+默认 60，自开拉时刻起算）。
+
+```
+# 纯采集模式: 不带 voice/text, 拨通只录音(听到对方说什么)
+curl -X POST -H "Content-Type:application/json" \
+  -d '{"user_id":"wxid_xxx","record":true,"record_seconds":30}' \
+  http://127.0.0.1:58080/send_voice_call
+```
 
 返回：`{"status":"ok","retcode":0,"data":{"answered":true,"reason":"eof","frames":522,...}}`
 
@@ -70,7 +79,7 @@ curl -X POST -H "Content-Type:application/json" \
 - `GET  /voice_call_status` — 查询是否在通话中及上一通的注入摘要
 - `POST /hangup_voice_call` — 手动挂断
 
-注意：同一时刻只允许一通；只支持出站（给对方放音），入站接收尚未接线。
+注意：同一时刻只允许一通；出站放音 + 入站采集（record）均已可用。
 链路细节与标定见 [docs/VOIP-CALL-STATUS.md](../docs/VOIP-CALL-STATUS.md) §13。
 
 ## 接入openclaw

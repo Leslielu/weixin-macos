@@ -2688,6 +2688,160 @@ function voipStatus() {
         lastRet: c.lastRet, error: c.error, last: null
     });
 }
+
+// ---- 下行采集(听对方): 我们当音频设备, 每 20ms 拉 GetAudioData ----
+// 机制(2026-11-02 定性): 引擎无播放设备也会吐下行 PCM, decode 由我们的拉取驱动。
+//   x2 参数 = [av+0x2320] 引擎登记的每拉字节数(不是 memberid, 传错恒 -1)。
+// 已知怪癖: 部分通话里 42% 帧是 16bit 字节交换的真语音(疑 HW/SW 解码双路径),
+//   LE 读成满幅白噪 ⇒ 运行时判别(maL>6000 且 maB*4<maL)成对交换修正。
+// 时间轴保留: 每拍必写 x2 字节(引擎没数据就写零), 静音段不丢。
+var VOIP_GETAUDIO_OFF = "0x4dba8";   // ConfEngine::GetAudioData(ce, buf, x2, &out)
+var VOIP_SETPLAY_OFF = "0x67fdc";    // ConfEngine::SetAudioPlayStatus(ce, mid, st)
+var voipCap = null;                  // 当前采集会话
+var voipCapLast = null;              // 上一通采集摘要(Go 收尾用)
+
+function voipCaptureEngine() {
+    // 返回 {ce, av, pullBytes, rate, frameMs} 或 null(引擎未就绪)
+    try {
+        var svc = voipService();
+        var ce = svc.add(8).readPointer().add(0xa10);
+        if (ce.add(8).readPointer().isNull()) return null;
+        if (ce.add(0x2c).readU32() < 1) return null;
+        var av = ce.add(8).readPointer().sub(8);
+        var pullBytes = av.add(0x2320).readU32();
+        var rate = av.add(0x248).readU32();
+        var frameMs = av.add(0x234).readU32();
+        if (!(pullBytes > 0 && pullBytes <= 8192)) return null;
+        if (!(rate >= 8000 && rate <= 96000)) return null;
+        if (!(frameMs >= 5 && frameMs <= 60)) return null;
+        return { ce: ce, av: av, pullBytes: pullBytes, rate: rate, frameMs: frameMs };
+    } catch (e) { return null; }
+}
+
+function voipCaptureStart(optsJson) {
+    if (voipCap) return "busy";
+    var opts = {};
+    try { opts = JSON.parse(optsJson || "{}"); } catch (e) { }
+    var maxSeconds = opts.maxSeconds || 60;
+    var c = {
+        phase: "wait", path: opts.path || "/tmp/voip_down.pcm",
+        maxSeconds: maxSeconds, file: null,
+        ce: null, pullBytes: 0, rate: 0, frameMs: 20,
+        buf: null, outP: null, n: 0, bytes: 0, swapN: 0, zeroN: 0,
+        t0: 0, idx: 0, timer: null, reason: ""
+    };
+    voipCap = c;
+    console.log("[voip-cap] 采集待命 path=" + c.path + " max=" + maxSeconds + "s");
+    function arm() {
+        // 引擎就绪前 200ms 轮询(拨号后 av 才建, 接通后 pullBytes 才有效)
+        if (!voipCap || voipCap !== c) return;
+        if (c.phase !== "wait") return;
+        var e = voipCaptureEngine();
+        if (!e) { c.timer = setTimeout(arm, 200); return; }
+        try {
+            var svc = voipService();
+            var setStatus = new NativeFunction(voipConfModule().base.add(VOIP_SETPLAY_OFF), "int",
+                ["pointer", "int", "int"]);
+            var sr = setStatus(e.ce, 1, 1);   // 激活播放信道(失败不致命, 实测部分通话不需要)
+            console.log("[voip-cap] SetAudioPlayStatus ret=" + sr);
+        } catch (e2) { console.log("[voip-cap] setStatus 异常: " + e2); }
+        c.ce = e.ce; c.pullBytes = e.pullBytes; c.rate = e.rate; c.frameMs = e.frameMs;
+        c.buf = Memory.alloc(16384); voipKeep.push(c.buf);
+        c.outP = Memory.alloc(16); voipKeep.push(c.outP);
+        c.buf.writeByteArray(new Uint8Array(16384));
+        try { c.file = new File(c.path, "wb"); }
+        catch (e3) {
+            voipCapLast = { path: c.path, error: "文件创建失败: " + e3, reason: "open-fail" };
+            voipCap = null;
+            return "err:" + e3;
+        }
+        c.phase = "run"; c.t0 = Date.now();
+        console.log("[voip-cap] 开采 rate=" + c.rate + "Hz frame=" + c.frameMs + "ms pull=" + c.pullBytes + "B");
+        tick();
+        return "ok";
+    }
+    function tick() {
+        if (!voipCap || voipCap !== c || c.phase !== "run") return;
+        var st = 0;
+        try { st = c.ce.add(0x2c).readU32(); } catch (e) { }
+        if (st < 1) { voipCaptureFinish("call-end"); return; }
+        if (Date.now() - c.t0 > c.maxSeconds * 1000) { voipCaptureFinish("max"); return; }
+        var x2 = c.pullBytes;
+        try { c.buf.writeByteArray(new Uint8Array(x2)); } catch (e) { }   // 清零→没数据写零保时间轴
+        var r = null;
+        try {
+            var getAudio = new NativeFunction(voipConfModule().base.add(VOIP_GETAUDIO_OFF), "int",
+                ["pointer", "pointer", "int", "pointer"]);
+            r = getAudio(c.ce, c.buf, x2, c.outP);
+        } catch (e) { console.log("[voip-cap] 拉取异常: " + e); voipCaptureFinish("exception"); return; }
+        try {
+            var v = new Uint8Array(c.buf.readByteArray(x2));
+            var le = new Int16Array(c.buf.readByteArray(x2));
+            var maL = 0;
+            for (var k = 0; k < le.length; k++) maL += le[k] < 0 ? -le[k] : le[k];
+            maL /= le.length;
+            var maB = 0;
+            for (var k2 = 0; k2 + 1 < x2; k2 += 2) {
+                var sv = (v[k2] << 8) | v[k2 + 1];
+                sv = sv > 32767 ? sv - 65536 : sv;
+                maB += sv < 0 ? -sv : sv;
+            }
+            maB /= (x2 / 2);
+            if (maL > 6000 && maB * 4 < maL) {
+                var sw = new Uint8Array(x2);
+                for (var k3 = 0; k3 < x2; k3++) sw[k3] = v[k3 ^ 1];
+                c.file.write(sw.buffer);
+                c.swapN++;
+            } else {
+                c.file.write(v.buffer);
+                if (maL < 1) c.zeroN++;
+            }
+            c.bytes += x2;
+        } catch (e2) { console.log("[voip-cap] 落盘异常: " + e2); }
+        c.n++;
+        c.idx++;
+        var deadline = c.t0 + c.idx * c.frameMs;
+        var d = deadline - Date.now();
+        if (d > 6) { c.timer = setTimeout(tick, d - 5); return; }
+        while (Date.now() < deadline) { }
+        c.timer = setTimeout(tick, 0);
+    }
+    arm();
+    return "ok";
+}
+
+function voipCaptureFinish(reason) {
+    var c = voipCap;
+    if (!c) return;
+    if (c.timer) { clearTimeout(c.timer); c.timer = null; }
+    if (c.file) { try { c.file.close(); } catch (e) { } }
+    voipCapLast = {
+        path: c.path, rate: c.rate, frameMs: c.frameMs, pullBytes: c.pullBytes,
+        frames: c.n, bytes: c.bytes, swapN: c.swapN, zeroN: c.zeroN,
+        seconds: c.t0 ? Number(((Date.now() - c.t0) / 1000).toFixed(1)) : 0,
+        reason: reason
+    };
+    voipCap = null;
+    console.log("[voip-cap] 结束 reason=" + reason + " " + voipCapLast.seconds + "s " +
+        c.bytes + "B swap=" + voipCapLast.swapN + " zero=" + voipCapLast.zeroN);
+}
+
+function voipCaptureStop() {
+    if (!voipCap) return "idle";
+    voipCaptureFinish("stop-request");
+    return "ok";
+}
+
+function voipCaptureStatus() {
+    if (voipCap) {
+        return JSON.stringify({
+            active: true, phase: voipCap.phase, path: voipCap.path,
+            frames: voipCap.n, bytes: voipCap.bytes, swapN: voipCap.swapN,
+            rate: voipCap.rate, last: null
+        });
+    }
+    return JSON.stringify({ active: false, last: voipCapLast });
+}
 // -------------------------语音通话(VoIP)分区-------------------------
 
 rpc.exports = {
@@ -2709,6 +2863,9 @@ rpc.exports = {
     triggerVoipHangup: triggerVoipHangup,
     voipPlay: voipPlay,
     voipStatus: voipStatus,
+    voipCaptureStart: voipCaptureStart,
+    voipCaptureStop: voipCaptureStop,
+    voipCaptureStatus: voipCaptureStatus,
 };
 
 // -------------------------发送图片消息分区-------------------------

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -35,14 +36,16 @@ var (
 
 // VoiceCallRequest /send_voice_call 请求体
 type VoiceCallRequest struct {
-	UserID     string `json:"user_id"`     // 被叫 wxid, 必填
-	Voice      string `json:"voice"`       // 本地音频文件路径(wav/mp3/aiff/...)
-	Text       string `json:"text"`        // 或用 TTS 合成(Voice 为空时生效)
-	TTSVoice   string `json:"tts_voice"`   // macOS say 音色, 默认 Tingting
-	Hangup     *bool  `json:"hangup"`      // 播完是否挂断, 默认 true
-	Async      bool   `json:"async"`       // true = 立即返回, 通话在后台跑完
-	MaxSeconds int    `json:"max_seconds"` // 单次播放上限(秒), 默认 120
-	Timeout    int    `json:"timeout"`     // 等接听上限(秒), 默认 60
+	UserID        string `json:"user_id"`       // 被叫 wxid, 必填
+	Voice         string `json:"voice"`         // 本地音频文件路径(wav/mp3/aiff/...)
+	Text          string `json:"text"`          // 或用 TTS 合成(Voice 为空时生效)
+	TTSVoice      string `json:"tts_voice"`     // macOS say 音色, 默认 Tingting
+	Hangup        *bool  `json:"hangup"`        // 播完是否挂断, 默认 true(record 模式见下)
+	Async         bool   `json:"async"`         // true = 立即返回, 通话在后台跑完
+	MaxSeconds    int    `json:"max_seconds"`   // 单次播放上限(秒), 默认 120
+	Timeout       int    `json:"timeout"`       // 等接听上限(秒), 默认 60
+	Record        bool   `json:"record"`        // 采集对方下行音频(听对方), 存 WAV 返回路径
+	RecordSeconds int    `json:"record_seconds"` // 采集时长上限(秒, 自接通起算), 默认 60
 }
 
 func boolOr(p *bool, def bool) bool {
@@ -123,6 +126,7 @@ func jsString(v any) string {
 type voipJSLast struct {
 	Reason     string `json:"reason"`
 	Answered   bool   `json:"answered"`
+	FrameMs    int    `json:"frameMs"`
 	Calls      int    `json:"calls"`
 	BytesSent  int    `json:"bytesSent"`
 	TotalBytes int    `json:"totalBytes"`
@@ -179,8 +183,8 @@ func voiceCallHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "user_id 必填", http.StatusBadRequest)
 		return
 	}
-	if req.Voice == "" && req.Text == "" {
-		http.Error(w, "voice 或 text 至少填一个", http.StatusBadRequest)
+	if req.Voice == "" && req.Text == "" && !req.Record {
+		http.Error(w, "voice/text/record 至少填一个", http.StatusBadRequest)
 		return
 	}
 	if !voiceCallMu.TryLock() {
@@ -208,10 +212,13 @@ func voiceCallHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // runVoiceCall 执行一次完整通话, 返回响应体。调用方负责持有 voiceCallMu。
+// 模式: 播放(voice/text) / 采集(record) / 两者同时(先播后录) / 纯采集。
 func runVoiceCall(req VoiceCallRequest) map[string]any {
 	maxSeconds := intOr(req.MaxSeconds, 120)
 	answerTimeout := intOr(req.Timeout, 60)
+	recordSeconds := intOr(req.RecordSeconds, 60)
 	doHangup := boolOr(req.Hangup, true)
+	playing := req.Voice != "" || req.Text != ""
 
 	dir, err := os.MkdirTemp("", "onebot_voip_")
 	if err != nil {
@@ -219,9 +226,26 @@ func runVoiceCall(req VoiceCallRequest) map[string]any {
 	}
 	defer os.RemoveAll(dir)
 
-	prefix, err := prepareVoIPPayload(dir, req.Voice, req.Text, req.TTSVoice, maxSeconds)
-	if err != nil {
-		return map[string]any{"status": "failed", "error": err.Error()}
+	var prefix string
+	if playing {
+		prefix, err = prepareVoIPPayload(dir, req.Voice, req.Text, req.TTSVoice, maxSeconds)
+		if err != nil {
+			return map[string]any{"status": "failed", "error": err.Error()}
+		}
+	}
+
+	// 0. 先武装下行采集(JS 侧自己等接通才开始拉, 拨号前调用不影响拨号)
+	if req.Record {
+		capOpts, _ := json.Marshal(map[string]any{
+			"path":       filepath.Join(dir, "down.pcm"),
+			"maxSeconds": recordSeconds + 30, // 引擎就绪/接听等待的余量
+		})
+		capCtx, capCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		capRet, capErr := safeExportsCall(capCtx, "voipCaptureStart", string(capOpts))
+		capCancel()
+		if capErr != nil || jsString(capRet) != "ok" {
+			Info("语音通话: 下行采集武装失败(继续通话)", "ret", jsString(capRet), "err", capErr)
+		}
 	}
 
 	started := time.Now()
@@ -230,68 +254,100 @@ func runVoiceCall(req VoiceCallRequest) map[string]any {
 	dialRet, dialErr := safeExportsCall(dialCtx, "triggerVoipCall", req.UserID)
 	dialCancel()
 	if dialErr != nil {
+		voipCaptureStopNow()
 		return map[string]any{"status": "failed", "error": "拨号失败: " + dialErr.Error()}
 	}
 	if jsString(dialRet) != "0" {
+		voipCaptureStopNow()
 		return map[string]any{"status": "failed", "user_id": req.UserID,
 			"error": "拨号未成功: " + jsString(dialRet)}
 	}
-	Info("语音通话: 已拨出", "user_id", req.UserID)
+	Info("语音通话: 已拨出", "user_id", req.UserID, "record", req.Record)
 
 	// 2. 启动注入(JS 侧自己等接通: -405447 每 200ms 重试, 接通瞬间才开播)
-	opts, _ := json.Marshal(map[string]any{"maxSeconds": maxSeconds})
-	playCtx, playCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	playRet, playErr := safeExportsCall(playCtx, "voipPlay", prefix, string(opts))
-	playCancel()
-	if playErr != nil || jsString(playRet) != "ok" {
-		msg := jsString(playRet)
-		if playErr != nil {
-			msg = playErr.Error()
+	var final *voipJSStatus
+	if playing {
+		opts, _ := json.Marshal(map[string]any{"maxSeconds": maxSeconds})
+		playCtx, playCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		playRet, playErr := safeExportsCall(playCtx, "voipPlay", prefix, string(opts))
+		playCancel()
+		if playErr != nil || jsString(playRet) != "ok" {
+			msg := jsString(playRet)
+			if playErr != nil {
+				msg = playErr.Error()
+			}
+			voipCaptureStopNow()
+			doHangupNow(doHangup)
+			return map[string]any{"status": "failed", "error": "注入启动失败: " + msg}
 		}
-		doHangupNow(doHangup)
-		return map[string]any{"status": "failed", "error": "注入启动失败: " + msg}
 	}
 
-	// 3. 轮询到播完 / 超时(等接听上限 + 播放上限 + 余量)
-	deadline := started.Add(time.Duration(answerTimeout+maxSeconds+15) * time.Second)
-	var final *voipJSStatus
-	var lastErr error
+	// 3. 轮询到 播放完成 && 采集完成 / 超时
+	budget := answerTimeout + 15
+	if playing {
+		budget += maxSeconds
+	}
+	if req.Record {
+		budget += recordSeconds
+	}
+	deadline := started.Add(time.Duration(budget) * time.Second)
+	playDone := !playing
+	recordDone := !req.Record
+	var answeredAt time.Time
+	var capStartedAt time.Time
 	answered := false
 	for {
 		time.Sleep(300 * time.Millisecond)
-		st, err := voipStatusNow()
-		if err != nil {
-			lastErr = err
-			if time.Now().After(deadline) {
-				break
+		if playing && !playDone {
+			st, err := voipStatusNow()
+			if err == nil {
+				if !st.Active {
+					final = st
+					playDone = true
+				} else if st.Answered && answeredAt.IsZero() {
+					answeredAt = time.Now()
+				}
 			}
-			continue
 		}
-		lastErr = nil
-		if !st.Active {
-			final = st
-			break
+		if req.Record && !recordDone {
+			cs, err := voipCaptureStatusNow()
+			if err == nil && cs != nil {
+				if !cs.Active {
+					recordDone = true // JS 侧已收尾(call-end/max/stop)
+				} else if answeredAt.IsZero() {
+					answeredAt = time.Now() // 采集在跑 = 已接通
+				}
+				if cs.Active && cs.Phase == "run" && capStartedAt.IsZero() {
+					capStartedAt = time.Now() // 真正开拉的时刻(引擎就绪可晚于接通数秒)
+				}
+			}
+			if !capStartedAt.IsZero() && time.Since(capStartedAt) > time.Duration(recordSeconds)*time.Second {
+				recordDone = true
+			}
 		}
-		answered = st.Answered
+		if !answeredAt.IsZero() {
+			answered = true
+		}
 		if !answered && time.Since(started) > time.Duration(answerTimeout)*time.Second {
 			Info("语音通话: 等接听超时, 挂断", "user_id", req.UserID,
 				"waited_ms", time.Since(started).Milliseconds())
+			voipCaptureStopNow()
 			hangupVoIP()
 			return map[string]any{"status": "failed", "user_id": req.UserID,
 				"error":     "对方未接听(超时)",
 				"waited_ms": time.Since(started).Milliseconds()}
 		}
+		if playDone && recordDone {
+			break
+		}
 		if time.Now().After(deadline) {
 			Info("语音通话: 总时长超限, 挂断", "user_id", req.UserID)
-			hangupVoIP()
 			break
 		}
 	}
+	voipCaptureStopNow()
 	if doHangup {
 		hangupVoIP()
-	}
-	if final == nil && lastErr != nil {
-		return map[string]any{"status": "failed", "error": "状态查询失败: " + lastErr.Error()}
 	}
 
 	data := map[string]any{
@@ -306,14 +362,164 @@ func runVoiceCall(req VoiceCallRequest) map[string]any {
 		data["frames"] = l.Calls
 		data["bytes_sent"] = l.BytesSent
 		data["pcm_bytes"] = l.TotalBytes
-		// 播放时长近似值(按 16k mono s16 折算), 精确时长以 reason=eof 为准
-		data["played_seconds"] = float64(l.BytesSent) / 32000.0
+		// 播放时长 = 帧数 × 帧长(帧长每通协商, 20ms 居多)
+		fms := l.FrameMs
+		if fms <= 0 {
+			fms = 20
+		}
+		data["played_seconds"] = float64(l.Calls) * float64(fms) / 1000.0
 		if l.Error != "" {
 			data["error"] = l.Error
 		}
 	}
+	// 采集收尾: PCM → WAV 落盘 voice_records/
+	if req.Record {
+		data["record"] = finalizeVoiceRecording(dir, req.UserID)
+	}
 	Info("语音通话完成", "user_id", req.UserID, "data", data)
 	return map[string]any{"status": "ok", "retcode": 0, "data": data}
+}
+
+// voipCaptureStopNow 请求 JS 停止下行采集并收尾(幂等)
+func voipCaptureStopNow() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := safeExportsCall(ctx, "voipCaptureStop"); err != nil {
+		Warn("语音通话: 停止采集失败", "err", err)
+	}
+}
+
+type voipCapLast struct {
+	Path      string  `json:"path"`
+	Rate      int     `json:"rate"`
+	FrameMs   int     `json:"frameMs"`
+	PullBytes int     `json:"pullBytes"`
+	Frames  int     `json:"frames"`
+	Bytes   int     `json:"bytes"`
+	SwapN   int     `json:"swapN"`
+	ZeroN   int     `json:"zeroN"`
+	Seconds float64 `json:"seconds"`
+	Reason  string  `json:"reason"`
+	Error   string  `json:"error"`
+}
+
+type voipCapStatus struct {
+	Active bool         `json:"active"`
+	Phase  string       `json:"phase"`
+	Rate   int          `json:"rate"`
+	Last   *voipCapLast `json:"last"`
+}
+
+func voipCaptureStatusNow() (*voipCapStatus, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, err := safeExportsCall(ctx, "voipCaptureStatus")
+	if err != nil {
+		return nil, err
+	}
+	var st voipCapStatus
+	if err := json.Unmarshal([]byte(jsString(raw)), &st); err != nil {
+		return nil, fmt.Errorf("解析 voipCaptureStatus 失败: %v (%v)", err, raw)
+	}
+	return &st, nil
+}
+
+// finalizeVoiceRecording 把采集 PCM 封成 WAV 落盘, 返回摘要
+func finalizeVoiceRecording(dir, userID string) map[string]any {
+	pcmPath := filepath.Join(dir, "down.pcm")
+	pcm, err := os.ReadFile(pcmPath)
+	if err != nil {
+		return map[string]any{"ok": false, "note": "无采集数据(未接通或引擎未就绪)"}
+	}
+	rate := 16000
+	frame := 1280 // 20ms@48k×2B 兜底
+	if st, err := voipCaptureStatusNow(); err == nil && st != nil && st.Last != nil {
+		if st.Last.Rate > 0 {
+			rate = st.Last.Rate
+		}
+		if st.Last.PullBytes > 0 {
+			frame = st.Last.PullBytes
+		}
+	}
+	// 裁掉首尾整帧数字静音(采集从响铃期就开始: startTalk 在拨出后即>=1,
+	// 接通前的拉取全是零)。中间静音不动 — 时间轴语义只去头尾。
+	orig := len(pcm)
+	for len(pcm) >= frame && allZero(pcm[:frame]) {
+		pcm = pcm[frame:]
+	}
+	for len(pcm) >= frame && allZero(pcm[len(pcm)-frame:]) {
+		pcm = pcm[:len(pcm)-frame]
+	}
+	if len(pcm) == 0 {
+		return map[string]any{"ok": true, "note": "全程数字静音(对方未出声)",
+			"raw_seconds": float64(orig) / float64(rate) / 2}
+	}
+	if err := os.MkdirAll("voice_records", 0o755); err != nil {
+		return map[string]any{"ok": false, "error": "创建 voice_records 失败: " + err.Error()}
+	}
+	name := fmt.Sprintf("call_%s_%d.wav", sanitizeFileToken(userID), time.Now().Unix())
+	wavPath := filepath.Join("voice_records", name)
+	if err := writeWAV(wavPath, pcm, rate, 1); err != nil {
+		return map[string]any{"ok": false, "error": "WAV 封装失败: " + err.Error()}
+	}
+	abs, _ := filepath.Abs(wavPath)
+	return map[string]any{"ok": true, "path": abs, "rate": rate, "bytes": len(pcm),
+		"seconds":    float64(len(pcm)) / float64(rate) / 2,
+		"raw_bytes":  orig,
+		"trim_note":  "已裁首尾静音帧(响铃期+挂断尾)"}
+}
+
+func allZero(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func sanitizeFileToken(s string) string {
+	var b []byte
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			b = append(b, byte(r))
+		}
+	}
+	if len(b) == 0 {
+		return "unknown"
+	}
+	return string(b)
+}
+
+// writeWAV 把 s16le PCM 封成 44 字节头的 WAV
+func writeWAV(path string, pcm []byte, rate, channels int) error {
+	const bits = 16
+	blockAlign := channels * bits / 8
+	byteRate := rate * blockAlign
+	hdr := make([]byte, 44)
+	copy(hdr[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(hdr[4:8], uint32(36+len(pcm)))
+	copy(hdr[8:12], "WAVE")
+	copy(hdr[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(hdr[16:20], 16) // PCM chunk size
+	binary.LittleEndian.PutUint16(hdr[20:22], 1)  // PCM format
+	binary.LittleEndian.PutUint16(hdr[22:24], uint16(channels))
+	binary.LittleEndian.PutUint32(hdr[24:28], uint32(rate))
+	binary.LittleEndian.PutUint32(hdr[28:32], uint32(byteRate))
+	binary.LittleEndian.PutUint16(hdr[32:34], uint16(blockAlign))
+	binary.LittleEndian.PutUint16(hdr[34:36], bits)
+	copy(hdr[36:40], "data")
+	binary.LittleEndian.PutUint32(hdr[40:44], uint32(len(pcm)))
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(hdr); err != nil {
+		return err
+	}
+	_, err = f.Write(pcm)
+	return err
 }
 
 func doHangupNow(doHangup bool) {

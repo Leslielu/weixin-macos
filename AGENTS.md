@@ -49,13 +49,17 @@ for programmatic message sending and receiving.
 - `onebot/`: Go service implementing the OneBot protocol. HTTP server on
   127.0.0.1:58080; message callback to wxgate on 127.0.0.1:36060; WebSocket
   via `-conn_type=websocket`; gadget mode via `-type=gadget
-  -gadget_addr=127.0.0.1:27042`. Voice calls (implemented and deployed
-  2026-11-01): `POST /send_voice_call` `{user_id, voice|<text>, async?,
-  hangup?, max_seconds?, timeout?}` dials, waits for answer, plays the given
-  audio or TTS, then hangs up; plus `GET /voice_call_status` and
-  `POST /hangup_voice_call`. One call at a time, outbound only. Code:
-  `onebot/voice_call.go` and the VoIP section of `onebot/script.js`;
-  calibration in `docs/VOIP-CALL-STATUS.md` §13.5.
+  -gadget_addr=127.0.0.1:27042`. Voice calls (implemented 2026-11-01,
+  capture added and deployed 2026-11-02): `POST /send_voice_call`
+  `{user_id, voice|<text>, record?, record_seconds?, async?, hangup?,
+  max_seconds?, timeout?}` dials, waits for answer, plays the given audio or
+  TTS, then hangs up. `record:true` also captures the callee's downlink audio
+  (hearing them): a silence-trimmed WAV lands in `voice_records/` and its path
+  is returned; without voice/text it is a record-only call. Plus
+  `GET /voice_call_status` and `POST /hangup_voice_call`. One call at a time,
+  outbound only. Code: `onebot/voice_call.go` and the VoIP section of
+  `onebot/script.js`; calibration in `docs/VOIP-CALL-STATUS.md` §13.5
+  (inject) and §16 (capture).
 - `watchdog/`: authoritative copy of the auto-restart watchdog
   (`wechat-watchdog.sh` + `ocr_allow.py` + `ocr_selftest.sh`). The deployed
   copy lives at `~/Prog/wxgate/` on mac-m1; keep both in sync.
@@ -96,8 +100,7 @@ for programmatic message sending and receiving.
   intermittent dropouts. `-405447` = not answered yet (retry 200 ms,
   auto-starts on answer). Known variable: one same-config round was noisy
   (suspect SDK recorder device contention — try holding the built-in mic if
-  noise recurs); inbound receive API `GetExternalHybridPlayData(+0x7a388)` is
-  located but not wired. **Topology rule (§14)**: always verify injection
+  noise recurs); inbound capture is solved (§16): pull `GetAudioData(+0x4dba8)` every 20ms with x2 = the engine-registered per-pull byte count `[av+0x2320]` — passing anything else returns -1; some calls emit byte-swapped frames (detect by LE/BE amplitude and swap); never blind-call `+0x7a388` (crashes without a play context). **Topology rule (§14)**: always verify injection
   quality with the tested side being the *dialer* and us answering. When the
   *callee* injects, ConfSDK's external-record consumer runs on a 40 ms tick
   and yields 20 ms holes + occasional 2× slow-motion, invariant to payload,

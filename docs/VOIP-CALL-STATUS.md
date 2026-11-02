@@ -18,7 +18,7 @@
 | **程序化拨号 + 接通 + 挂断(原生全流程)** | ✅ **2026-11-01 打通并人工实测** | §11 ConfSDK `vt[6]`/`vt[12]` |
 | 本机标识字段(field7) | ✅ 可填 0, 无需常量 | §11.2 实测 |
 | **通话音频: 出站注入(给对方放音)** | ✅ **2026-11-01 打通**(帧长按每通协商格式自适应, 16k/48k 打手机实听均干净) | §13 |
-| **通话音频: 入站接收(听对方)** | ⏳ 已定性: 卡播放设备注册, 收流活/解码是拉取驱动 | §15 |
+| **通话音频: 入站接收(听对方)** | ✅ 2026-11-02 打通并生产化(`record` 参数) | §16 |
 | onebot 端点 | ✅ 2026-11-01 实现并在 mac-m1 部署验证(`/send_voice_call` 等三端点) | §13.5 |
 | 生产部署 / 入站接听 / 通话事件推送 | ⏳ 下一步 | §9 |
 
@@ -495,7 +495,8 @@ svc → [svc+8]                 ConfEngine
   5ms 醒 + 临界自旋) + 抖动统计。实测数百帧 `maxLateMs=0, lateOver3ms=0`。
 - 入站方向(听对方)接口已定位未接线: `GetExternalHybridPlayData`(wrapper
   `ConfSDKdyn+0x7a388`) / `GetExternalPlayData`(`+0x7a3a8`), 与注入对称。
-  **2026-11-01 深夜定性: 这两个口在没有播放设备时不可用, 见 §15。**
+  **2026-11-02 修正: 播放上下文缺失时这两个 wrapper 盲调仍不可用(必崩),
+  但 ConfEngine::GetAudioData(+0x4dba8) 直调可行, 见 §16。**
 
 ### 13.3 实测验收(最终形态)
 
@@ -638,6 +639,10 @@ mute 与否(freeze在 m1 侧)全都改不动它。
 
 ## 15. 下行采集(听对方)定性 —— 卡在播放设备注册, 未通(2026-11-01 深夜, probe44~52)
 
+> ⚠️ **本章「设备门」结论已被 §16 修正**: -1 的真因是 x2 参数错(x2 应传引擎登记的
+> 每拉字节数 [av+0x2320], 不是 memberid), 引擎根本不需要播放设备也会吐下行 PCM。
+> 本章的机制分析(收流/零 AudioUnit/罗塞塔)仍然成立, 保留作过程记录。
+
 > 结论先行: **远端 RTP 全程在收、收包解码调度在跑, 但「解码成 PCM」是播放拉取驱动
 > (decode-on-pull), 而拉取方只有 app 的 CoreAudio 设备回调。无 UI ⇒ 引擎侧 AudioUnit
 > 从未创建 ⇒ 没人拉 ⇒ 引擎内存里根本不存在解码后的对方 PCM。** 公开拉取口
@@ -696,3 +701,50 @@ GetExternalHybridPlayData = ConfSDKdyn+0x7a388 wrapper → 0x65e20(门禁 +0x7f4
 | `probe50.js` | GetAudioData 直拉首试(-1) |
 | `probe51.js` | SetAudioPlayStatus+拉联动(激活成功但拉仍 -1) |
 | `probe52.js` | 矩阵: status{1,0}×{AudioData,Ex}(2001 次 -1, 门在 vt[32] 内部) |
+
+## 16. 下行采集打通并生产化 —— record 参数(2026-11-02, probe53~55 + onebot)
+
+> 结论: **§15 的「播放设备门」是误判。** GetAudioData 返回 -1 只因 x2 参数传错:
+> x2 不是 memberid, 是引擎登记的**每拉字节数** `[av+0x2320]`(48k/20ms=1920B,
+> 16k=640B)。传对立即放行; 引擎无需播放设备, 下行 PCM 由我们的 20ms 拉取驱动
+> (decode-on-pull 的「pull」就是我们)。收发对称: 上行注入 Push, 下行采集 Pull。
+
+### 16.1 关键事实
+
+| # | 事实 | 证据 |
+|---|---|---|
+| 1 | x2=[av+0x2320], 传 memberid 恒 -1 | probe50~52 共 2001 次 -1 → probe53 传对后 3001 次全 ret=0 |
+| 2 | 采集整帧必须 x2 字节 | probe53 只落 1024B/帧 → 每帧丢 47% → 「20ms 碎裂」; probe54 整帧后帧边界无缝 |
+| 3 | 部分通话 42% 帧是 16bit 字节交换的真语音 | probe54 解剖: BE 读法自相关 0.98(真人语音), LE 读成满幅白噪; 连续块分布非奇偶交替, 疑 HW/SW 解码双路径(字符串表有 uiHWDecExceptionMask 回退机制), 非必现 |
+| 4 | startTalk 在拨出响铃期即 ≥1 | 采集从响铃就开始 → WAV 首部静音; 生产版裁首尾整帧数字静音(中间保留=真实时间轴) |
+| 5 | 引擎没数据时写零(DTX), 拉取照常 ret=0 | probe54: 568/3001 帧全零 |
+
+### 16.2 采集管线(生产版, onebot/script.js voipCapture* 分区)
+
+```
+voipCaptureStart({path,maxSeconds})   武装(拨号前调, 内部 200ms 轮询等引擎就绪)
+  └ 引擎就绪判定: [svc+8]+0xa10+8 非 null 且 startTalk≥1 且 [av+0x2320]∈(0,8192]
+  └ SetAudioPlayStatus(ce,1,1) 激活播放信道(部分通话不需要, 失败不致命)
+  └ 每 20ms: 清零缓冲 → GetAudioData(ce, buf, x2, &out) → 字节序判别(可选交换)
+            → 整帧落盘(没数据写零 = 保留时间轴)
+停止: startTalk<1(通话结束) / maxSeconds / voipCaptureStop
+```
+
+Go 侧(/send_voice_call record:true): 采集 PCM → 裁首尾静音帧 → 44B 头封 WAV →
+`voice_records/call_<wxid>_<unix>.wav`, 响应返回 path/rate/seconds。
+`record_seconds` 自**开拉时刻**起算(引擎就绪可晚于接通数秒)。
+纯采集模式: 只传 user_id+record(不带 voice/text) = 拨通只录音。
+
+### 16.3 验收(2026-11-02, 用户耳测)
+
+- 播+录同通: TTS 播报 + 20.26s 足额录音, 48k WAV
+- 纯采集: 15.4s 原始(含响铃) → 裁剪 10.52s 纯语音, 用户确认「没问题」
+- 已知怪癖: 字节交换帧运行时判别修正(swapN 字段可观测); 交换帧何时出现未定源
+
+### 16.4 工具
+
+| 文件 | 用途 |
+|---|---|
+| `probe53.js` | x2 参数突破首证 |
+| `probe54.js` | 整帧落盘 + 每帧写入长度实测 |
+| `probe55.js` | 运行时字节序判别交换 |
