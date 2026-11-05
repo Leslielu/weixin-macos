@@ -285,8 +285,8 @@ curl -X POST -H "Content-Type:application/json" \
 ### 4.1.15.55 适配复盘（2026-11-04，详见 4.1.15-adaptation.md）
 
 - **结果**: 22 键 addrfind 全中，V3 无身份换位；文本/图片/视频/语音/文件发送
-  在登录 >15 分钟后五连测全 ack，文本/图片/语音/文件接收与落盘全通。VoIP 拨号/
-  接听/挂断正常，但注入 -405909、格式 raw=null、采集未启动，留待后续。
+  在登录 >15 分钟后五连测全 ack，文本/图片/语音/文件接收与落盘全通。VoIP 次日
+  （11-05）修复并全链路验收通过（av 偏移未漂移 + 等待码迁移，见下两条铁律）。
 - **先查低级错误，再谈架构变化**: 登录账号/容器、onebot cwd（script.js 是运行时
   从 `./script.js` 读取）、本地保存目录、真实 ack/实收都要先核。语音“接收失败”
   最后一项只是 `/tmp` audio 目录不存在。
@@ -302,8 +302,13 @@ curl -X POST -H "Content-Type:application/json" \
 - **不可复现的服务端错误不盲修**: 文件 sendappmsg 早期两次 ret=-2，同代码后来
   对 ludaohe/filehelper 均 ret=0 且实收可打开。先保存响应 hex、重试与确认实收，
   不把瞬时失败写成协议漂移。
-- **静态推断必须有运行时验收**: VoIP av 块 +8 只是由函数体偏移推得；一通实测
-  即暴露格式门不通过。下次先读运行时指针链和字段真值，不盲换函数地址。
+- **静态推断必须落到真正的实现体**: VoIP av 块 +8 原先是由 ConfSDKdyn 的 ce
+  字段漂移外推，一通实测暴露格式门不通过；11-05 对照 MultiMediaDyn 真实现体后
+  证明 av 五个字段全未漂移。ce 与 av 分属不同框架/对象，禁止互推偏移。
+- **等待错误码也是版本地址的一部分**: 4.1.15 的 -405909 与旧版 -405471 都是
+  PUT 的 `mv==null/startTalk<1` 分支。只迁函数地址、不迁等待码，会在接听前把
+  正常的“未就绪”累计成硬失败。muteMic(start) 的引擎空负码则是预期，不能据它
+  盲换 MuteMic 地址。
 
 ## 维护约定
 
@@ -357,6 +362,13 @@ curl -X POST -H "Content-Type:application/json" \
 `av+0x234/0x248/0x254/0x258` = frameMs/recRate/bytesPerSample/recRate2(帧长公式用);
 `av+0x2320` = **每拉字节数**(采集 x2 参数, 传错恒 -1);
 `av+0x5418` = externalMode。
+
+**ce 与 av 必须分开迁移**：ce 字段看 ConfSDKdyn 的 ConfEngine 函数体；av 字段看
+MultiMediaDyn 的注入实现（旧版 0x1f8018，经 `sub x0,x0,#8` thunk）和下行实现
+（旧版 0x211974，经同款 thunk）。二者分属不同框架和对象，ce 全体 +N 不能推出 av
+也 +N。4.1.15 的 ce 多个字段 +8，但 av 上述五个字段全部不变，是最直接反例。
+同时从 PUT 首个失败分支迁移 `VOIP_ERR_ENGINE_NOT_READY`（旧 -405471，新 -405909），
+并从实际 NoMember 路径核对 `VOIP_ERR_NO_MEMBER`，不要把旧错误码写死在 tick 里。
 
 ### 查找流程(新版本)
 

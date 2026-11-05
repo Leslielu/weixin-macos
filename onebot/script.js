@@ -2396,15 +2396,17 @@ var VOIP_DIAL_OFF = "0x2172354";
 var VOIP_CONF_ARG = 0x1352707;
 var VOIP_PUT_OFF = "0x7d2fc";
 var VOIP_MUTE_OFF = "0x691f4";
-// 结构偏移(4.1.15.55, ConfSDKdyn 内; 4.1.13 值见括号, 迁移时对照新版 veneer/
-// GetAudioData 函数体偏移重定):
+var VOIP_ERR_NO_MEMBER = -405885;      // NoMember is Active(4.1.13 为 -405447)
+var VOIP_ERR_ENGINE_NOT_READY = -405909; // mv==null/startTalk<1(4.1.13 为 -405471)
+// 结构偏移(4.1.15.55): ce 字段在 ConfSDKdyn 内漂移；av 字段必须对照
+// MultiMediaDyn 的注入/下行实现体重定，不能由 ce 的漂移量外推。
 var VOIP_CE_OFF = "0x9e0";            // [svc+8]+CE_OFF = confEngine (旧 0xa10)
 var VOIP_CE_STARTTALK_OFF = 0x34;     // ce+.. = startTalkFlag (旧 0x2c)
-var VOIP_AV_FRAMEMS_OFF = 0x23c;      // av+.. = frameMs (旧 0x234)
-var VOIP_AV_RATE_OFF = 0x250;         // av+.. = 采集采样率 (旧 0x248)
-var VOIP_AV_ENGRATE_OFF = 0x25c;      // av+.. = 引擎采样率 (旧 0x254)
-var VOIP_AV_ENGCH_OFF = 0x260;        // av+.. = 声道 (旧 0x258)
-var VOIP_AV_PULLBYTES_OFF = 0x2328;   // av+.. = 每拉字节数 (旧 0x2320)
+var VOIP_AV_FRAMEMS_OFF = 0x234;      // av=mv-8；4.1.15 MM+0x201d80 实证未变
+var VOIP_AV_RATE_OFF = 0x248;         // 采集采样率；MM+0x21ba4c 实证未变
+var VOIP_AV_ENGRATE_OFF = 0x254;      // 引擎采样率；注入实现仍读此偏移
+var VOIP_AV_ENGCH_OFF = 0x258;        // 声道；注入实现仍读此偏移
+var VOIP_AV_PULLBYTES_OFF = 0x2320;   // 每拉字节数；下行实现仍读此偏移
 var voipKeep = [];
 var voipCall = null; // 当前注入会话
 var voipLast = null; // 上一通注入的结果摘要(供 Go 侧轮询收尾)
@@ -2521,8 +2523,8 @@ function voipHangupNative(svc) {
     return new NativeFunction(fn, "int", ["pointer", "int", "int"])(s, 1, 0);
 }
 
-// 静音 SDK 内部采集(不调则音调 ×1.5 偏快)。拨号前调一次常见返回负码
-// (-405652 / -405662) —— 那时会话还没就绪; 接通瞬间必须再调一次, 正常应回 0。
+// 静音 SDK 内部采集(不调则音调 ×1.5 偏快)。拨号前引擎未就绪时返回负码
+// 属于预期；接通瞬间必须再调一次，正常应回 0。
 function voipMuteMic(svc, tag) {
     try {
         var mf = new NativeFunction(voipConfModule().base.add(VOIP_MUTE_OFF), "int",
@@ -2662,7 +2664,7 @@ function voipPlay(prefix, optsJson) {
     var c = {
         prefix: prefix, svc: null, playU8: null, frameBuf: null, frameCap: 0,
         stage: null, off: 0, idx: 0, t0: 0, calls: 0, lastRet: null,
-        maxLate: 0, lateOver3: 0, waiting: 0, answered: false,
+        maxLate: 0, lateOver3: 0, waiting: 0, waitRet: null, answered: false,
         fmtApplied: false, timer: null, error: null, stopReason: "",
         rate: 24000, contentRate: 16000, channels: 1,
         frameMs: 20, frameBytes: 960, payloadBytes: 640, maxSec: maxSec
@@ -2699,9 +2701,20 @@ function voipPlay(prefix, optsJson) {
             c.frameBuf.writeByteArray(c.stage);
             ret = putExternal(c.svc, c.frameBuf, c.frameBytes, c.rate, c.channels);
         } catch (e) { err = String(e); }
-        // -405447 = NoMember is Active(未接听) / -405471 = 会话未就绪:
-        // 原地等待不消耗数据, 接通瞬间自动从文件头开播
-        if ((ret === -405447 || ret === -405471) && err === null) {
+        // 未接听/引擎未就绪：原地等待不消耗数据，接通后从文件头开播。
+        // 错误码逐版漂移，必须与 ConfEngine::PutExternalRecordData 的首个
+        // (mv==null || startTalk<1) 分支对照迁移，不能写死旧版数值。
+        if ((ret === VOIP_ERR_NO_MEMBER || ret === VOIP_ERR_ENGINE_NOT_READY) && err === null) {
+            if (c.waitRet !== ret) {
+                var waitState = "unknown";
+                try {
+                    var waitCe = c.svc.add(8).readPointer().add(VOIP_CE_OFF);
+                    waitState = "startTalk=" + waitCe.add(VOIP_CE_STARTTALK_OFF).readU32() +
+                                " mv=" + waitCe.add(8).readPointer();
+                } catch (eWait) { }
+                console.log("[voip] 等待接听/引擎 ret=" + ret + " " + waitState);
+                c.waitRet = ret;
+            }
             c.waiting++;
             if (c.waiting > Math.floor(c.maxSec * 5)) { voipStop("answer timeout"); return; }
             c.lastRet = ret;
