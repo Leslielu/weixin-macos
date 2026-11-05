@@ -296,7 +296,8 @@ curl -X POST -H "Content-Type:application/json" \
   接收，却不能据此声称“4.1.15 信封必然改形”。需要最小 A/B 分离贡献。
 - **日志时间相邻不是路径证明**: srh len=1 小帧会被 `<4` 生产门丢弃，却曾因与
   Go 聊天日志同秒被误认为来源。给 `protobuf_msg` 发送点加来源 ID，或禁用某路做
-  A/B，才能决定 hook 去留。
+  A/B，才能决定 hook 去留。**11-05 禁用 A/B 已做: llSRH 非必需**（无 srh hook
+  时 ludaohe 文本照常转发、发送 ack 正常），4_1_15_55_mac.json 不含该键。
 - **失败样本先分类**: 403B hexdump 是 ambient 同步控制包，不是聊天；不要据它
   改 WxRecvMsg 解析器。测试采样要带来源/cmdid/时间，并对齐用户所发内容。
 - **不可复现的服务端错误不盲修**: 文件 sendappmsg 早期两次 ret=-2，同代码后来

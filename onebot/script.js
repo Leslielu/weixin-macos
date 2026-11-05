@@ -409,7 +409,7 @@ var msgMapMgrGlobal = ptr(0);        // 4.1.13: msg-map manager this, 捕获点 
 var mgrCaptureAddr = ptr(0);         // 4.1.13: manager 捕获 hook 点(0x42e4c2c, H found 路径)
 var respDispatchAddr = ptr(0);       // 4.1.13: H 尾部响应分发点(0x42e5044, mov x0,x22)
 var onPushAddr = ptr(0);             // 4.1.13: 长链 push 入口(stn.cc __OnPush 头 0x59b0e94)
-var longlinkSrhAddr = ptr(0);        // 4.1.15: 长链 SingleRespHandle 体内实验点(去留待 A/B)
+var longlinkSrhAddr = ptr(0);        // 4.1.15: 长链 SingleRespHandle 体内实验点(A/B 已证聊天接收非必需, 正式 JSON 不带)
 var cndOnCompleteAddr;
 var imgMessageCallbackFunc;
 var videoMessageCallbackFunc;

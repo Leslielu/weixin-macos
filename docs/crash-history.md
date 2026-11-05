@@ -172,6 +172,7 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 
 本质：kill onebot = gadget 会话拆除，拆除路径本身有竞态（同样的 kill 08:46 活了、08:48 崩了，概率性）。与 F 同族（gadget 会话生命周期脆弱）。
 **修复 = 规程**：换 script.js 必须**微信+onebot 同步重启**（先重启微信再起新 onebot），永不单独 kill 存活微信上的 onebot。
+**2026-11-04 第二形态（4.1.15 适配期实锤）**：被拆除的不是 onebot 的会话，而是**并发挂着的独立探针 frida 会话**（`pkill frida`）——同样触发拆除竞态崩宿主。且并发第二会话本身还会劣化拦截器状态（见 F 类 2026-11-01 形态）。**铁律：探针绝不二次会话 attach；诊断 hook 必须并进 script.js 单会话。**
 
 ### 2026-09-21 23:07:56 —— H 类：detach 拆 syscall 蹦床竞态崩微信
 
@@ -230,6 +231,29 @@ mars::cdn::worker 线程 NULL+0x10，疑似下载路径。未修，未复发（�
 | `f1d0017` | wxgate | onebot.log 追加模式，保留崩溃现场 |
 | `d852c00` | wxgate | start.sh export homebrew PATH（duration=0 崩溃根因，2026-09-07 部署验证） |
 | `e92caf0` | weixin-macos | 视频双保险：duration 探测失败 fail-fast + CDN 钥匙持久化 `cdn_video_keys.json` 启动回灌 |
+
+### 2026-11-04 22:41/22:45 —— 4.1.15 适配期两起崩溃（开发副本，指纹已并入分类）
+
+**① G 类第二形态：探针二次会话拆除竞态（人为失误）**
+独立 frida 会话（非 onebot）挂 llSRH 探针后 `pkill frida` 拆会话 → 微信崩。
+处置与教训已并入上方 G 类条目：探针绝不二次会话 attach，诊断 hook 并进 script.js
+单会话，换脚本走「改好 → 重启微信 → 登录 → 起新 onebot」。
+
+**② PAC 签名家族新指纹：llSRH 函数头挂载必崩**
+```
+挂载点:  wechat.dylib+0x5d4bc48 (长链 SingleRespHandle 函数头, 4.1.15)
+时序:    Interceptor.attach 后 4 秒崩
+线程名:  mars::stn
+PC:      0x46362fc (H 块尾 blr)
+EXC:     EXC_BAD_ACCESS "possible pointer authentication failure"
+毒值:    0x7269775f6966698f (ASCII 垃圾当指针跳, "fi_rw" 字节样)
+```
+与 AudioIOThread 毒值 `0xac4400000002`（0x546a558/0x5470f7c/0x54704e4/
+0x5470644/0x5470688 禁挂清单）同家族：**PAC 签名间接调用目标，头 4 字节被蹦床
+覆写 = 签名失配**。非 pacibsp 序言 ≠ 安全（本函数头就不是 pacibsp）。
+**PAC 禁挂清单 +1: llSRH 头**。体内 fall-through 点 0x5d4bc80 挂载存活（其后
+所有会话稳定），但采样全为 len=1 小帧，无聊天价值 → llSRH 观察点整体待 A/B 去留。
+4.1.15 全程详见 `docs/4.1.15-adaptation.md` §5。
 
 ## 遗留问题（按优先级）
 
