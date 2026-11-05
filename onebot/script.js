@@ -123,6 +123,9 @@ function initAddresses() {
     // 4.1.13(structVer=3) 长链 push 入口(可选键): stn.cc __OnPush 函数头。稳态
     // (登录后短链 CGI 窗口关闭) newsync 全以长链 push 到达, 此处=收消息主路+第4出队点
     {{if .onPushAddr}}onPushAddr = baseAddr.add({{.onPushAddr}});{{end}}
+    // 4.1.15(可选实验键): 长链 SingleRespHandle 体内 fall-through 点。
+    // 函数头属 PAC 禁挂；此路是否必需待与 resp-dispatch 做禁用 A/B。
+    {{if .longlinkSrhAddr}}longlinkSrhAddr = baseAddr.add({{.longlinkSrhAddr}});{{end}}
     // [2026-10-07] 语音 force-legacy 闸门(可选键): 缺键=ptr(0)不挂, 语音走原路径
     {{if .tryMultiphaseAddr}}tryMultiphaseAddr = baseAddr.add({{.tryMultiphaseAddr}});{{end}}
 
@@ -406,6 +409,7 @@ var msgMapMgrGlobal = ptr(0);        // 4.1.13: msg-map manager this, 捕获点 
 var mgrCaptureAddr = ptr(0);         // 4.1.13: manager 捕获 hook 点(0x42e4c2c, H found 路径)
 var respDispatchAddr = ptr(0);       // 4.1.13: H 尾部响应分发点(0x42e5044, mov x0,x22)
 var onPushAddr = ptr(0);             // 4.1.13: 长链 push 入口(stn.cc __OnPush 头 0x59b0e94)
+var longlinkSrhAddr = ptr(0);        // 4.1.15: 长链 SingleRespHandle 体内实验点(去留待 A/B)
 var cndOnCompleteAddr;
 var imgMessageCallbackFunc;
 var videoMessageCallbackFunc;
@@ -1459,6 +1463,49 @@ function attachOnPushV3() {
     });
 }
 
+// 4.1.15 长链 SingleRespHandle 体内实验点(longlinkSrhAddr)。
+// 注意: 函数头属 PAC 禁挂；只能挂已验证的 fall-through 点。采样曾读出
+// len=1 小帧，聊天是否由此路转发尚未与 resp-dispatch 做隔离 A/B，故保留
+// 可选键但不宣称它是 4.1.15 主收消息口。读法: x1=AutoBuffer&, D=ab[0],
+// data=D[0], len=D+0xc(u32)，首字节 0x08 → protobuf_msg。
+function attachLonglinkSrhV3() {
+    if (longlinkSrhAddr.equals(ptr(0))) {
+        console.log("[*] JSON 缺 longlinkSrhAddr, 跳过长链 SRH 实验收消息点");
+        return;
+    }
+    console.log("[+] Hooking 长链 SRH V3 at: " + longlinkSrhAddr);
+    Interceptor.attach(longlinkSrhAddr, {
+        onEnter: function (args) {
+            // 只读 x1(0x5d4bc80 处 x19 已持有 arg1 副本), 不跑出队泵
+            var x1 = this.context.x1;
+            try {
+                var D = x1.readPointer();
+                var dataPtr = D.readPointer();
+                var dataLen = D.add(0xc).readU32();
+                if (dataLen < 4 || dataLen > MAX_FRIDA_MESSAGE_BYTES) {
+                    return;
+                }
+                var mem = null;
+                try { mem = dataPtr.readByteArray(dataLen); } catch (eR) { return; }
+                if (!mem) {
+                    return;
+                }
+                var uint8Array = new Uint8Array(mem);
+                if (uint8Array[0] !== 0x08) {
+                    return;
+                }
+                incomingTrafficSeen = true;
+                send({
+                    type: "protobuf_msg",
+                    data: Array.from(uint8Array),
+                });
+            } catch (e) {
+                // 热路径静默容错: 单条异常不能影响原生分发
+            }
+        }
+    });
+}
+
 // [已废弃] cmdid 注册表分发探针(0x4320b40): 收消息候选路由排查期探针,
 // resp-dispatch(0x42e5044) 实证为收发统一分发点后删除(2026-09-21)。
 
@@ -1468,6 +1515,7 @@ function attachReq2buf() {
         attachRespDispatchV3();
         attachSubmitCgiDrainV3();
         attachOnPushV3();
+        attachLonglinkSrhV3();
         return;
     }
     Interceptor.attach(req2bufEnterAddr, {
@@ -2327,24 +2375,36 @@ function triggerSendVoiceMessage(taskId, sender, receiver, protoHex, payloadHex)
 // -------------------------语音通话(VoIP)分区-------------------------
 // 2026-11-01 里程碑(docs/VOIP-CALL-STATUS.md §11/§13): 拨号 → 接通 → 给对方
 // 播一段 PCM → 挂断, 全链路走原生入口, 不需要通话窗口/麦克风/虚拟声卡。
-//   拨出: 0x1fc07f4(CLIENT, 被叫cstr, vector<string>*, 1, 0, "0x2e6981b3")
-//         CLIENT = baseAddr+0x9b93ab8 静态单例; [+0x28]=1 表示初始化完成,
+// 2026-11-04 4.1.15.55 适配: 地址+结构偏移全迁移(方法见 docs/version-upgrade.md
+// 语音通话地址迁移节); ce 对象内部字段整体 +8 平移(0x2c→0x34 等), svc→ce
+// 0xa10→0x9e0; av 块偏移按同规律 +8, 运行时格式读数(frameMs/rate 范围门)复核。
+//   拨出: 0x2172354(CLIENT, 被叫cstr, vector<string>*, 1, 0, "0x2e6981b3")
+//         CLIENT = baseAddr+0xa0598f8 静态单例; [+0x28]=1 表示初始化完成,
 //         为 0 时进入未初始化返回路径(不拨号) ⇒ 这里先查, 为 0 直接报错。
 //   挂断: ConfSDK svc->vt[12](svc, 1, 0)
-//   注入: ConfSDKdyn+0x7a370(svc, pcm, len, 24000, 1)   ← 声明采样率恒 24000
-//   静音麦克风: ConfSDKdyn+0x662e0([svc+8]+0xa10, 1)    ← 不调音调 ×1.5 偏快
+//   注入: ConfSDKdyn+0x7d2fc(svc, pcm, len, 24000, 1)   ← 声明采样率恒 24000
+//   静音麦克风: ConfSDKdyn+0x691f4([svc+8]+0x9e0, 1)    ← 不调音调 ×1.5 偏快
 //
-// ⚠️ 帧长**每通电话现算**, 不能写死: 引擎格式从 [svc+8]+0xa10(地址)+8 取 mvq,
-//    再 mvq-8 读 +0x234(frameMs) / +0x254(采样率) / +0x258(声道);
+// ⚠️ 帧长**每通电话现算**, 不能写死: 引擎格式从 [svc+8]+0x9e0(地址)+8 取 mvq,
+//    再 mvq-8 读 +0x23c(frameMs) / +0x25c(采样率) / +0x260(声道);
 //    每帧样本数 = frameMs*采样率*声道/1000, 字节数 = 样本数*2(s16le)。
 //    设备采样率是每通协商出来的(实测 16000 / 48000 都出现), 写死 960B 打 48k
 //    通话会导致每 20ms 只有 1/3 有声 → 对方听到间歇空白。
 // ⚠️ 不挂钩子: 音频引擎相关入口是 PAC 间接调用目标, 一挂必崩 AudioIOThread。
-var VOIP_CLIENT_OFF = "0x9b93ab8";
-var VOIP_DIAL_OFF = "0x1fc07f4";
+var VOIP_CLIENT_OFF = "0xa0598f8";
+var VOIP_DIAL_OFF = "0x2172354";
 var VOIP_CONF_ARG = 0x1352707;
-var VOIP_PUT_OFF = "0x7a370";
-var VOIP_MUTE_OFF = "0x662e0";
+var VOIP_PUT_OFF = "0x7d2fc";
+var VOIP_MUTE_OFF = "0x691f4";
+// 结构偏移(4.1.15.55, ConfSDKdyn 内; 4.1.13 值见括号, 迁移时对照新版 veneer/
+// GetAudioData 函数体偏移重定):
+var VOIP_CE_OFF = "0x9e0";            // [svc+8]+CE_OFF = confEngine (旧 0xa10)
+var VOIP_CE_STARTTALK_OFF = 0x34;     // ce+.. = startTalkFlag (旧 0x2c)
+var VOIP_AV_FRAMEMS_OFF = 0x23c;      // av+.. = frameMs (旧 0x234)
+var VOIP_AV_RATE_OFF = 0x250;         // av+.. = 采集采样率 (旧 0x248)
+var VOIP_AV_ENGRATE_OFF = 0x25c;      // av+.. = 引擎采样率 (旧 0x254)
+var VOIP_AV_ENGCH_OFF = 0x260;        // av+.. = 声道 (旧 0x258)
+var VOIP_AV_PULLBYTES_OFF = 0x2328;   // av+.. = 每拉字节数 (旧 0x2320)
 var voipKeep = [];
 var voipCall = null; // 当前注入会话
 var voipLast = null; // 上一通注入的结果摘要(供 Go 侧轮询收尾)
@@ -2467,7 +2527,7 @@ function voipMuteMic(svc, tag) {
     try {
         var mf = new NativeFunction(voipConfModule().base.add(VOIP_MUTE_OFF), "int",
             ["pointer", "int"]);
-        var r = mf(svc.add(8).readPointer().add(0xa10), 1);
+        var r = mf(svc.add(8).readPointer().add(VOIP_CE_OFF), 1);
         console.log("[voip] muteMic(" + tag + ") ret=" + r);
         return r;
     } catch (e) {
@@ -2492,12 +2552,12 @@ function triggerVoipHangup() {
 // 拨号前 mvqqEngine 还是 0x0, 读不到 ⇒ 返回 null, 调用方稍后重试。
 function voipEngineFrame(svc) {
     try {
-        var mv = svc.add(8).readPointer().add(0xa10).add(8).readPointer();
+        var mv = svc.add(8).readPointer().add(VOIP_CE_OFF).add(8).readPointer();
         if (mv.isNull()) return null;
         var av = mv.sub(8);
-        var frameMs = av.add(0x234).readU32();
-        var engRate = av.add(0x254).readU32();
-        var engCh = av.add(0x258).readU32();
+        var frameMs = av.add(VOIP_AV_FRAMEMS_OFF).readU32();
+        var engRate = av.add(VOIP_AV_ENGRATE_OFF).readU32();
+        var engCh = av.add(VOIP_AV_ENGCH_OFF).readU32();
         if (!(frameMs >= 5 && frameMs <= 60)) return null;
         if (!(engRate >= 8000 && engRate <= 96000)) return null;
         if (engCh !== 1 && engCh !== 2) engCh = 1;
@@ -2695,8 +2755,8 @@ function voipStatus() {
 // 已知怪癖: 部分通话里 42% 帧是 16bit 字节交换的真语音(疑 HW/SW 解码双路径),
 //   LE 读成满幅白噪 ⇒ 运行时判别(maL>6000 且 maB*4<maL)成对交换修正。
 // 时间轴保留: 每拍必写 x2 字节(引擎没数据就写零), 静音段不丢。
-var VOIP_GETAUDIO_OFF = "0x4dba8";   // ConfEngine::GetAudioData(ce, buf, x2, &out)
-var VOIP_SETPLAY_OFF = "0x67fdc";    // ConfEngine::SetAudioPlayStatus(ce, mid, st)
+var VOIP_GETAUDIO_OFF = "0x5053c";   // ConfEngine::GetAudioData(ce, buf, x2, &out)
+var VOIP_SETPLAY_OFF = "0x6aee4";    // ConfEngine::SetAudioPlayStatus(ce, mid, st)
 var voipCap = null;                  // 当前采集会话
 var voipCapLast = null;              // 上一通采集摘要(Go 收尾用)
 
@@ -2704,13 +2764,13 @@ function voipCaptureEngine() {
     // 返回 {ce, av, pullBytes, rate, frameMs} 或 null(引擎未就绪)
     try {
         var svc = voipService();
-        var ce = svc.add(8).readPointer().add(0xa10);
+        var ce = svc.add(8).readPointer().add(VOIP_CE_OFF);
         if (ce.add(8).readPointer().isNull()) return null;
-        if (ce.add(0x2c).readU32() < 1) return null;
+        if (ce.add(VOIP_CE_STARTTALK_OFF).readU32() < 1) return null;
         var av = ce.add(8).readPointer().sub(8);
-        var pullBytes = av.add(0x2320).readU32();
-        var rate = av.add(0x248).readU32();
-        var frameMs = av.add(0x234).readU32();
+        var pullBytes = av.add(VOIP_AV_PULLBYTES_OFF).readU32();
+        var rate = av.add(VOIP_AV_RATE_OFF).readU32();
+        var frameMs = av.add(VOIP_AV_FRAMEMS_OFF).readU32();
         if (!(pullBytes > 0 && pullBytes <= 8192)) return null;
         if (!(rate >= 8000 && rate <= 96000)) return null;
         if (!(frameMs >= 5 && frameMs <= 60)) return null;
@@ -2763,7 +2823,7 @@ function voipCaptureStart(optsJson) {
     function tick() {
         if (!voipCap || voipCap !== c || c.phase !== "run") return;
         var st = 0;
-        try { st = c.ce.add(0x2c).readU32(); } catch (e) { }
+        try { st = c.ce.add(VOIP_CE_STARTTALK_OFF).readU32(); } catch (e) { }
         if (st < 1) { voipCaptureFinish("call-end"); return; }
         if (Date.now() - c.t0 > c.maxSeconds * 1000) { voipCaptureFinish("max"); return; }
         var x2 = c.pullBytes;

@@ -80,8 +80,12 @@ func consumeBytesFields(raw []byte, field protowire.Number) [][]byte {
 }
 
 // parseAllRecvData 从 WxRecvMsg 原始字节里提取所有消息数据。
-// 结构: WxRecvMsg.wrapper(field2) -> wrapper.body(field2, 可重复) -> body.content.data
+// 已知形状: WxRecvMsg.wrapper(field2) -> wrapper.body(field2, 可重复) -> body.content.data
 // 一个 wrapper 里可能打包多条 body，需要全部取出。
+// 严格路径优先，失败时再做形状无关递归扫描：深度优先遍历全部
+// length-delimited 字段，凡能解出带有效 sender/content 的 WxRecvMsgBody
+// 或 WxRecvMsgData 节点均收集。用于兼容新增信封层/字段号变化，4.1.13
+// 已知路径保持优先、零回归；4.1.15 收发回归见 docs/4.1.15-adaptation.md。
 func parseAllRecvData(rawBytes []byte) []*wxproto.WxRecvMsgData {
 	var result []*wxproto.WxRecvMsgData
 	for _, wrapperRaw := range consumeBytesFields(rawBytes, 2) {
@@ -95,27 +99,92 @@ func parseAllRecvData(rawBytes []byte) []*wxproto.WxRecvMsgData {
 			}
 		}
 	}
-	return result
+	if len(result) > 0 {
+		return result
+	}
+	seen := make(map[string]bool)
+	return findRecvBodiesRecursive(rawBytes, 0, seen)
+}
+
+// findRecvBodiesRecursive 深度优先遍历所有 length-delimited 字段找 WxRecvMsgBody。
+func findRecvBodiesRecursive(raw []byte, depth int, seen map[string]bool) []*wxproto.WxRecvMsgData {
+	if depth > 6 || len(raw) < 2 || len(raw) > 1<<22 {
+		return nil
+	}
+	var out []*wxproto.WxRecvMsgData
+	if d := tryRecvBody(raw, seen); d != nil {
+		out = append(out, d)
+	}
+	for _, child := range allBytesFields(raw) {
+		out = append(out, findRecvBodiesRecursive(child, depth+1, seen)...)
+	}
+	return out
+}
+
+// tryRecvBody 尝试把节点解成 WxRecvMsgBody，要求 Content.Data 带有效
+// sender/content（防随机字节误报），按 msgId+sender+create_time 去重。
+// 兼容形态②: 节点本身直接是 WxRecvMsgData（无 Body 包装层）。
+func tryRecvBody(raw []byte, seen map[string]bool) *wxproto.WxRecvMsgData {
+	body := &wxproto.WxRecvMsgBody{}
+	if err := proto.Unmarshal(raw, body); err != nil {
+		return nil
+	}
+	if body.Content != nil && body.Content.Data != nil {
+		if d := validRecvData(body.Content.Data, seen); d != nil {
+			return d
+		}
+	}
+	// 形态②: 节点直接是 WxRecvMsgData
+	data := &wxproto.WxRecvMsgData{}
+	if err := proto.Unmarshal(raw, data); err != nil {
+		return nil
+	}
+	return validRecvData(data, seen)
+}
+
+func validRecvData(d *wxproto.WxRecvMsgData, seen map[string]bool) *wxproto.WxRecvMsgData {
+	if d.Sender == nil || d.Sender.Value == "" || d.Content == nil || d.Content.Value == "" {
+		return nil
+	}
+	key := fmt.Sprintf("%d:%s:%d", d.MsgId, d.Sender.Value, d.CreateTime)
+	if seen[key] {
+		return nil
+	}
+	seen[key] = true
+	return d
+}
+
+// allBytesFields 返回节点内全部 wiretype==2 字段值（不限字段号）。
+func allBytesFields(raw []byte) [][]byte {
+	var out [][]byte
+	for len(raw) > 0 {
+		num, typ, n := protowire.ConsumeTag(raw)
+		if n < 0 {
+			break
+		}
+		raw = raw[n:]
+		if typ == protowire.BytesType {
+			v, m := protowire.ConsumeBytes(raw)
+			if m < 0 {
+				break
+			}
+			out = append(out, v)
+			raw = raw[m:]
+			continue
+		}
+		m := protowire.ConsumeFieldValue(num, typ, raw)
+		if m < 0 {
+			break
+		}
+		raw = raw[m:]
+	}
+	return out
 }
 
 func HandleProtobufMsg(payload map[string]interface{}) ([][]byte, error) {
-	dataInter, ok := payload["data"]
-	if !ok {
-		return nil, fmt.Errorf("protobuf_msg: missing data field")
-	}
-
-	dataArr, ok := dataInter.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("protobuf_msg: data is not array")
-	}
-
-	rawBytes := make([]byte, len(dataArr))
-	for i, v := range dataArr {
-		num, ok := v.(float64)
-		if !ok {
-			return nil, fmt.Errorf("protobuf_msg: data[%d] is not number", i)
-		}
-		rawBytes[i] = byte(int(num))
+	rawBytes, err := payloadRawBytes(payload)
+	if err != nil {
+		return nil, err
 	}
 
 	//fmt.Println("[receive protobuf data]", HexDump(rawBytes, 0))
@@ -143,6 +212,27 @@ func HandleProtobufMsg(payload map[string]interface{}) ([][]byte, error) {
 	}
 
 	return jsonList, nil
+}
+
+// payloadRawBytes 从 frida send() 的 payload 里取 data 字节数组。
+func payloadRawBytes(payload map[string]interface{}) ([]byte, error) {
+	dataInter, ok := payload["data"]
+	if !ok {
+		return nil, fmt.Errorf("protobuf_msg: missing data field")
+	}
+	dataArr, ok := dataInter.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("protobuf_msg: data is not array")
+	}
+	rawBytes := make([]byte, len(dataArr))
+	for i, v := range dataArr {
+		num, ok := v.(float64)
+		if !ok {
+			return nil, fmt.Errorf("protobuf_msg: data[%d] is not number", i)
+		}
+		rawBytes[i] = byte(int(num))
+	}
+	return rawBytes, nil
 }
 
 // buildWechatMessageJSON 把单条 WxRecvMsgData 转成 WechatMessage JSON。

@@ -132,6 +132,19 @@ trio 无任何静态引用)——回调在运行时注册进堆对象, IDA 静�
 9. **syscall 泵有边界**: hook 挂载前已 park 在阻塞 syscall 里的线程对 entry hook
    不可见, 纯 blackout 场景泵救不了——需长超时保质+长链 push 事件兜底
    (4.1.13 出队泵设计, 见 4.1.13 细档 §8)。
+10. **DIAG 自己必须先证明无害**。strict-mode JS 禁止
+    `typeof X === "undefined" { X = 0 }` 这种未声明赋值：它抛 ReferenceError，
+    会中止**整个 onEnter，包括生产转发**。计数器一律顶层 `var X=0`；每次加 DIAG
+    先查 `[JS日志报错]`，零采样不能直接解释成零调用（4.1.15 最大弯路）。
+11. **探针并入 onebot 的单 gadget 会话**。禁止第二个并发 frida attach，更禁止
+    pkill 拆它；4.1.15 实测二次会话拆除触发 G 类竞态崩宿主。改探针=改 script.js
+    后整链重启，不在存活微信上反复起停 onebot。
+12. **PAC 禁挂清单新增 llSRH 函数头**（4.1.15 头 0x5d4bc48）：挂上 4s 后
+    mars::stn 在 H 尾 blr 崩，毒值 0x7269775f6966698f。需要观测时选已验证的
+    体内 fall-through 点；非 pacibsp 序言也不代表可以安全头挂。
+13. **本地 app 复制先处理只读权限再去隔离属性**：
+    `find ... -type f ! -writable -exec chmod u+w {} +` 后才可
+    `xattr -dr com.apple.quarantine`，否则 Gatekeeper 可能启动时删 app。
 
 ### 验收期媒体链路(2026-09-20 4.1.12 实战)
 
@@ -269,6 +282,29 @@ curl -X POST -H "Content-Type:application/json" \
   ground truth 尺寸(0x80 vs 0x3F8 制造两轮次生崩溃); ③JSON 地址落地必校验
   函数序言(中段地址伪象浪费半天)。
 
+### 4.1.15.55 适配复盘（2026-11-04，详见 4.1.15-adaptation.md）
+
+- **结果**: 22 键 addrfind 全中，V3 无身份换位；文本/图片/视频/语音/文件发送
+  在登录 >15 分钟后五连测全 ack，文本/图片/语音/文件接收与落盘全通。VoIP 拨号/
+  接听/挂断正常，但注入 -405909、格式 raw=null、采集未启动，留待后续。
+- **先查低级错误，再谈架构变化**: 登录账号/容器、onebot cwd（script.js 是运行时
+  从 `./script.js` 读取）、本地保存目录、真实 ack/实收都要先核。语音“接收失败”
+  最后一项只是 `/tmp` audio 目录不存在。
+- **观测代码会改变观测结果**: 毒 DIAG 曾同时杀死 OnPush 与 resp-dispatch 的生产
+  逻辑，制造“传输迁移”假象。诊断代码必须与生产代码同等审查。
+- **每轮只改一个变量**: 拔毒 DIAG、Go 递归解析、llSRH 观察点同轮上线，虽然恢复
+  接收，却不能据此声称“4.1.15 信封必然改形”。需要最小 A/B 分离贡献。
+- **日志时间相邻不是路径证明**: srh len=1 小帧会被 `<4` 生产门丢弃，却曾因与
+  Go 聊天日志同秒被误认为来源。给 `protobuf_msg` 发送点加来源 ID，或禁用某路做
+  A/B，才能决定 hook 去留。
+- **失败样本先分类**: 403B hexdump 是 ambient 同步控制包，不是聊天；不要据它
+  改 WxRecvMsg 解析器。测试采样要带来源/cmdid/时间，并对齐用户所发内容。
+- **不可复现的服务端错误不盲修**: 文件 sendappmsg 早期两次 ret=-2，同代码后来
+  对 ludaohe/filehelper 均 ret=0 且实收可打开。先保存响应 hex、重试与确认实收，
+  不把瞬时失败写成协议漂移。
+- **静态推断必须有运行时验收**: VoIP av 块 +8 只是由函数体偏移推得；一通实测
+  即暴露格式门不通过。下次先读运行时指针链和字段真值，不盲换函数地址。
+
 ## 维护约定
 
 - 新版本 JSON 命名 `wechat_version/4_1_XX_YY_mac.json`, 键序与 4.1.11 一致
@@ -276,6 +312,11 @@ curl -X POST -H "Content-Type:application/json" \
 - 用户全局规则: git reset 须审批; Agents.md 不要改(有变更只提交)
 - **gadget 会话预算**: 反复重启 onebot 会耗尽 gadget 内部会话(控制通道整体卡死,
   只能重启微信)。改 script.js 批量改完再重启, 别改一处重启一次
+- **onebot 启动目录固定为 `onebot/`**: script.js 是运行时 `os.ReadFile("./script.js")`，
+  从仓库根目录启动会直接 FATAL；改 JS 无需重编，改 Go 才重编。
+- **新增 JSON 键**: Go `wechatHookConf` 是 map 直传模板，通常无需改 Go 结构；但
+  script.js 必须同时有 `var key=ptr(0)` 和对应 `{{if .key}}...{{end}}` 模板行，
+  缺模板行时运行时永远是 0。
 - **bundle ID 单例**: 日常 4.1.13 在跑时 `open` 4.1.12 是空操作(只激活已有实例),
   必须 `open -n`; 登录前先 `ps` 确认进程路径是 WeChat-4.1.12.app
 
@@ -293,7 +334,7 @@ curl -X POST -H "Content-Type:application/json" \
 | 常量 | 值(4.1.13.63) | 语义 | 找法 |
 |---|---|---|---|
 | VOIP_CLIENT_OFF | `0x9b93ab8` | VoIP 客户端静态单例(__DATA) | 拨号函数的 adrp+add 装载目标(见下行) |
-| VOIP_DIAL_OFF | `0x1fc07f4` | 原生客户端拨号 `(client, 被叫cstr, vector*, 1, 0, 0x2e6981b3)` | **常量锚**: 函数内出现魔数 `0x2e6981b3`(movz/movk 拼装) + 读 `[x0+0x28]` 初始化标志 + 构造 24B string vector。全切片搜 `0x2e6981b3` 的立即数拼装序列, 目视确认调用形 |
+| VOIP_DIAL_OFF | `0x1fc07f4` | 原生客户端拨号 `(client, 被叫cstr, vector*, 1, 0, 0x2e6981b3)` | **不要用魔数静态搜**（4.1.15 已证伪：二进制无该 movz/movk 拼装或字面池）。用 `add x?,x0,#0x28` 初始化标志访问 + `ldarb` 特征对 + 函数序言指纹定位，再确认调用形 |
 
 **ConfSDKdyn 框架(4 个函数偏移, script.js `VOIP_PUT_OFF` 等)**:
 版本升级会同时换掉 app 内的 `ConfSDKdyn.framework`, 这 4 个全部要重找。
@@ -322,10 +363,14 @@ curl -X POST -H "Content-Type:application/json" \
 ```
 1. lipo -thin arm64 ConfSDKdyn.framework/Versions/A/ConfSDKdyn -o /tmp/conf-new.dylib
 2. 每个 锚字符串 → 在切片里搜得偏移 S
-3. objdump 全量 | grep "adr.*<S>" 得引用点 → 向上回溯最近的
-   sub sp/stp x29 函数头 = 函数地址(带字符串的就是可调用体, Put 例外:
-   字符串落在 impl, 还要反向找谁 bl/b 到 impl 链上的 svc thunk)
-4. wechat.dylib: 搜 0x2e6981b3 立即数拼装 → 确认 dial fn → 读其 adrp+add 得 CLIENT
+3. objdump 全量 | grep "adr.*<S>" 得引用点 → 向上回溯函数头。
+   头部可为 pacibsp 或任意寄存器对的 `stp xA,xB,[sp,#-N]!`；
+   前一条可以是 `b*`（含 bl），不能只认 ret。Put 例外：锚字符串落在 impl，
+   还要反向找谁 bl/b 到 impl 链上的 svc thunk。capstone 线性反汇编撞
+   __cstring 数据后要在失败地址 +4 重启，不能因一次停止就报 refs=[]。
+4. wechat.dylib: 用 DIAL 的 `add x?,x0,#0x28` + `ldarb` + 序言指纹定位；
+   再用字节级 BL caller 扫描找调用者，从调用者的单例装载簇确认 CLIENT。
+   **禁止搜 0x2e6981b3 立即数**（该值历史上来自运行时 probe 捕获）。
 5. 把 6 个新值改进 onebot/script.js VoIP 分区常量(值+锚注释都在)
 ```
 
