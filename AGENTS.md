@@ -96,7 +96,12 @@ for programmatic message sending and receiving.
   recorder artifact") is withdrawn in §17.9. Dev-copy caution: calling the
   public native record entry (`ConfSDKdyn+0x7eb18`) latches the engine into
   external-device mode 1 **for the whole process** (microphone capture
-  bypassed); a WeChat restart is required to clear it.
+  bypassed); a WeChat restart is required to clear it. **Restart WeChat before
+  validating the gate** — while latched the microphone path is already bypassed,
+  so the control round may also show 0 holes and the A/B loses its meaning (run
+  the control round first and confirm it reproduces ~59 % / 18 ms holes). Verify recordings with
+  `tools/voip/verify_recording.py`: 0 holes alone is not enough, the envelope
+  correlation against the source must be ≥ 0.7 as well.
 - `watchdog/`: authoritative copy of the auto-restart watchdog
   (`wechat-watchdog.sh` + `ocr_allow.py` + `ocr_selftest.sh`). The deployed
   copy lives at `~/Prog/wxgate/` on mac-m1; keep both in sync.
@@ -108,7 +113,8 @@ for programmatic message sending and receiving.
 - `tools/voip`: VoIP-call reverse-engineering toolchain (`strxref`/`voipwalk`/
   `voipclimb` static analysis, `voipprobe` frida-go runner, probe1–43 session
   scripts, `run_probe.py` probe driver, `invite_payload.py` invite template
-  splicer, per-session logs). Dev clone: `~/Applications/WeChat-4.1.13.app`
+  splicer, `verify_recording.py` call-recording acceptance: holes / duty cycle
+  plus envelope correlation against the source audio; per-session logs). Dev clone: `~/Applications/WeChat-4.1.13.app`
   (same 4.1.13.63 binary as production, addresses transfer 1:1). Run probes
   with `run_probe.py` (the frida CLI buffers redirected output; its log is
   append-only — offset grep by line number for fresh events; trigger files

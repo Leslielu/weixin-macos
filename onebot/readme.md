@@ -84,8 +84,10 @@ curl -X POST -H "Content-Type:application/json" \
 
 完整字段、响应与示例见 [docs/VOICE-CALL-API.md](../docs/VOICE-CALL-API.md)。
 
-注意：同一时刻只允许一通；出站放音 + 入站采集（record）均已可用。
-链路细节与标定见 [docs/VOIP-CALL-STATUS.md](../docs/VOIP-CALL-STATUS.md) §13。
+注意：同一时刻只允许一通；出站放音、入站采集（record）、入站播放（`voice`/`text`，
+2026-11-07 起默认 `mic_gate:true`）均已可用。入站播放的门控语义与验收方法见
+[docs/VOIP-CALL-STATUS.md](../docs/VOIP-CALL-STATUS.md) §17.9。
+链路细节与标定见同文档 §13。
 
 ## 接入openclaw
 ```

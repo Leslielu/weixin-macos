@@ -157,23 +157,31 @@ curl -X POST http://127.0.0.1:58080/hangup_voice_call
 
 ## 4. POST /voice_call_inbound —— 布防被叫自动接听
 
-布防后来电自动接听 → 可采集对方（录音）/ 实验性播放 → 挂断。
+布防后来电自动接听 → 可采集对方（录音）/ 播放给定音频或 TTS → 挂断。
 一次布防默认只接一通，窗口期内无来电自动解除。
+
+> 接听方播放的周期性空洞已于 2026-11-07 修复（`mic_gate`，根因与标定见
+> `docs/VOIP-CALL-STATUS.md` §17.9）：原生麦克风 20ms 数字静音帧会与注入帧交替,
+> 门控后同一录音器 0 洞 / 100% 占空比。
 
 ### 请求体
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `enabled` | bool | `false` | `false` = 解除布防 |
-| `voice` / `text` / `tts_voice` | string | — | 接听后播放（**实验性**），同出站 |
+| `voice` / `text` / `tts_voice` | string | — | 接听后播放，同出站（音符帧按协商格式现算） |
 | `record` | bool | `false` | 接听后采集对方音频并落 WAV |
 | `max_seconds` | int | `120` | 单通上限，到点自动挂断 |
 | `answer_delay_ms` | int | `1200` | 来电到接听的延时 |
 | `window_seconds` | int | `300` | 布防窗口，超时无来电自动解除 |
 | `multi` | bool | `false` | 窗口内连续来电都接 |
 | `mute_mic` | bool | `true` | 接听后静音本机麦克风 |
+| `mic_gate` | bool | `true` | 播放时阻断原生麦克风生产源（§17.9）。**传 `false` 只用于对照实验**：空洞会回来（~59% 占空比） |
 | `hangup` | bool | `true` | 播完是否自动挂断 |
 | `record_seconds` | int | — | 兼容字段，实际随通话时长 |
+
+`mic_gate` 开启时，播放期间本机麦克风完全不进混音（与 `mute_mic` 语义一致：播报即静音）；
+需要"边播边传麦克风"目前不支持（mixer 层无混音口）。纯录音（不带 voice/text）不受影响。
 
 实验参数（一般不用动）：`callee40`、`start_delay_ms`、`content_rate_div`、
 `no_pad`、`load_rate`、`feed_interval_ms`、`full_frame`、`declared_rate`。
@@ -197,7 +205,7 @@ curl -X POST http://127.0.0.1:58080/voice_call_inbound \
 ```json
 {"status":"ok","armed":true,"record":true,"play":false,
  "max_seconds":120,"window_seconds":600,
- "note":"接听方播放为实验特性(已知空洞问题), 录音不受影响"}
+ "note":"接听方播放已按 §17.9 修复(麦克风生产源门控, mic_gate 可关), 录音不受影响"}
 ```
 
 出站通话进行中布防会被拒绝：`{"status":"failed","message":"出站通话进行中, 无法布防入站接听"}`。
@@ -243,8 +251,9 @@ curl http://127.0.0.1:58080/voice_call_inbound_status
 
 1. **录音是接听方下行**。采集自接通起武装，但引擎就绪可能比接通晚几秒，
    `record_seconds` 计的是真正开始拉流之后的时间——短录音要给余量。
-2. **入站接听里给对方放音仍是实验特性**（§17.8 的 40ms 节拍问题，实听为轻微抖动）；
-   出站放音是已验收的稳定路径。
+2. **入站接听里给对方放音已可用**（2026-11-07 修复 §17.9：`mic_gate` 默认开，
+   录音验收 0 洞 / 100% 占空比；门控期间本机麦克风不进混音）。出站放音仍是最稳的路径。
+   注意它依赖版本 JSON 的 `voipMicGateAddr`/`voipMicGateModeOff`，缺键会**静默**退回旧行为。
 3. **运行依赖**：`ffmpeg`（音频转 PCM）、macOS `say`（TTS）、`python3 + pilk`（语音消息编码，
    onebot 启动即自检）。缺 ffmpeg 时 `voice`/`text` 路径直接报错。
 4. 拨号会拉起微信自带的通话状态机与音频引擎；被对方拒接/未接会走 `timeout` 分支并挂断。

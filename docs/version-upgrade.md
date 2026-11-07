@@ -328,10 +328,13 @@ curl -X POST -H "Content-Type:application/json" \
 
 ## 语音通话地址迁移(2026-11-02 增补, 适配 4.1.13.63)
 
-> **盲区警告**: 语音通话的地址**不在 `wechat_version/*.json` 里**, 是 `onebot/script.js`
+> **盲区警告**: 语音通话的**函数地址不在 `wechat_version/*.json` 里**, 是 `onebot/script.js`
 > 顶部的硬编码常量(VoIP 分区 `VOIP_*_OFF`)——addrfind/JSON 流程管不到它们。
 > 每次升级除了 JSON 18 键, **必须人工迁移这一组**, 否则 `/send_voice_call` 直接坏
 > (拨号段错误/注入失败/采集 -1)。通话类故障先读 `docs/VOIP-CALL-STATUS.md`。
+>
+> 例外(2026-11-07 起): **麦克风门控**的两个键在 JSON 里(`voipMicGateAddr` /
+> `voipMicGateModeOff`), 与 18 键一起走 JSON 流程, 见文末「麦克风门控迁移」。
 
 ### 地址清单(共 6 函数偏移 + 1 结构图, 分属两个二进制)
 
@@ -387,6 +390,36 @@ MultiMediaDyn 的注入实现（旧版 0x1f8018，经 `sub x0,x0,#8` thunk）和
 5. 把 6 个新值改进 onebot/script.js VoIP 分区常量(值+锚注释都在)
 ```
 
+### 麦克风门控迁移(2026-11-07 增补, JSON 可选键)
+
+接听方播放文件时, 原生麦克风以 50 帧/s 产出 20ms 数字静音帧, 与注入帧交替 ⇒ 每 40ms
+一个 ~19ms 洞(占用 ~59%)。在录音回调入口把引擎 mode 字写 2 可让该回调直接返回、
+不再转发麦克风帧(`docs/VOIP-CALL-STATUS.md` §17.9)。
+
+| JSON 键 | 4.1.15.55 | 4.1.13.63(静态, 未验证) | 语义 |
+|---|---|---|---|
+| `voipMicGateAddr` | `0x795c4` | `0x78050` | `MultiMediaDyn` 内 `XVE_RecordDevDataCallBack` 偏移 |
+| `voipMicGateModeOff` | `0x75cc` | `0x7504` | 该回调读取的引擎 mode 字偏移(eng+off) |
+
+**两个键必须成对**: 缺任一 → 模板渲染成空串 → 门控静默禁用(音乐照放, 洞回来, 无报错)。
+
+版本内定位法(与 ConfSDKdyn 锚字符串法同源):
+
+```
+1. strings -a MultiMediaDyn 找 "XVE_RecordDevDataCallBack"(回调体内的日志 tag)
+2. 反汇编找 adrp+add 引用该字符串的函数头 → 即回调(4.1.15 为 0x795c4)
+3. 函数头附近应有 `mov w8,#<modeOff>; add x20,x0,x8`, 该立即数就是 voipMicGateModeOff
+   (4.1.15 为 0x75cc; 4.1.13 为 0x7504)
+4. 确认分派: 读 [x20] 后 `cmp w8,#1 / b.eq <另一 impl> / cbnz -> ret 0`,
+   mode==0 分支尾随 `b <mic 混音实现>`(4.1.15: 0x1a92b8; mode-1: 0x1b95dc)
+5. 同文件里 XVE_PlayDevDataCallBack(4.1.15: 0x79720)**不要**填进来
+```
+
+**静默失效风险**: 这两个键不在 addrfind 的 18 键里, JSON 缺键不会报错。升级后如果只做
+消息收发回归, 空洞问题会带着旧症状回来且无日志线索。升级验收时按 `VOIP-CALL-STATUS.md`
+§17.9 D 的配方跑一轮(0 洞/100%/env_corr≥0.7), 并确认日志出现
+`[+] Hooking VoIP micGate at MultiMediaDyn+0x...` 与 `[voip] micGate begin mode=0→2`。
+
 ### 验证(三级, 全过才算迁移完成)
 
 1. **静态**: 每个候选 objdump ±0x40, 对照 4.1.13.63 的调用形(参数寄存器/门禁序列)
@@ -395,6 +428,10 @@ MultiMediaDyn 的注入实现（旧版 0x1f8018，经 `sub x0,x0,#8` thunk）和
 3. **一通实测**(开发副本拨真号): dial ret=1 → 接通 → 注入对方**听得到** →
    muteMic(answered) ret=0 → record 采集帧 ret≥0 且 WAV 有真人声 → 挂断干净无崩溃。
    采集 -1 = x2/结构偏移错; 注入无声 = PUT_OFF/格式错; 拨号即崩 = DIAL_OFF/CLIENT 错。
+4. **接听方播报复核**(启用 mic_gate 时): 布防播固定样本 → 对方拨号并录下行 →
+   `tools/voip/verify_recording.py rec.wav --src test-assets/test-voice.wav`
+   得 0 洞 / duty≈100% / env_corr≥0.7; 日志有 `micGate begin` 与 `micGate end`
+   且 `writes≈callbacks`。**前提: 微信是新进程**(mode-1 锁存会让对照轮也零洞)。
 
 实测细节与全部坑(字节交换帧/静音帧/响铃期采集)见 `docs/VOIP-CALL-STATUS.md` §13/§16;
 通话中崩溃查 `docs/crash-history.md`(PAC 禁挂清单也在那/CLAUDE.md)。

@@ -32,3 +32,6 @@ __pycache__/
 # voip 逆向工具链的产物与原始会话日志 (源码保留)
 tools/voip/voipprobe
 tools/voip/probe*.log
+onebot/voice_records/
+onebot/cdn_video_keys.json
+/log/

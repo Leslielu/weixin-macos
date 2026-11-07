@@ -22,7 +22,7 @@ WeChat macOS reverse engineering project. Hooks WeChat's underlying message send
 - `onebot/` - Go service implementing OneBot protocol (HTTP/WebSocket)
 - `tools/` - 逆向/分析工具：
   - `addrfind` - 跨版本地址迁移（方法论见 docs/version-upgrade.md）
-  - `voip` - VoIP 语音通话逆向工具链（strxref/voipwalk/voipclimb 静态分析 + voipprobe runner + probe1-43 探针演进 + run_probe.py 探针驱动 + invite_payload.py 报文拼装），做通话相关工作先读 docs/VOIP-CALL-STATUS.md
+  - `voip` - VoIP 语音通话逆向工具链（strxref/voipwalk/voipclimb 静态分析 + voipprobe runner + probe1-43 探针演进 + run_probe.py 探针驱动 + invite_payload.py 报文拼装 + verify_recording.py 通话录音验收：洞数/占空比/与源包络相关），做通话相关工作先读 docs/VOIP-CALL-STATUS.md
 - `idapro/` - IDA Pro Python analysis scripts
 - `wechat_version/` - Memory address configs for different WeChat versions (JSON)
 - `frida-gadget/` - Alternative approach for systems without SIP disabled
@@ -161,6 +161,9 @@ Each WeChat version requires specific memory offsets in `wechat_version/*.json`.
   4.1.13 地址为静态定位、未运行时验证。
   **开发副本注意**：调过公开原生录音入口
   `0x7eb18` 后引擎被锁 mode-1（进程级持久、麦克风被旁路），重启微信才恢复。
+  **验门控前必须重启微信清锁存**——锁存状态下麦克风通路已被旁路，对照轮可能同样零洞，
+  A/B 会失真（先跑对照轮确认能复现 ~59% 再用它判门控）。
+  录音验收用 `tools/voip/verify_recording.py`（0 洞 ≠ 内容对，还要 env_corr≥0.7）。
 - For OpenClaw integration, see `onebot/readme.md`
 
 ## IDA Pro Usage
