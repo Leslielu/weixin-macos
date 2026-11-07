@@ -21,5 +21,7 @@
   "uploadOnCompleteAddr": "0x5ab7f04",
   "downloadImagAddr": "0x5c28368",
   "downloadFileAddr": "0x5bc76f4",
-  "downloadVideoAddr": "0x5be2268"
+  "downloadVideoAddr": "0x5be2268",
+  "voipMicGateAddr": "0x795c4",
+  "voipMicGateModeOff": "0x75cc"
 }

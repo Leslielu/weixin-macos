@@ -31,7 +31,8 @@ var (
 	voiceCallBusy atomic.Bool // 供 /voice_call_status 查询(不加锁读)
 
 	// 预生成的采样率各档(覆盖常见协商结果)
-	voipPCMRates = []int{16000, 44100, 48000}
+	// 8000/24000 是接听方自适应降采样后的目标(JS 兜底重采样有混叠, 人声会发尖)
+	voipPCMRates = []int{8000, 16000, 24000, 44100, 48000}
 )
 
 // VoiceCallRequest /send_voice_call 请求体

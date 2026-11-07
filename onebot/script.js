@@ -2396,6 +2396,14 @@ var VOIP_DIAL_OFF = "0x2172354";
 var VOIP_CONF_ARG = 0x1352707;
 var VOIP_PUT_OFF = "0x7d2fc";
 var VOIP_MUTE_OFF = "0x691f4";
+// 接听方文件播放专用: XVE_RecordDevDataCallBack(MultiMediaDyn)。只阻断原生
+// 麦克风帧进入 mixer；外部注入走 XVE_ExternalPutRecordData，不经过此回调。
+// 地址由版本 JSON 提供，缺键不挂；0x79720 是 PlayDevDataCallBack，不能门控。
+var VOIP_MICGATE_OFF = "{{if .voipMicGateAddr}}{{.voipMicGateAddr}}{{end}}";
+var VOIP_AV_ENGINE_OFF = 0x218;
+// mode 字在引擎对象内的偏移逐版漂移: 4.1.15=0x75cc, 4.1.13=0x7504(静态)。
+// 两个键必须成对: 只填地址不填偏移会写错字段, 因此缺任一即禁用门控。
+var VOIP_MICGATE_MODE_OFF = "{{if .voipMicGateModeOff}}{{.voipMicGateModeOff}}{{end}}";
 var VOIP_ERR_NO_MEMBER = -405885;      // NoMember is Active(4.1.13 为 -405447)
 var VOIP_ERR_ENGINE_NOT_READY = -405909; // mv==null/startTalk<1(4.1.13 为 -405471)
 // 结构偏移(4.1.15.55): ce 字段在 ConfSDKdyn 内漂移；av 字段必须对照
@@ -2410,6 +2418,8 @@ var VOIP_AV_PULLBYTES_OFF = 0x2320;   // 每拉字节数；下行实现仍读此
 var voipKeep = [];
 var voipCall = null; // 当前注入会话
 var voipLast = null; // 上一通注入的结果摘要(供 Go 侧轮询收尾)
+var voipMicGateHookAttached = false;
+var voipMicGateSession = null;
 
 function voipClientAddr() {
     if (!baseAddr) throw new Error("wechat.dylib 基址未就绪");
@@ -2538,6 +2548,75 @@ function voipMuteMic(svc, tag) {
     }
 }
 
+// 4.1.15 A/B: 麦克风静音帧与外部文件帧同时生产时，M1 录音呈 40ms 周期洞；
+// 在此回调入口把 mode 写成 2，使其走直接 ret 0 分支后，同样本空洞归零。
+// hook 常驻、按会话启用；不在通话结束回写旧 eng，避免引擎已释放后写悬空指针。
+// SDK 会在后续原生录音回调前自行恢复 mode，新通话也会重建引擎。
+function voipMicGateAttach() {
+    if (voipMicGateHookAttached) return true;
+    if (!VOIP_MICGATE_OFF || !VOIP_MICGATE_MODE_OFF) {
+        console.log("[voip] micGate 未配置版本地址/偏移(需成对), 保持原路径");
+        return false;
+    }
+    try {
+        var mm = Process.enumerateModules().filter(function (m) {
+            return m.name.indexOf("MultiMediaDyn") !== -1 && m.size > 100 * 1024;
+        }).sort(function (a, b) { return b.size - a.size; })[0];
+        if (!mm) throw new Error("MultiMediaDyn 未加载");
+        Interceptor.attach(mm.base.add(VOIP_MICGATE_OFF), {
+            onEnter: function (args) {
+                var c = voipMicGateSession;
+                if (!c || !c.micGateEng || !args[0].equals(c.micGateEng)) return;
+                try {
+                    c.micGateCallbacks++;
+                    var mode = args[0].add(VOIP_MICGATE_MODE_OFF);
+                    if (mode.readU32() !== 2) {
+                        mode.writeU32(2);
+                        c.micGateWrites++;
+                    }
+                } catch (e) {
+                    voipMicGateSession = null; // fail-open: 异常时恢复正常麦克风路径
+                    console.log("[voip] micGate 回调异常, 已停用: " + e);
+                }
+            }
+        });
+        voipMicGateHookAttached = true;
+        console.log("[+] Hooking VoIP micGate at MultiMediaDyn+" + VOIP_MICGATE_OFF);
+        return true;
+    } catch (e) {
+        console.log("[voip] micGate hook 失败, 保持原路径: " + e);
+        return false;
+    }
+}
+
+function voipMicGateBegin(c) {
+    if (!c.micGate || c.micGateEng) return;
+    try {
+        var ce = c.svc.add(8).readPointer().add(VOIP_CE_OFF);
+        var mv = ce.add(8).readPointer();
+        if (mv.isNull()) return;
+        var eng = mv.sub(8).add(VOIP_AV_ENGINE_OFF).readPointer();
+        if (eng.isNull()) return;
+        c.micGateEng = eng;
+        c.micGateCallbacks = 0; c.micGateWrites = 0;
+        c.micGateSavedMode = eng.add(VOIP_MICGATE_MODE_OFF).readU32();
+        voipMicGateSession = c;
+        eng.add(VOIP_MICGATE_MODE_OFF).writeU32(2);
+        console.log("[voip] micGate begin mode=" + c.micGateSavedMode + "→2");
+    } catch (e) {
+        voipMicGateSession = null; c.micGateEng = null;
+        console.log("[voip] micGate begin 失败, 保持原路径: " + e);
+    }
+}
+
+function voipMicGateEnd(c, tag) {
+    if (voipMicGateSession !== c) return;
+    voipMicGateSession = null;
+    c.micGateEng = null;
+    console.log("[voip] micGate end tag=" + tag + " callbacks=" + c.micGateCallbacks +
+                " writes=" + c.micGateWrites);
+}
+
 function triggerVoipHangup() {
     try {
         if (voipCall) voipStop("hangup");
@@ -2572,6 +2651,24 @@ function voipEngineFrame(svc) {
                  raw: [frameMs, engRate, engCh, samples, contentBytes] };
     } catch (e) { console.log("[voip] engineFrame err: " + e); }
     return null;
+}
+
+// 协商参数探针: 接通后每秒采一次引擎 av 字段, 看是否在通话中途变档
+// (接听方实验: 现象为接通 ~1s 后音质/节拍劣化, 怀疑此处协商变更)
+function voipEngineSample(svc, tag) {
+    try {
+        var ce = svc.add(8).readPointer().add(VOIP_CE_OFF);
+        var mv = ce.add(8).readPointer();
+        if (mv.isNull()) { console.log("[voip-av] " + tag + " mv=null"); return; }
+        var av = mv.sub(8);
+        console.log("[voip-av] " + tag +
+            " frameMs=" + av.add(VOIP_AV_FRAMEMS_OFF).readU32() +
+            " rate=" + av.add(VOIP_AV_RATE_OFF).readU32() +
+            " engRate=" + av.add(VOIP_AV_ENGRATE_OFF).readU32() +
+            " engCh=" + av.add(VOIP_AV_ENGCH_OFF).readU32() +
+            " pull=" + av.add(VOIP_AV_PULLBYTES_OFF).readU32() +
+            " startTalk=" + ce.add(VOIP_CE_STARTTALK_OFF).readU32());
+    } catch (e) { console.log("[voip-av] " + tag + " err=" + e); }
 }
 
 // 载荷优先取 ffmpeg 预生成的同采样率文件(<prefix>_<rate>_1.pcm), 否则拿 16k
@@ -2610,6 +2707,7 @@ function voipLoadPayload(prefix, rate, chn) {
 function voipStop(reason) {
     var c = voipCall;
     if (!c) return;
+    if (c.micGate) voipMicGateEnd(c, reason);
     voipCall = null;
     if (c.timer !== null) { clearTimeout(c.timer); c.timer = null; }
     c.stopReason = reason;
@@ -2637,7 +2735,15 @@ function voipApplyFormat(c, tag) {
         c.payloadBytes = ef.payloadBytes;
         c.frameMs = ef.frameMs;
     }
-    c.playU8 = voipLoadPayload(c.prefix, c.contentRate, c.channels);
+    // 接听方实测(2026-11-05): 消费端按引擎采样率原样渲染, 内容率必须等于引擎率,
+    // 降到引擎率一半会同时把音高×2、时长÷2。noPad 同理: 帧内补零会被渲染成静音,
+    // 16k 通话 640B 内容 + 320B 零尾 ⇒ 每 40ms 一个 ~18ms 空洞(占空比 57%);
+    // 48k 通话整帧无尾 ⇒ 占空比 91.5%。两条都只在接听方模式启用。
+    if (c.noPad) c.frameBytes = c.payloadBytes;
+    var loadRate = c.loadRate > 0 ? c.loadRate
+        : (c.contentDiv > 0) ? Math.round(c.contentRate / c.contentDiv)
+        : (c.contentRate >= 32000 ? c.contentRate : Math.round(c.contentRate / 2));
+    c.playU8 = voipLoadPayload(c.prefix, loadRate, c.channels);
     var need = Math.max(16384, c.frameBytes * 4);
     if (!c.frameBuf || need > c.frameCap) {
         c.frameBuf = Memory.alloc(need);
@@ -2645,11 +2751,12 @@ function voipApplyFormat(c, tag) {
         c.frameCap = need;
     }
     c.frameBuf.writeByteArray(new Uint8Array(c.frameCap)); // 整块清零防脏数据
-    c.stage = new Uint8Array(c.frameBytes);
+    c.stage = new Uint8Array(c.frameBytes * (c.mult || 1));
     c.off = 0; c.idx = 0; c.t0 = Date.now();
     c.fmtApplied = !!ef;
     console.log("[voip] fmt " + tag + " frame=" + c.frameBytes + "B payload=" +
-                c.payloadBytes + "B @" + c.contentRate + "Hz ch=" + c.channels +
+                c.payloadBytes + "B eng=" + c.contentRate + "Hz load=" + loadRate +
+                "Hz ch=" + c.channels +
                 " " + c.frameMs + "ms raw=" + (ef ? JSON.stringify(ef.raw) : "null"));
     return ef;
 }
@@ -2667,9 +2774,37 @@ function voipPlay(prefix, optsJson) {
         maxLate: 0, lateOver3: 0, waiting: 0, waitRet: null, answered: false,
         fmtApplied: false, timer: null, error: null, stopReason: "",
         rate: 24000, contentRate: 16000, channels: 1,
-        frameMs: 20, frameBytes: 960, payloadBytes: 640, maxSec: maxSec
+        frameMs: 20, frameBytes: 960, payloadBytes: 640, maxSec: maxSec,
+        // 接听方实验: 每 40ms 喂 2 倍帧(内容密度翻倍), 对抗 §14 的 40ms 消费节拍
+        mult: opts.callee40 ? 2 : 1,
+        // 接听方实验: muteMic 会关停 SDK 内部采集消费者, 嫌疑造成 40ms 退化, 可关闭
+        muteMic: opts.muteMic !== false,
+        // 接听方实验: 接通后先等协商落定再喂第一帧(0 = 立即; 建议 3000)
+        startDelayMs: opts.startDelayMs > 0 ? opts.startDelayMs : 0,
+        // 接听方实验: 内容采样率 = 引擎采样率 / N; 0 = 自适应(16k 通话用 8k, 48k 通话用原率)
+        contentDiv: opts.contentRateDiv >= 1 ? opts.contentRateDiv : 0,
+        // 接听方实验: 喂入节拍(ms), 默认 20; 消费端每 40ms 取一次时设 40 防积压
+        feedMs: opts.feedIntervalMs >= 20 ? opts.feedIntervalMs : 20,
+        // 接听方实验: 整块 buffer 填满内容(不留零尾), 配合 feedMs 对齐消费速率
+        fullFrame: !!opts.fullFrame,
+        // 接听方模式: 帧长=内容长(16k 通话不发 960B 零尾帧)。实测零尾被渲染成静音,
+        // 是接听方空洞的主因(§17.7)。
+        noPad: !!opts.noPad,
+        // 接听方实验: 强制载荷采样率(0 = 由 contentDiv 推)。用于验证"SDK 按声明率
+        // 24000 解释缓冲再重采样"的假设: 16k 通话试 24000 + fullFrame。
+        loadRate: opts.loadRate > 0 ? opts.loadRate : 0,
+        // 接听方实验: PutExternalRecordData 的声明采样率(默认沿用拨号方经验 24000)
+        declRate: opts.declaredRate > 0 ? opts.declaredRate : 24000,
+        // 接听方模式: 接听前只读 startTalk 探测, 不喂帧(防试探帧滞留成"嘟嘟"声)
+        probeWait: !!opts.probeWait,
+        // 接听方文件播放默认阻断原生麦克风生产源；出站不传此开关。
+        micGate: !!opts.micGate,
+        micGateEng: null, micGateCallbacks: 0, micGateWrites: 0, micGateSavedMode: null,
+        sample: !!opts.sampleAv,
+        startFeedAt: 0
     };
     voipCall = c;
+    if (c.micGate && !voipMicGateAttach()) c.micGate = false;
     try {
         c.svc = voipService();
         voipApplyFormat(c, "start");
@@ -2679,7 +2814,7 @@ function voipPlay(prefix, optsJson) {
         console.log("[-] voip 注入初始化失败: " + e);
         return "err:" + e;
     }
-    voipMuteMic(c.svc, "start"); // 拨号前大概率还没就绪, 接通瞬间还会再调一次
+    if (c.muteMic) voipMuteMic(c.svc, "start"); // 拨号前调一次常见返回负码, 接通瞬间还会再调
 
     var putExternal = new NativeFunction(voipConfModule().base.add(VOIP_PUT_OFF), "int",
         ["pointer", "pointer", "int", "int", "int"]);
@@ -2693,14 +2828,36 @@ function voipPlay(prefix, optsJson) {
         if (c.t0 > 0 && (Date.now() - c.t0) > c.maxSec * 1000) {
             voipStop("maxSeconds"); return;
         }
-        var take = Math.min(c.payloadBytes, c.playU8.length - c.off);
-        if (take < c.payloadBytes) c.stage.fill(0, 0, c.payloadBytes); // 尾帧清零
-        for (var i = 0; i < take; i++) c.stage[i] = c.playU8[c.off + i];
+        var mult = c.mult || 1;
+        var skipFeed = mult > 1 && (c.idx % 2 === 1); // 40ms 模式: 隔帧喂 2 倍内容
+        if (c.feedMs > 20) skipFeed = (c.idx % Math.round(c.feedMs / c.frameMs)) !== 0; // 只降节拍不改内容量
+        var take = 0;
         var ret = null, err = null;
-        try {
-            c.frameBuf.writeByteArray(c.stage);
-            ret = putExternal(c.svc, c.frameBuf, c.frameBytes, c.rate, c.channels);
-        } catch (e) { err = String(e); }
+        // 接听方模式: 接听前只读 startTalk 探测, 不往引擎 buffer 喂字节。
+        // 否则试探帧会滞留, 接通后以"嘟嘟"碎片反复播出(2026-11-05 实测)。
+        if (c.probeWait && !c.answered) {
+            var stNow = null;
+            try {
+                stNow = c.svc.add(8).readPointer().add(VOIP_CE_OFF)
+                    .add(VOIP_CE_STARTTALK_OFF).readU32();
+            } catch (eSt) { stNow = null; }
+            if (stNow === null || stNow < 1) {
+                c.waiting++;
+                if (c.waiting > Math.floor(c.maxSec * 5)) { voipStop("answer timeout"); return; }
+                c.lastRet = "pre-answer";
+                c.timer = setTimeout(tick, 200);
+                return;
+            }
+        }
+        if (!skipFeed) {
+            take = Math.min((c.fullFrame ? c.frameBytes * mult : c.payloadBytes * mult), c.playU8.length - c.off);
+            if (take < c.stage.length) c.stage.fill(0, 0, c.stage.length); // 尾帧清零(整块模式也走这里)
+            for (var i = 0; i < take; i++) c.stage[i] = c.playU8[c.off + i];
+            try {
+                c.frameBuf.writeByteArray(c.stage);
+                ret = putExternal(c.svc, c.frameBuf, c.frameBytes * mult, c.declRate, c.channels);
+            } catch (e) { err = String(e); }
+        }
         // 未接听/引擎未就绪：原地等待不消耗数据，接通后从文件头开播。
         // 错误码逐版漂移，必须与 ConfEngine::PutExternalRecordData 的首个
         // (mv==null || startTalk<1) 分支对照迁移，不能写死旧版数值。
@@ -2716,6 +2873,8 @@ function voipPlay(prefix, optsJson) {
                 c.waitRet = ret;
             }
             c.waiting++;
+            // 已接通后引擎消失 = 对方挂断, 别再空等 60s
+            if (c.answered && c.waiting > 25) { voipStop("engine-lost"); return; }
             if (c.waiting > Math.floor(c.maxSec * 5)) { voipStop("answer timeout"); return; }
             c.lastRet = ret;
             c.timer = setTimeout(tick, 200);
@@ -2726,10 +2885,30 @@ function voipPlay(prefix, optsJson) {
             c.waiting = 0;
             c.answered = true;
             voipApplyFormat(c, "answered");
-            voipMuteMic(c.svc, "answered"); // 会话已就绪, 这次必须静音成功
+            if (c.muteMic) voipMuteMic(c.svc, "answered"); // 出站必调(防×1.5 变速); 接听方实验可关
+            if (c.startDelayMs > 0) {
+                c.startFeedAt = Date.now() + c.startDelayMs;
+                console.log("[voip] 延迟开播 " + c.startDelayMs + "ms(等协商落定)");
+            }
+        }
+        // 门控与喂入同拍启动: 无论是否经历"等待接通"分支, 接通后都要掐掉麦克风生产源,
+        // 否则静音帧仍会与外部帧交替(§17.9)。引擎未就绪时本函数静默重试。
+        if (c.micGate && !c.micGateEng) voipMicGateBegin(c);
+        // 延迟开播窗口: 空转等待, 不喂帧不推进
+        if (c.startFeedAt > 0) {
+            if (Date.now() < c.startFeedAt) {
+                c.delayProbes = (c.delayProbes || 0) + 1;
+                if (c.sample) voipEngineSample(c.svc, "delay" + c.delayProbes);
+                c.timer = setTimeout(tick, 500); return;
+            }
+            c.startFeedAt = 0;
+            voipApplyFormat(c, "delayed"); // 协商可能仍在变, 开播前再读一次
+            c.t0 = Date.now(); // 节拍时间线从真正开播起算
+            console.log("[voip] 延迟到期, 开始喂帧");
         }
         c.off += take;
-        c.calls++;
+        if (!skipFeed) c.calls++;
+        if (c.sample && (c.idx % 50) === 0) voipEngineSample(c.svc, "t=" + c.idx);
         var late = Date.now() - (c.t0 + (c.idx + 1) * c.frameMs);
         if (late > c.maxLate) c.maxLate = late;
         if (late > 3) c.lateOver3++;
@@ -2915,6 +3094,336 @@ function voipCaptureStatus() {
     }
     return JSON.stringify({ active: false, last: voipCapLast });
 }
+
+// ---- 入站接听(被叫): RecvNotify 来话通知 → Accept 接听 → 采集/注入 → 挂断 ----
+// 常量迁移: 函数身份用日志锚串定位(Accept/RecvNotify/Hangup), 槽位号只作参考——
+// 4.1.15 静态实证 vtable 布局与 4.1.13 一致(vt[7]=RecvNotify, vt[10]=Accept,
+// vt[12]=Hangup), 但运行时按函数地址直接调用/挂钩, 不依赖槽位号。
+// ⚠️ 接听方注入已知问题(4.1.13 §14): 外部录音消费者 40ms 节拍 → 20ms 空洞 +
+// 偶发 2 倍慢放。4.1.15 是否仍如此待实测; 录音(下行拉取)与角色无关, 不受影响。
+var VOIP_RING_OFF = "0x7ced8";    // ConfSDKdyn: WXConfService::RecvNotify(来话通知, 旧 0x79f64)
+var VOIP_ANSWER_OFF = "0x7cbc0";  // ConfSDKdyn: WXConfService::Accept(接听, 旧 0x79c4c), 调用形 (svc,1,0,0x22)
+// App 层接听信令(4.1.15 wechat.dylib+0x4bc8164): 只调 ConfSDK Accept 主叫端显示未接通;
+// 人工接听 = 先发此信令(0, &room字符串, 0, 0)(type=5 应答消息) 再 Accept —— 调用栈反查定位。
+// x1 是 libc++ std::string(房间号), 传 NULL 会 access violation(读 +0x17 长度字节)。
+// 房间号来自全局 std::string(ToF 卡内联 SSO), UI 在同一函数里 0x21742e0 先取它。
+var VOIP_ANSWERSIG_OFF = "0x4bc8164";
+var VOIP_ROOM_OFF = "0xa35b120"; // wechat.dylib __DATA: 当前通话 room id 全局字符串
+var voipInbound = null;           // 武装状态(一次武装处理一通, 用完自动解除)
+var voipInboundLast = null;       // 上一通入站通话摘要
+var voipRingHookAttached = false;
+
+function voipInboundCallActive() {
+    // 接听后引擎建起(startTalk≥1)直到挂断; 接听前也会短暂为 null/0
+    try {
+        var svc = voipService();
+        var ce = svc.add(8).readPointer().add(VOIP_CE_OFF);
+        if (ce.add(8).readPointer().isNull()) return false;
+        return ce.add(VOIP_CE_STARTTALK_OFF).readU32() >= 1;
+    } catch (e) { return false; }
+}
+
+function voipInboundAttachRing() {
+    if (voipRingHookAttached) return; // hook 只挂不拆
+    voipRingHookAttached = true;
+    var conf = voipConfModule();
+    Interceptor.attach(conf.base.add(VOIP_RING_OFF), {
+        onEnter: function (args) {
+            try { voipOnIncoming(args); } catch (e) {
+                console.log("[voip-in] 来话处理异常: " + e);
+            }
+        }
+    });
+    console.log("[+] Hooking VoIP RecvNotify(来话通知) at ConfSDKdyn+" + VOIP_RING_OFF);
+}
+
+// 从 RecvNotify protobuf 提取房间号(十进制字符串)。观测形状:
+//   08 02 12 <len varint> | 08 <room varint> 10 ... — field2.room.field1
+// 房间号 ~5.6e17 超出 JS 安全整数, 必须走字节级十进制转换, 不能走 Number。
+function voipVarintToDecString(b, start) {
+    var groups = [];
+    var i = start, byte;
+    do { byte = b[i++]; groups.push(byte & 0x7f); } while ((byte & 0x80) && i < b.length && groups.length < 10);
+    var bytes = new Array(Math.ceil(groups.length * 7 / 8));
+    for (var z = 0; z < bytes.length; z++) bytes[z] = 0;
+    for (var k = 0; k < groups.length; k++) {
+        for (var bit = 0; bit < 7; bit++) {
+            if (groups[k] & (1 << bit)) {
+                var pos = k * 7 + bit;
+                bytes[pos >> 3] |= 1 << (pos & 7);
+            }
+        }
+    }
+    var digits = "", end = bytes.length;
+    while (end > 0) {
+        var rem = 0;
+        for (var j = end - 1; j >= 0; j--) {
+            var cur = rem * 256 + bytes[j];
+            bytes[j] = Math.floor(cur / 10);
+            rem = cur % 10;
+        }
+        digits = rem + digits;
+        while (end > 0 && bytes[end - 1] === 0) end--;
+    }
+    return digits || "0";
+}
+
+function voipParseRoomFromNotify(ptr, len) {
+    try {
+        if (len < 12) return null;
+        var b = new Uint8Array(ptr.readByteArray(Math.min(len, 64)));
+        if (b[0] !== 0x08 || b[2] !== 0x12) return null;
+        var i = 3, lb = 0;
+        do { lb = b[i++]; } while ((lb & 0x80) && i < b.length); // 子消息长度 varint
+        if (i >= b.length || b[i] !== 0x08) return null;
+        var s = voipVarintToDecString(b, i + 1);
+        return (s && s !== "0" && s.length >= 15) ? s : null; // roomid 为 18~19 位十进制
+    } catch (e) { return null; }
+}
+
+function voipOnIncoming(args) {
+    var c = voipInbound;
+    if (!c || c.phase !== "armed") return;
+    if (Date.now() > c.deadline) { voipInboundDisarmInternal("window-expired"); return; }
+    var now = Date.now();
+    if (now - c.lastNotifyTs < 800) return; // 通知风暴去抖
+    c.lastNotifyTs = now;
+    c.notifyCount++;
+    var len = 0, head = "";
+    try {
+        len = args[2].toInt32();
+        if (len > 0 && len <= 65536) {
+            var b = new Uint8Array(args[1].readByteArray(Math.min(len, 32)));
+            for (var i = 0; i < b.length; i++) {
+                var h = b[i].toString(16); head += (h.length < 2 ? "0" : "") + h;
+            }
+            var room = voipParseRoomFromNotify(args[1], len);
+            if (room) c.roomId = room;
+        }
+    } catch (e) { }
+    console.log("[voip-in] 来话通知 #" + c.notifyCount + " len=" + len + " room=" + c.roomId + " head=" + head);
+    if (voipCall) { console.log("[voip-in] 出站注入进行中, 忽略来话"); return; }
+    c.phase = "answering";
+    setTimeout(function () { voipInboundAnswer(); }, c.answerDelayMs);
+}
+
+// libc++ std::string 读取/构造(与 voipBuildVec 同布局: 短串内联, 长串 ptr@+0/size@+8)
+function voipReadStdString(p) {
+    var isLong = (p.add(0x17).readU8() & 0x80) !== 0;
+    var data = isLong ? p.readPointer() : p;
+    var len = isLong ? p.add(8).readU64().toNumber() : (p.add(0x17).readU8() & 0x7f);
+    if (len < 0 || len > 4096) return null;
+    var b = new Uint8Array(data.readByteArray(len));
+    var s = "";
+    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return s;
+}
+
+function voipBuildStdString(s) {
+    var sb = Memory.alloc(24);
+    voipKeep.push(sb);
+    if (s.length <= 22) {
+        var bytes = new Array(24);
+        for (var i = 0; i < 24; i++) bytes[i] = 0;
+        for (i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i) & 0xff;
+        bytes[0x17] = s.length;
+        sb.writeByteArray(bytes);
+        return sb;
+    }
+    var data = Memory.allocUtf8String(s);
+    voipKeep.push(data);
+    sb.writePointer(data);
+    sb.add(8).writeU64(s.length);
+    sb.add(0x17).writeU8(0x80);
+    return sb;
+}
+
+function voipInboundAnswer() {
+    var c = voipInbound;
+    if (!c || c.phase !== "answering") return;
+    // ① App 层接听信令(顺序照抄 UI: 信令在前, Accept 在后)。
+    //    房间号来源: 来话通知 protobuf(主) → wechat.dylib 全局 std::string(兜底,
+    //    响铃期可能尚未写入, 300ms 重试若干次)。
+    var room = c.roomId;
+    var roomSrc = "notify";
+    if (!room) {
+        for (var tries = 0; tries < 6 && !room; tries++) { // 最多再等 ~1.8s
+            room = voipReadStdString(baseAddr.add(VOIP_ROOM_OFF)) || null;
+            if (!room) {
+                var eSleep = Date.now() + 300;
+                while (Date.now() < eSleep) { }
+            }
+        }
+        roomSrc = "global";
+    }
+    if (room) {
+        try {
+            var sigFn = new NativeFunction(baseAddr.add(VOIP_ANSWERSIG_OFF), "int",
+                ["int", "pointer", "int", "int"]);
+            var sr = sigFn(0, voipBuildStdString(room), 0, 0);
+            console.log("[voip-in] 接听信令 room=" + room + " src=" + roomSrc + " ret=" + sr);
+        } catch (e) {
+            console.log("[voip-in] 接听信令异常: " + e);
+        }
+    } else {
+        console.log("[voip-in] 无房间号(通知解析失败且全局为空), 跳过信令");
+    }
+    // ② ConfSDK Accept 建引擎
+    var r;
+    try {
+        var svc = voipService();
+        var acceptFn = new NativeFunction(voipConfModule().base.add(VOIP_ANSWER_OFF),
+            "int", ["pointer", "int", "int", "int"]);
+        r = acceptFn(svc, 1, 0, 0x22);
+        console.log("[voip-in] Accept ret=" + r);
+    } catch (e) {
+        r = null;
+        console.log("[voip-in] Accept 异常: " + e);
+    }
+    c.answerRet = r;
+    c.phase = "incall";
+    c.answeredAt = Date.now();
+    c.hangupAt = c.answeredAt + c.maxSeconds * 1000;
+    // 采集先武装(引擎接听后才建, voipCaptureStart 内部 200ms 轮询会等就绪)
+    if (c.record) {
+        var cr = voipCaptureStart(JSON.stringify({ path: c.capPath, maxSeconds: c.maxSeconds + 10 }));
+        console.log("[voip-in] 采集武装 ret=" + cr);
+    }
+    // 接听方注入(实验性): muteMic 由布防参数控制(默认开 —— 否则静默期对方听到本机环境音)
+    if (c.prefix) {
+        var pr = voipPlay(c.prefix, JSON.stringify({ maxSeconds: c.maxSeconds, muteMic: c.muteMic !== false, startDelayMs: c.startDelayMs, callee40: c.callee40, contentRateDiv: c.contentRateDiv, feedIntervalMs: c.feedIntervalMs, fullFrame: c.fullFrame, noPad: c.noPad, loadRate: c.loadRate, declaredRate: c.declaredRate, probeWait: true, micGate: c.micGate !== false, sampleAv: true }));
+        console.log("[voip-in] 接听方注入启动 ret=" + pr);
+    }
+    voipInboundHousekeep();
+}
+
+// 500ms 巡检: 播完自动挂断 / 超时挂断 / 通话结束收尾
+function voipInboundHousekeep() {
+    var c = voipInbound;
+    if (!c || c.phase !== "incall") return;
+    var now = Date.now();
+    var active = voipInboundCallActive();
+    if (!active) {
+        // 接听后引擎消失 = 通话结束(对方挂断或我方挂断)
+        if (now - c.answeredAt < 8000) {
+            // 刚接听引擎可能还没建起, 别急着判死
+            c.timer = setTimeout(voipInboundHousekeep, 500);
+            return;
+        }
+        voipInboundFinish("call-end");
+        return;
+    }
+    if (c.hangup && !c.hungup) {
+        var playDone = !voipCall && voipLast && voipLast.reason === "eof";
+        if (playDone && now - c.answeredAt > 3000) {
+            // 播完留 1.5s 尾巴给采集, 然后挂断
+            if (!c.eofAt) c.eofAt = now;
+            if (now - c.eofAt >= 1500) {
+                c.hungup = true;
+                var hr = voipHangupNative(null);
+                console.log("[voip-in] 播完自动挂断 ret=" + hr);
+            }
+        } else if (!c.eofAt && now > c.hangupAt) {
+            c.hungup = true;
+            var hr2 = voipHangupNative(null);
+            console.log("[voip-in] 超时自动挂断 ret=" + hr2);
+        }
+    }
+    c.timer = setTimeout(voipInboundHousekeep, 500);
+}
+
+function voipInboundFinish(reason) {
+    var c = voipInbound;
+    if (!c) return;
+    if (c.timer !== null) { clearTimeout(c.timer); c.timer = null; }
+    voipInboundLast = {
+        ts: Date.now(), reason: reason, answerRet: c.answerRet,
+        notifyCount: c.notifyCount, played: c.prefix ? true : false,
+        recorded: c.record, seconds: c.answeredAt ? (Date.now() - c.answeredAt) / 1000 : 0
+    };
+    console.log("[voip-in] 通话结束 reason=" + reason +
+                " answerRet=" + c.answerRet + " " + voipInboundLast.seconds.toFixed(1) + "s");
+    if (c.multi && Date.now() < c.deadline) {
+        // 多通模式: 窗口内重置为武装态, 继续接下一通
+        c.phase = "armed"; c.answerRet = null; c.notifyCount = 0; c.roomId = null;
+        c.answeredAt = 0; c.hangupAt = 0; c.eofAt = 0; c.hungup = false;
+        console.log("[voip-in] 多通模式, 已重新武装");
+        return;
+    }
+    voipInbound = null;
+}
+
+function voipInboundDisarmInternal(reason) {
+    var c = voipInbound;
+    if (!c) return;
+    if (c.timer !== null) { clearTimeout(c.timer); c.timer = null; }
+    voipInboundLast = { ts: Date.now(), reason: reason, answerRet: c.answerRet,
+                        notifyCount: c.notifyCount, seconds: 0 };
+    console.log("[voip-in] 解除武装 reason=" + reason);
+    voipInbound = null;
+}
+
+// opts: {prefix, capPath, record, maxSeconds, answerDelayMs, windowSeconds, hangup, callee40, startDelayMs}
+function voipInboundArm(optsJson) {
+    var opts = {};
+    try { opts = JSON.parse(optsJson || "{}"); } catch (e) { return "err:bad-json"; }
+    if (voipInbound) return "busy";
+    voipInbound = {
+        phase: "armed", prefix: opts.prefix || "", capPath: opts.capPath || "/tmp/voip_in_down.pcm",
+        record: !!opts.record, maxSeconds: opts.maxSeconds > 0 ? opts.maxSeconds : 120,
+        answerDelayMs: opts.answerDelayMs > 0 ? opts.answerDelayMs : 1200,
+        hangup: opts.hangup !== false, multi: !!opts.multi,
+        callee40: !!opts.callee40, startDelayMs: opts.startDelayMs > 0 ? opts.startDelayMs : 0,
+        // 接听方默认 1: 内容率 = 引擎率(实测降半会音高×2、时长÷2)
+        contentRateDiv: opts.contentRateDiv >= 1 ? opts.contentRateDiv : 1,
+        feedIntervalMs: opts.feedIntervalMs >= 20 ? opts.feedIntervalMs : 20,
+        fullFrame: !!opts.fullFrame,
+        // 接听方默认不补零尾(实测零尾渲染成静音 ⇒ 40ms 周期空洞)
+        noPad: opts.noPad !== false,
+        loadRate: opts.loadRate > 0 ? opts.loadRate : 0,
+        declaredRate: opts.declaredRate > 0 ? opts.declaredRate : 24000,
+        muteMic: opts.muteMic !== false,
+        // 接听方模式: 接听前只读 startTalk 探测, 不喂帧(防试探帧滞留成"嘟嘟"声)
+        probeWait: !!opts.probeWait,
+        // 接听方文件播放默认阻断原生麦克风生产源(§17.9); 关掉即回到旧行为
+        micGate: opts.micGate !== false,
+        deadline: Date.now() + (opts.windowSeconds > 0 ? opts.windowSeconds : 300) * 1000,
+        lastNotifyTs: 0, notifyCount: 0, answerRet: null, roomId: null,
+        answeredAt: 0, hangupAt: 0, eofAt: 0, hungup: false, timer: null
+    };
+    voipInboundAttachRing();
+    console.log("[voip-in] 武装就绪 record=" + voipInbound.record +
+                " play=" + (voipInbound.prefix ? "yes" : "no") +
+                " delay=" + voipInbound.startDelayMs + "ms" +
+                " div=" + voipInbound.contentRateDiv +
+                " feed=" + voipInbound.feedIntervalMs + "ms" +
+                " full=" + (voipInbound.fullFrame ? "yes" : "no") +
+                " noPad=" + (voipInbound.noPad ? "yes" : "no") +
+                " load=" + (voipInbound.loadRate > 0 ? voipInbound.loadRate + "Hz" : "auto") +
+                " decl=" + voipInbound.declaredRate +
+                " max=" + voipInbound.maxSeconds + "s" +
+                " 窗口至 " + new Date(voipInbound.deadline).toLocaleTimeString());
+    return "ok";
+}
+
+function voipInboundDisarm() {
+    if (!voipInbound) return "idle";
+    if (voipInbound.phase === "incall") return "busy:incall";
+    voipInboundDisarmInternal("disarm-request");
+    return "ok";
+}
+
+function voipInboundStatus() {
+    var c = voipInbound;
+    if (!c) return JSON.stringify({ armed: false, last: voipInboundLast });
+    return JSON.stringify({
+        armed: true, phase: c.phase, record: c.record,
+        play: !!c.prefix, maxSeconds: c.maxSeconds,
+        notifyCount: c.notifyCount, answerRet: c.answerRet,
+        inCallSeconds: c.answeredAt ? (Date.now() - c.answeredAt) / 1000 : 0,
+        deadline: c.deadline, last: voipInboundLast
+    });
+}
 // -------------------------语音通话(VoIP)分区-------------------------
 
 rpc.exports = {
@@ -2939,6 +3448,9 @@ rpc.exports = {
     voipCaptureStart: voipCaptureStart,
     voipCaptureStop: voipCaptureStop,
     voipCaptureStatus: voipCaptureStatus,
+    voipInboundArm: voipInboundArm,
+    voipInboundDisarm: voipInboundDisarm,
+    voipInboundStatus: voipInboundStatus,
 };
 
 // -------------------------发送图片消息分区-------------------------

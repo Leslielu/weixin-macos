@@ -56,10 +56,47 @@ for programmatic message sending and receiving.
   TTS, then hangs up. `record:true` also captures the callee's downlink audio
   (hearing them): a silence-trimmed WAV lands in `voice_records/` and its path
   is returned; without voice/text it is a record-only call. Plus
-  `GET /voice_call_status` and `POST /hangup_voice_call`. One call at a time,
-  outbound only. Code: `onebot/voice_call.go` and the VoIP section of
-  `onebot/script.js`; calibration in `docs/VOIP-CALL-STATUS.md` §13.5
-  (inject) and §16 (capture).
+  `GET /voice_call_status` and `POST /hangup_voice_call`. One call at a time;
+  outbound and inbound are mutually exclusive. Inbound answering (implemented
+  2026-11-05): `POST /voice_call_inbound`
+  `{enabled, voice|<text>, record?, max_seconds?, answer_delay_ms?,
+  window_seconds?, multi?, hangup?, mute_mic?, mic_gate?, content_rate_div?,
+  no_pad?, load_rate?}` arms auto-answer — an incoming call is accepted, the caller's
+  downlink is captured, optional playback runs, then hangup; `enabled:false`
+  disarms. Playback content must be resampled to the negotiated engine rate
+  (`content_rate_div` defaults to 1); the SDK ignores the declared rate, so
+  any other ratio shifts pitch (half rate = pitch x2). Its status endpoint,
+  `GET /voice_call_inbound_status`, finalizes the capture to
+  `voice_records/call_inbound_<ts>.wav`. Code: `onebot/voice_call.go`,
+  `onebot/voice_call_inbound.go` and the VoIP section of `onebot/script.js`;
+  calibration in `docs/VOIP-CALL-STATUS.md` §13.5 (inject), §16 (capture),
+  §17 (inbound answer), §17.7 (static map of the feed chain), §17.8 (history)
+  and §17.9 (2026-11-07 root cause of the callee-side holes).
+  The injection entry `PutExternalRecordData` copies exactly **one engine
+  frame** per call (640 B at 16 k) — feeding more content in a single call is
+  architecturally impossible (the excess is truncated).
+  **Callee-side playback holes: root cause found (2026-11-07 late, §17.9).**
+  The native microphone path keeps producing 20 ms **digital-silence frames**
+  at 50 fps; alternating with the injected external frames that yields one
+  ~19 ms hole every 40 ms (~59 % duty cycle) in the downlink. At the entry of
+  `XVE_RecordDevDataCallBack` (`MultiMediaDyn+0x795c4`; 4.1.13 statically
+  `+0x78050`) writing `eng+0x75cc` (4.1.13: `+0x7504`) to 2 makes the callback
+  take its "return 0 without forwarding" branch: the same 10 s sample then
+  records **0 holes / 100 % duty** in M1's recorder (control: 59.2 % / 244
+  holes). **Writing the field from a timer does not work** — the SDK rewrites
+  it before every native callback; only an `onEnter` hook at the callback
+  entry holds. `MM+0x79720` is `XVE_PlayDevDataCallBack`, not a mic callback.
+  Optional version-JSON keys `voipMicGateAddr` / `voipMicGateModeOff` (must be
+  paired; missing either disables the gate). It is enabled only for callee-side file playback (outbound
+  and record-only inbound are untouched). 4.1.15.55 is validated end to end
+  through the real HTTP path after the documented WeChat+onebot restart
+  (`mic_gate` default: 0 holes / 100 % duty; `mic_gate:false` control:
+  59.2 % / 271 holes, §17.9 D). The 4.1.13 addresses are static
+  only, not yet validated at runtime. Earlier §17.8 reading ("mostly an M1
+  recorder artifact") is withdrawn in §17.9. Dev-copy caution: calling the
+  public native record entry (`ConfSDKdyn+0x7eb18`) latches the engine into
+  external-device mode 1 **for the whole process** (microphone capture
+  bypassed); a WeChat restart is required to clear it.
 - `watchdog/`: authoritative copy of the auto-restart watchdog
   (`wechat-watchdog.sh` + `ocr_allow.py` + `ocr_selftest.sh`). The deployed
   copy lives at `~/Prog/wxgate/` on mac-m1; keep both in sync.
@@ -101,10 +138,10 @@ for programmatic message sending and receiving.
   auto-starts on answer). Known variable: one same-config round was noisy
   (suspect SDK recorder device contention — try holding the built-in mic if
   noise recurs); inbound capture is solved (§16): pull `GetAudioData(+0x4dba8)` every 20ms with x2 = the engine-registered per-pull byte count `[av+0x2320]` — passing anything else returns -1; some calls emit byte-swapped frames (detect by LE/BE amplitude and swap); never blind-call `+0x7a388` (crashes without a play context). **Topology rule (§14)**: always verify injection
-  quality with the tested side being the *dialer* and us answering. When the
-  *callee* injects, ConfSDK's external-record consumer runs on a 40 ms tick
-  and yields 20 ms holes + occasional 2× slow-motion, invariant to payload,
-  cadence and declared rate (settled 2026-11-01; production already injects
+  quality with the tested side being the *dialer* and us answering (the old
+  "callee injection = 40 ms holes + 2× slow-motion" reading turned out to be
+  the **two competing production sources** — gating the microphone source at
+  the record callback gives 0 holes, §17.9; production already injects
   from the dialer and is clean). Also documented there: audio probe pitfalls (Stalker
   always crashes this process; SubmitCgi payload is x1 not x0). **Never hook
   `0x546a558/0x5470f7c/0x54704e4/0x5470644/0x5470688`** — they are PAC-signed

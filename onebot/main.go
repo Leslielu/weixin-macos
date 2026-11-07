@@ -44,6 +44,9 @@ func main() {
 	http.HandleFunc("/send_voice_call", voiceCallHandler)
 	http.HandleFunc("/voice_call_status", voiceCallStatusHandler)
 	http.HandleFunc("/hangup_voice_call", voiceCallHangupHandler)
+	// 入站接听(§14.5): 来电自动接听 → 采集(听对方)/实验性播放 → 挂断
+	http.HandleFunc("/voice_call_inbound", voiceCallInboundHandler)
+	http.HandleFunc("/voice_call_inbound_status", voiceCallInboundStatusHandler)
 
 	http.HandleFunc("/ws", handleWebSocket)
 	http.HandleFunc("/test_ws", testWebSocket)
