@@ -78,6 +78,11 @@ curl -X POST -H "Content-Type:application/json" \
 
 - `GET  /voice_call_status` — 查询是否在通话中及上一通的注入摘要
 - `POST /hangup_voice_call` — 手动挂断
+- `POST /voice_call_inbound` — 布防被叫自动接听（`enabled:false` 解除）
+- `GET  /voice_call_inbound_status` — 入站状态；通话结束自动封装
+  `voice_records/call_inbound_<ts>.wav`
+
+完整字段、响应与示例见 [docs/VOICE-CALL-API.md](../docs/VOICE-CALL-API.md)。
 
 注意：同一时刻只允许一通；出站放音 + 入站采集（record）均已可用。
 链路细节与标定见 [docs/VOIP-CALL-STATUS.md](../docs/VOIP-CALL-STATUS.md) §13。
