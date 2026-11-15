@@ -149,6 +149,32 @@ onebot 启动干净：脚本全量加载、hook 全就位、无 ERROR/panic。
 - 5 分钟硬时限真机验证 + 多通后 goroutine/内存增长
 - media_overflow 真机注入、未授权/第二连接真机复测（协议自动化已过）
 
+## 4.5 mac-m1 生产部署 —— 2026-11-15 ✅
+
+流程：本地重签（com.leslie.onebot，md5 1a5f23ec…）→ rsync 提交文件（md5 核验）→
+远端重编 wxgate（go1.26.1）→ start.sh 注入 `-stream_token` → 看门狗走"重启微信→登录→
+起新 onebot"恢复链路 → 验证。
+
+| 验证项 | 结果 |
+|---|---|
+| 新二进制确认 | ✅ 日志行号 391→415（新 main.go） |
+| onebot capabilities(token) | ✅ healthy=true, proto v1 |
+| wxgate 代理 capabilities(36060, 同 token) | ✅ healthy=true |
+| 生产 WS：创建/hello/scoped hangup | ✅ |
+| call.ended(local_hangup, resources_released=true) | ✅ |
+| 旧接口 /voice_call_status | ✅ |
+
+**部署事故与修复（记录防再犯）**：wxgate 全量 rsync（`git ls-files`）把本地仓库**陈旧的
+start.sh（wechat_conf=4_1_10_53，9 月版）**覆盖了生产手工维护版（4_1_15_55）——生产配置
+漂移未回写仓库的隐患被这次部署引爆。已用"仓库版+单行修正+token 注入"重建生产版，并把
+本地仓库 start.sh 对齐生产版后提交。教训：**生产手工改过的文件必须及时回写仓库**；全量
+rsync 前先 diff 生产漂移文件。
+
+生产配置：`~/Prog/wxgate/.stream_token`（600）= start.sh `-stream_token` 与
+wxgate config.yaml `onebot_stream_token`/`voice_api_token` 同值；回退点
+`onebot.bak.20261115`、`start.sh.bak.20261115`（⚠️ 该备份是事故期版本，勿直接回退，
+用 git 仓库版）、`config.yaml.bak.20261115`。
+
 ## 5. 待定事项
 
 - 部署 mac-m1：本地冒烟已全过；上线须固定证书重签 + "重启微信→登录→起新 onebot"
