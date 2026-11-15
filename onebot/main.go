@@ -48,6 +48,16 @@ func main() {
 	http.HandleFunc("/voice_call_inbound", voiceCallInboundHandler)
 	http.HandleFunc("/voice_call_inbound_status", voiceCallInboundStatusHandler)
 
+	// 实时双向语音流(设计: docs/VOIP-STREAMING-DESIGN.md; -stream_token 空 = 路由禁用)
+	streamHub = NewStreamHub()
+	streamMgr = NewStreamManager(StreamConfig{
+		Token:          config.StreamToken,
+		QueueHardMs:    StreamQueueHardMs,
+		AllowedOrigins: config.StreamOrigins(),
+	}, fridaStreamBackend{}, streamHub)
+	streamMgr.RegisterRoutes(nil)
+	streamMgr.Start()
+
 	http.HandleFunc("/ws", handleWebSocket)
 	http.HandleFunc("/test_ws", testWebSocket)
 
@@ -83,6 +93,8 @@ func initFlag() {
 	flag.IntVar(&config.SendInterval, "send_interval", 1000, "发送间隔: ms")
 	flag.IntVar(&config.WechatPid, "wechat_pid", 0, "微信进程 PID，不设置则自动查找")
 	flag.StringVar(&logLevel, "log_level", "info", "log level")
+	flag.StringVar(&config.StreamToken, "stream_token", "", "实时语音流内部 Bearer token(空=实时路由禁用)")
+	flag.StringVar(&config.StreamOriginsRaw, "stream_origins", "", "实时语音流允许的浏览器 Origin, 逗号分隔(空=拒绝一切带 Origin 请求)")
 
 	flag.Parse()
 
@@ -110,6 +122,13 @@ func initFlag() {
 	fmt.Println("SendInterval", config.SendInterval)
 	fmt.Println("WechatPid", config.WechatPid)
 	fmt.Println("LogLevel", logLevel)
+	// stream_token 只打印是否配置, 不打印值(§10.5)
+	fmt.Println("StreamToken", func() string {
+		if config.StreamToken != "" {
+			return "(configured)"
+		}
+		return "(disabled)"
+	}())
 }
 
 func initFridaGadget() {
@@ -217,8 +236,9 @@ func loadJs() {
 		Fatal("创建脚本失败", "err", err)
 	}
 
-	// 打印 JS 里的 console.log
-	script.On("message", func(rawMsg string) {
+	// 打印 JS 里的 console.log(双参签名: 第二参是 send() 附带的二进制 PCM,
+	// voip-stream 下行帧走这里, 避免 JSON 数字数组)
+	script.On("message", func(rawMsg string, data []byte) {
 		defer func() {
 			if r := recover(); r != nil {
 				Error("message panic", "err", r, "stack", string(debug.Stack()))
@@ -243,6 +263,10 @@ func loadJs() {
 						switch t.(string) {
 						case "protobuf_msg":
 							go HandleProtobufMsgAndSend(pMap)
+						case "voip_stream":
+							// 实时语音流事件(设计: docs/VOIP-STREAMING-DESIGN.md);
+							// data 为下行 PCM 二进制, 直接入 hub, 不走普通消息转发
+							submitStreamEvent(pMap, data)
 						case "send":
 							if config.ConnType == "http" {
 								go SendHttpReq(payloadJson)

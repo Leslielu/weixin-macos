@@ -102,6 +102,23 @@ for programmatic message sending and receiving.
   the control round first and confirm it reproduces ~59 % / 18 ms holes). Verify recordings with
   `tools/voip/verify_recording.py`: 0 holes alone is not enough, the envelope
   correlation against the source must be ≥ 0.7 as well.
+- Realtime duplex voice stream (implemented 2026-11-15, unit tests green, **NOT yet
+  validated on a real call — do not ship**): five routes under `/voice_calls`
+  (`GET .../capabilities`, `POST /voice_calls` reserve, `WS /voice_calls/{id}/stream`,
+  `GET /voice_calls/{id}`, `POST /voice_calls/{id}/hangup`) speaking the JSON+base64
+  PCM WebSocket protocol (generation/segment/seq, commit, clear, backpressure
+  buffer_full, input gap, heartbeat ping 10s / pong 30s). Design:
+  `docs/VOIP-STREAMING-DESIGN.md`; code: `onebot/voice_stream*.go`, the
+  "VoIP 实时流式分区" section of `onebot/script.js`, debug client
+  `tools/voip/stream_client.py` (dials only with explicit `--start`). New onebot
+  flags: `-stream_token` (empty = realtime routes fail-closed), `-stream_origins`.
+  Shares the `voiceCallMu` global lock with file-based calls and inbound answering;
+  while a realtime session is active the legacy `/hangup_voice_call` answers
+  409 `call_id_required`. Progress/done scope is `submitted_to_wechat` (not
+  "heard by peer"); clear only flushes the onebot queue (frames already submitted
+  to the engine are not reclaimable, capabilities say so explicitly); answer
+  detection is inferred (silent probe frame ret==0 on the caller side);
+  rejected/busy events are **not implemented** (capabilities report false).
 - `watchdog/`: authoritative copy of the auto-restart watchdog
   (`wechat-watchdog.sh` + `ocr_allow.py` + `ocr_selftest.sh`). The deployed
   copy lives at `~/Prog/wxgate/` on mac-m1; keep both in sync.

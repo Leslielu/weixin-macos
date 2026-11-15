@@ -553,6 +553,15 @@ func voiceCallHangupHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "仅支持 POST", http.StatusMethodNotAllowed)
 		return
 	}
+	// 实时通话进行中禁止旧无 ID 挂断(设计 §4.4): 旧定时器不得误杀新实时通话
+	if StreamBusy() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "failed",
+			"error": map[string]any{"code": "call_id_required",
+				"message": "实时通话进行中, 请调用 /voice_calls/{call_id}/hangup"}})
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ret, err := safeExportsCall(ctx, "triggerVoipHangup")

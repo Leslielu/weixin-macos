@@ -3424,6 +3424,533 @@ function voipInboundStatus() {
         deadline: c.deadline, last: voipInboundLast
     });
 }
+// -------------------------VoIP 实时流式分区(voip-stream)-------------------------
+// 实时双向流(设计: docs/VOIP-STREAMING-DESIGN.md): Go 会话层(WS) ⇄ 本分区 ⇄ 原生引擎。
+// 与旧 voipPlay/voipCap 完全独立, 只复用底层原语:
+//   拨号 triggerVoipCall / 挂断 voipHangupNative / 格式 voipEngineFrame /
+//   注入 PutExternalRecordData(每次一帧) / 下行 GetAudioData / mute voipMuteMic。
+// 铁律:
+//   - putExternal 每次只吃一个引擎帧(§17.7); 帧参数每通现读, 禁止写死 960B/1920B
+//   - 接通判定 = 出站静音探测帧 ret==0(等待码漂移按 VOIP_ERR_* 迁移); startTalk 不可独立作接通判据
+//   - tick 无忙等自旋(双向流里自旋会阻塞 recv/clear/采集), 每 tick 至多提交一帧
+//   - ret!=0 不推进提交进度; 只有 ret==0 计入 submitted
+//   - clear 只清本层未提交数据; 已 putExternal 的帧不可撤回(cleared 如实披露)
+// Go→JS: script.post(JSON, PCM 二进制) → recv 循环, op: append|commit|clear|stop
+// JS→Go: send({type:"voip_stream", ev:...}, PCM 二进制?)
+var voipStreamSess = null;   // 当前流式会话(全局一通)
+var voipStreamLast = null;   // 上一通摘要
+
+function voipStreamEmit(fields, bin) {
+    var m = { type: "voip_stream" };
+    if (voipStreamSess) m.callId = voipStreamSess.callId;
+    for (var k in fields) m[k] = fields[k];
+    try { send(m, bin || null); } catch (e) { console.log("[vs] send 失败: " + e); }
+}
+
+// ---- 连续流式重采样: windowed-sinc + Blackman 窗, 跨 chunk 保留相位/历史 ----
+// 降采样截止 min(from,to)/2 抗混叠; 返回 null 表示同率直通。
+// 公开计数: inTotal(喂入), inConsumed(已消费), outTotal(产出, 单声道)。
+function voipStreamResampler(fromRate, toRate) {
+    if (fromRate === toRate) return null;
+    var K = 16;
+    var step = fromRate / toRate;
+    var fc = Math.min(0.5, toRate / (2 * fromRate));
+    var buf = [];            // pending 输入样本(绝对序号 firstAbs..inTotal-1)
+    var firstAbs = 0;
+    var inTotal = 0, inConsumed = 0, outTotal = 0;
+    var flushed = false;
+    var pos = 0;
+    function sinc(x) { if (x === 0) return 1; var p = Math.PI * x; return Math.sin(p) / p; }
+    function win(u) { var x = Math.PI * (u + 1); return 0.42 - 0.5 * Math.cos(x) + 0.08 * Math.cos(2 * x); }
+    var rs = {
+        inTotal: 0, inConsumed: 0, outTotal: 0,
+        process: function (i16, chk) {
+            for (var i = 0; i < i16.length; i++) buf.push(i16[i]);
+            inTotal += i16.length;
+            this._drain(chk);
+        },
+        flush: function (chk) {
+            if (flushed) { this._snap(chk); return; }
+            flushed = true;
+            var pad = Math.ceil(K * step) + 2;
+            for (var i = 0; i < pad; i++) buf.push(0);
+            inTotal += pad;
+            this._drain(chk);
+            inConsumed = inTotal - pad; // 补零不算输入
+            this.inConsumed = inConsumed;
+            this._snap(chk);
+        },
+        _drain: function (chk) {
+            while (Math.floor(pos) + K < inTotal) {
+                var base = Math.floor(pos), frac = pos - base, acc = 0;
+                for (var j = -K; j <= K; j++) {
+                    var idx = base + j - firstAbs;
+                    var s = (idx >= 0 && idx < buf.length) ? buf[idx] : 0;
+                    var x = j - frac;
+                    acc += 2 * fc * sinc(2 * fc * x) * win(x / K) * s;
+                }
+                acc = acc < -32768 ? -32768 : (acc > 32767 ? 32767 : acc);
+                chk.out.push(Math.round(acc));
+                pos += step;
+                outTotal++;
+            }
+            inConsumed = Math.floor(pos) - K;
+            if (inConsumed < 0) inConsumed = 0;
+            this.inConsumed = inConsumed; this.inTotal = inTotal; this.outTotal = outTotal;
+            this._snap(chk);
+            while (firstAbs < pos - K - 64) { buf.shift(); firstAbs++; }
+        },
+        _snap: function (chk) {
+            if (chk) chk.cps.push({ o: outTotal, i: inConsumed });
+        }
+    };
+    return rs;
+}
+
+// Int16Array → LE 字节视图(零拷贝)
+function voipStreamI16ToBytes(i16) {
+    return new Uint8Array(i16.buffer, i16.byteOffset, i16.byteLength);
+}
+
+// 下行字节序启发式修正(与 voipCap 同款): LE 幅度大而 BE 幅度极小 ⇒ 成对交换
+function voipStreamFixEndian(u8) {
+    var n = u8.length - (u8.length % 2);
+    var le = new Int16Array(u8.buffer, u8.byteOffset, n / 2);
+    var maL = 0, k;
+    for (k = 0; k < le.length; k++) maL += le[k] < 0 ? -le[k] : le[k];
+    maL /= le.length;
+    var maB = 0;
+    for (k = 0; k + 1 < n; k += 2) {
+        var sv = (u8[k] << 8) | u8[k + 1];
+        sv = sv > 32767 ? sv - 65536 : sv;
+        maB += sv < 0 ? -sv : sv;
+    }
+    maB /= (n / 2);
+    if (maL > 6000 && maB * 4 < maL) {
+        var sw = new Uint8Array(n);
+        for (k = 0; k < n; k++) sw[k] = u8[k ^ 1];
+        return { i16: new Int16Array(sw.buffer, 0, n / 2), swapped: true };
+    }
+    return { i16: le, swapped: false };
+}
+
+function voipStreamDial(callId, userId, optsJson) {
+    if (voipStreamSess) return "busy";
+    if (!callId || !userId) return "err:callId/userId 为空";
+    var opts = {};
+    try { opts = JSON.parse(optsJson || "{}"); } catch (e) {}
+    var c = {
+        callId: callId, userId: userId, state: "dialing",
+        inRate: opts.inputRate > 0 ? opts.inputRate : 16000,
+        outRate: opts.outputRate > 0 ? opts.outputRate : 24000,
+        queueHardMs: opts.queueHardMs > 0 ? opts.queueHardMs : 1000,
+        maxSec: opts.maxSeconds > 0 ? opts.maxSeconds : 300,
+        svc: null, gen: 1, queue: [], acceptedSrc: 0,
+        outFifo: [], outHead: 0, cps: [], srcSubmittedBase: 0,
+        committed: [], curSeg: null, pendingFlush: null,
+        playT0: 0, playIdx: 0, playTimer: null, probeTimer: null, fmtTimer: null,
+        capTimer: null, cap: null, fmt: null, rs: null,
+        frameBuf: null, putExternal: null, submittedOut: 0, negRets: 0,
+        engineLostTries: 0, probeTries: 0, lastStats: 0, startedAt: Date.now()
+    };
+    try {
+        c.svc = voipService();
+        c.putExternal = new NativeFunction(voipConfModule().base.add(VOIP_PUT_OFF),
+            "int", ["pointer", "pointer", "int", "int", "int"]);
+        c.frameBuf = Memory.alloc(16384);
+    } catch (e) { return "err:" + e; }
+    var r = triggerVoipCall(userId);
+    if (r !== "0") return "dial-failed:" + r;
+    // ⚠️ triggerVoipCall 会 voipKeep.length=0 重置保活池, frameBuf 必须在拨号**之后**入池,
+    // 否则分配被释放, 探测期就是 use-after-free
+    voipKeep.push(c.frameBuf);
+    voipStreamSess = c;
+    voipStreamEmit({ ev: "state", state: "dialing" });
+    vsProbe(c);
+    return "ok";
+}
+
+// 出站接通探测: 每 200ms 试探一帧数字静音。等待码 = 未接听/引擎未就绪, 原地重试;
+// ret==0 = 已接通(探测帧本身是静音, 对方无感)。禁止用 startTalk 判接通(响铃期即≥1)。
+function vsProbe(c) {
+    if (voipStreamSess !== c || c.state !== "dialing") return;
+    c.probeTries++;
+    var ret = null;
+    try { ret = c.putExternal(c.svc, c.frameBuf, 960, 24000, 1); }
+    catch (e) { console.log("[vs] probe put 异常: " + e); }
+    if (ret === 0) { vsAnswered(c); return; }
+    if (ret !== VOIP_ERR_NO_MEMBER && ret !== VOIP_ERR_ENGINE_NOT_READY)
+        console.log("[vs] probe 非等待码 ret=" + ret + " (第" + c.probeTries + "次, 继续等)");
+    if (c.probeTries > c.maxSec * 5) {
+        console.log("[vs] 等接听超时(" + c.maxSec + "s)");
+        vsTeardown(c, "ring_timeout");
+        return;
+    }
+    c.probeTimer = setTimeout(function () { vsProbe(c); }, 200);
+}
+
+// 探测帧被消费 ⇒ 已接听。格式此刻才落定, 200ms 轮询直到可读(最多 25 次)。
+function vsAnswered(c) {
+    if (voipStreamSess !== c) return;
+    c.state = "answer_fmt";
+    console.log("[vs] 接通(等待 " + (c.probeTries * 200) + "ms), 读引擎格式");
+    var tries = 0;
+    function fmtLoop() {
+        if (voipStreamSess !== c) return;
+        var ef = voipEngineFrame(c.svc);
+        if (!ef) {
+            if (++tries > 25) { vsTeardown(c, "backend_error:engine_format_unreadable"); return; }
+            c.fmtTimer = setTimeout(fmtLoop, 200);
+            return;
+        }
+        c.fmt = {
+            frameMs: ef.frameMs, frameBytes: ef.frameBytes, payloadBytes: ef.payloadBytes,
+            engRate: ef.contentRate, engCh: ef.channels, payloadSamples: ef.payloadBytes / 2
+        };
+        var e2 = voipCaptureEngine();
+        c.fmt.capRate = e2 ? e2.rate : ef.contentRate;
+        c.fmt.pullBytes = e2 ? e2.pullBytes : c.fmt.payloadBytes;
+        c.rs = voipStreamResampler(c.inRate, c.fmt.engRate);
+        voipMuteMic(c.svc, "stream-answered");
+        c.state = "connected";
+        c.playT0 = Date.now();
+        c.lastStats = 0;
+        voipStreamEmit({ ev: "state", state: "connected", answerDetection: "put_ready_inferred",
+            engineFormat: c.fmt });
+        vsCapStart(c);
+        c.playTimer = setTimeout(function () { vsPlayTick(c); }, 0);
+    }
+    fmtLoop();
+}
+
+// 排空队列 → 重采样器(每 tick 有界); 段界到时先 flush 上一段再喂新段
+function vsFeed(c) {
+    var fed = 0;
+    while (c.queue.length && fed < 30) {
+        if (c.pendingFlush && c.queue[0].seg !== c.pendingFlush) {
+            if (c.rs) { var chk0 = { out: [], cps: [] }; c.rs.flush(chk0);
+                for (var i0 = 0; i0 < chk0.out.length; i0++) c.outFifo.push(chk0.out[i0]); }
+            c.pendingFlush = null;
+        }
+        var ch = c.queue.shift();
+        var chk = { out: [], cps: [] };
+        if (c.rs) { c.rs.process(ch.samples, chk); }
+        else { for (var i = 0; i < ch.samples.length; i++) chk.out.push(ch.samples[i]);
+            chk.cps.push({ o: chk.out.length, i: ch.samples.length }); }
+        for (var j = 0; j < chk.out.length; j++) c.outFifo.push(chk.out[j]);
+        c.cps = c.cps.concat(chk.cps);
+        fed++;
+    }
+    if (c.pendingFlush && c.queue.length === 0) {
+        if (c.rs) { var chk1 = { out: [], cps: [] }; c.rs.flush(chk1);
+            for (var i1 = 0; i1 < chk1.out.length; i1++) c.outFifo.push(chk1.out[i1]); }
+        c.pendingFlush = null;
+    }
+}
+
+// 已成功提交(引擎域单声道)对应的源样本位置 —— 用 checkpoint 保守推进
+// (2026-11-15 轮B修复: checkpoint 耗尽后结果必须持久化, 否则 consumed 会回退)
+function vsSrcSubmitted(c) {
+    if (!c.rs) return Math.min(c.acceptedSrc, c.submittedOut);
+    var base = c.srcSubmittedBase || 0;
+    while (c.cps.length && c.cps[0].o <= c.submittedOut) {
+        base = c.cps[0].i;
+        c.cps.shift();
+    }
+    c.srcSubmittedBase = base;
+    return Math.min(base, c.acceptedSrc);
+}
+
+function vsQueuedMs(c) {
+    if (!c.fmt) return 0;
+    var q;
+    if (c.rs) {
+        var backlog = (c.rs.outTotal - c.submittedOut) / c.fmt.engRate * 1000;
+        q = (c.acceptedSrc - c.rs.inConsumed) / c.inRate * 1000;
+        var v = q + backlog;
+        return v < 0 ? 0 : v;
+    }
+    q = (c.acceptedSrc - c.submittedOut) / c.inRate * 1000;
+    return q < 0 ? 0 : q;
+}
+
+// 提交一帧: 从 outFifo 取 payloadSamples(按声道复制), 内容+零尾, ret==0 才推进
+// (outFifo 用头指针代替 shift, 避免每帧 O(n) 搬移)
+function vsSubmitOne(c) {
+    var f = c.fmt;
+    var contentSamples = f.payloadSamples;
+    if (c.outFifo.length - c.outHead < contentSamples) return false;
+    var frameU8 = new Uint8Array(f.frameBytes); // 全零 = 零尾
+    var dv = new DataView(frameU8.buffer);
+    var o = 0;
+    for (var i = 0; i < contentSamples; i++) {
+        var s = c.outFifo[c.outHead++];
+        if (f.engCh === 2) {
+            dv.setInt16(o, s, true); dv.setInt16(o + 2, s, true); o += 4;
+        } else { dv.setInt16(o, s, true); o += 2; }
+    }
+    if (c.outHead > 4096) { c.outFifo = c.outFifo.slice(c.outHead); c.outHead = 0; }
+    try { c.frameBuf.writeByteArray(frameU8); } catch (e) {
+        console.log("[vs] frameBuf 写入异常: " + e);
+        vsTeardown(c, "backend_error:framebuf"); return false;
+    }
+    var ret = null;
+    try { ret = c.putExternal(c.svc, c.frameBuf, f.frameBytes, 24000, f.engCh); }
+    catch (e) { console.log("[vs] put 异常: " + e);
+        vsTeardown(c, "backend_error:put_exception"); return false; }
+    if (ret === VOIP_ERR_NO_MEMBER || ret === VOIP_ERR_ENGINE_NOT_READY) {
+        c.engineLostTries++;
+        if (c.engineLostTries > 25) vsTeardown(c, "engine_lost");
+        return false;
+    }
+    if (ret !== 0) {
+        c.negRets++;
+        console.log("[vs] put 非零 ret=" + ret + " (#" + c.negRets + ")");
+        if (c.negRets >= 20) vsTeardown(c, "backend_error:put_" + ret);
+        return false;
+    }
+    c.negRets = 0; c.engineLostTries = 0;
+    c.submittedOut += contentSamples;
+    vsCheckSegmentDone(c);
+    return true;
+}
+
+// 已提交位置越过已 commit 段尾 ⇒ 该段本层提交完成
+function vsCheckSegmentDone(c) {
+    while (c.committed.length && vsSrcSubmitted(c) >= c.committed[0].end) {
+        var seg = c.committed.shift();
+        voipStreamEmit({ ev: "segment_done", generation: c.gen, segmentId: seg.seg,
+            consumedSamples: Math.round(vsSrcSubmitted(c)),
+            submittedEngSamples: c.submittedOut });
+    }
+}
+
+function vsPlayTick(c) {
+    if (voipStreamSess !== c || c.state !== "connected") return;
+    c.playTimer = null;
+    vsFeed(c);
+    if (c.fmt && c.outFifo.length - c.outHead >= c.fmt.payloadSamples) vsSubmitOne(c);
+    var now = Date.now();
+    if (now - c.lastStats >= 100) {
+        c.lastStats = now;
+        voipStreamEmit({ ev: "stats", generation: c.gen, segmentId: c.curSeg || "",
+            submittedEngSamples: c.submittedOut,
+            consumedSamples: Math.round(vsSrcSubmitted(c)),
+            queuedMs: Math.round(vsQueuedMs(c)) });
+    }
+    c.playIdx++;
+    var deadline = c.playT0 + c.playIdx * (c.fmt ? c.fmt.frameMs : 20);
+    var d = deadline - Date.now();
+    c.playTimer = setTimeout(function () { vsPlayTick(c); }, d > 5 ? d - 5 : 0);
+}
+
+// ---- 下行采集: 引擎率 → 客户端率重采样 → 二进制 send 给 Go ----
+function vsCapStart(c) {
+    var tries = 0;
+    function arm() {
+        if (voipStreamSess !== c || c.state !== "connected") return;
+        var e = voipCaptureEngine();
+        if (!e) {
+            if (++tries > 50) { console.log("[vs] 下行引擎未就绪, 放弃采集"); return; }
+            c.capTimer = setTimeout(arm, 200);
+            return;
+        }
+        try {
+            var setStatus = new NativeFunction(voipConfModule().base.add(VOIP_SETPLAY_OFF),
+                "int", ["pointer", "int", "int"]);
+            setStatus(e.ce, 1, 1);
+        } catch (e2) { console.log("[vs] setStatus 异常: " + e2); }
+        c.cap = {
+            ce: e.ce, pullBytes: e.pullBytes, rate: e.rate, frameMs: e.frameMs,
+            buf: Memory.alloc(16384), outP: Memory.alloc(16),
+            t0: Date.now(), idx: 0, seq: 0, off: 0,
+            gapFrames: 0, gapSamples: 0, swapN: 0,
+            rs: voipStreamResampler(e.rate, c.outRate)
+        };
+        voipKeep.push(c.cap.buf); voipKeep.push(c.cap.outP);
+        c.cap.buf.writeByteArray(new Uint8Array(16384));
+        console.log("[vs] 开采 rate=" + e.rate + " pull=" + e.pullBytes + "B → " + c.outRate + "Hz");
+        c.capTimer = setTimeout(function () { vsCapTick(c); }, 0);
+    }
+    arm();
+}
+
+function vsCapTick(c) {
+    if (voipStreamSess !== c || !c.cap) return;
+    var cap = c.cap;
+    c.capTimer = null;
+    var st = 0;
+    try { st = cap.ce.add(VOIP_CE_STARTTALK_OFF).readU32(); } catch (e) {}
+    if (st < 1) {
+        voipStreamEmit({ ev: "state", state: "remote_end_hint", detection: "start_talk_down" });
+        c.cap = null;
+        return;
+    }
+    var r = null;
+    try {
+        cap.buf.writeByteArray(new Uint8Array(cap.pullBytes));
+        var getAudio = new NativeFunction(voipConfModule().base.add(VOIP_GETAUDIO_OFF),
+            "int", ["pointer", "pointer", "int", "pointer"]);
+        r = getAudio(cap.ce, cap.buf, cap.pullBytes, cap.outP);
+    } catch (e) { console.log("[vs] 拉取异常: " + e);
+        vsTeardown(c, "backend_error:getaudio"); return; }
+    if (r !== 0) {
+        cap.gapFrames++; cap.gapSamples += cap.pullBytes / 2;
+        if (cap.gapFrames % 25 === 1)
+            voipStreamEmit({ ev: "input_gap", frames: cap.gapFrames,
+                missingSamples: cap.gapSamples });
+    } else {
+        var u8 = new Uint8Array(cap.buf.readByteArray(cap.pullBytes));
+        var fx = voipStreamFixEndian(u8);
+        if (fx.swapped) cap.swapN++;
+        var out = fx.i16;
+        if (cap.rs) { var chk = { out: [], cps: [] }; cap.rs.process(fx.i16, chk); out = chk.out; }
+        if (out && out.length) {
+            var i16 = new Int16Array(out.length);
+            for (var i = 0; i < out.length; i++) i16[i] = out[i];
+            var off = cap.off;
+            cap.off += out.length;
+            cap.seq++;
+            voipStreamEmit({ ev: "input", seq: cap.seq, sampleOffset: off,
+                rate: c.outRate, samples: out.length }, voipStreamI16ToBytes(i16).buffer);
+        }
+    }
+    cap.idx++;
+    var deadline = cap.t0 + cap.idx * cap.frameMs;
+    var d = deadline - Date.now();
+    c.capTimer = setTimeout(function () { vsCapTick(c); }, d > 5 ? d - 5 : 0);
+}
+
+function vsTeardown(c, reason) {
+    if (voipStreamSess !== c) return;
+    if (c.playTimer) { clearTimeout(c.playTimer); c.playTimer = null; }
+    if (c.probeTimer) { clearTimeout(c.probeTimer); c.probeTimer = null; }
+    if (c.fmtTimer) { clearTimeout(c.fmtTimer); c.fmtTimer = null; }
+    if (c.capTimer) { clearTimeout(c.capTimer); c.capTimer = null; }
+    var srcSub = Math.round(vsSrcSubmitted(c));
+    voipStreamLast = {
+        callId: c.callId, reason: reason, answered: c.state === "connected",
+        generation: c.gen, acceptedSrc: c.acceptedSrc, srcSubmitted: srcSub,
+        submittedEng: c.submittedOut, swapN: c.cap ? c.cap.swapN : 0,
+        gapFrames: c.cap ? c.cap.gapFrames : 0, seconds: (Date.now() - c.startedAt) / 1000
+    };
+    voipStreamSess = null;
+    console.log("[vs] 结束 reason=" + reason + " submitted=" + c.submittedOut +
+        " src=" + srcSub + "/" + c.acceptedSrc);
+    // ⚠️ 必须显式带 callId(voipStreamSess 已置 null, emit 取不到), 否则 Go 路由不到,
+    // 资源释放确认丢失 → manager 被误标 unhealthy(2026-11-15 轮B实测)
+    voipStreamEmit({ ev: "stopped", callId: c.callId, reason: reason });
+}
+
+// ---- Go→JS 命令处理(recv 循环, 与音频同通道保序) ----
+function vsHandleIn(msg, data) {
+    var c = voipStreamSess;
+    if (!c || (msg.callId && msg.callId !== c.callId)) {
+        var codeMap = { append: "append_ack", commit: "commit_ack", clear: "clear_ack" };
+        var ev0 = codeMap[msg.op];
+        if (ev0) voipStreamEmit({ ev: ev0, reqId: msg.reqId, ok: false, code: "no_session",
+            generation: msg.generation || 0, seq: msg.seq || 0 });
+        return;
+    }
+    switch (msg.op) {
+        case "append": {
+            function ack(ok, code) {
+                voipStreamEmit({ ev: "append_ack", reqId: msg.reqId, generation: msg.generation,
+                    seq: msg.seq, ok: ok, code: code || "",
+                    queuedMs: Math.round(vsQueuedMs(c)) });
+            }
+            if (c.state !== "connected") { ack(false, "not_connected"); return; }
+            if (msg.generation !== c.gen) {
+                ack(false, msg.generation < c.gen ? "stale_generation" : "invalid_generation");
+                return;
+            }
+            if (!data || data.byteLength === 0 || (data.byteLength % 2) !== 0 ||
+                data.byteLength > 9600) { ack(false, "invalid_frame"); return; }
+            var samples = new Int16Array(data);
+            var ms = samples.length * 1000 / c.inRate;
+            if (vsQueuedMs(c) + ms > c.queueHardMs) { ack(false, "buffer_full"); return; }
+            c.queue.push({ seg: msg.segmentId || "default", samples: samples });
+            c.acceptedSrc += samples.length;
+            if (!c.curSeg) c.curSeg = msg.segmentId || "default";
+            ack(true, "");
+            return;
+        }
+        case "commit": {
+            function ackC(ok, code) {
+                voipStreamEmit({ ev: "commit_ack", reqId: msg.reqId, ok: ok, code: code || "" });
+            }
+            if (msg.generation !== c.gen) { ackC(false, "stale_generation"); return; }
+            if (!c.curSeg) { ackC(false, "empty_segment"); return; }
+            // 段内全部喂完后 flush(重采样器尾帧), 段 done 才能准时上报
+            c.committed.push({ seg: c.curSeg, end: c.acceptedSrc });
+            if (!c.rs || c.queue.length === 0) {
+                var chk = { out: [], cps: [] };
+                if (c.rs) c.rs.flush(chk);
+                for (var i = 0; i < chk.out.length; i++) c.outFifo.push(chk.out[i]);
+                c.cps = c.cps.concat(chk.cps);
+            } else {
+                c.pendingFlush = c.curSeg;
+            }
+            c.curSeg = null;
+            ackC(true, "");
+            vsCheckSegmentDone(c);
+            return;
+        }
+        case "clear": {
+            function ackX(ok, code) {
+                voipStreamEmit({ ev: "clear_ack", reqId: msg.reqId, ok: ok, code: code || "" });
+            }
+            if (msg.newGeneration !== c.gen + 1) { ackX(false, "invalid_generation"); return; }
+            var dropped = c.acceptedSrc - Math.round(vsSrcSubmitted(c));
+            var consumed = Math.round(vsSrcSubmitted(c));
+            var finalSeg = c.committed.length ? c.committed[c.committed.length - 1].seg : "";
+            c.queue = []; c.outFifo = []; c.outHead = 0;
+            c.cps = []; c.srcSubmittedBase = 0; c.committed = [];
+            c.pendingFlush = null; c.curSeg = null;
+            c.rs = c.fmt ? voipStreamResampler(c.inRate, c.fmt.engRate) : null;
+            c.acceptedSrc = 0; c.submittedOut = 0; c.engineLostTries = 0; c.negRets = 0;
+            c.gen = msg.newGeneration;
+            console.log("[vs] clear gen=" + msg.oldGeneration + "→" + msg.newGeneration +
+                " dropped=" + dropped + " consumed=" + consumed);
+            voipStreamEmit({ ev: "clear_ack", reqId: msg.reqId, ok: true,
+                oldGeneration: msg.oldGeneration, newGeneration: msg.newGeneration,
+                droppedSamples: dropped, consumedSamples: consumed,
+                finalSegment: finalSeg, queueEmpty: true });
+            return;
+        }
+        case "stop": {
+            vsTeardown(c, msg.reason || "stop-request");
+            return;
+        }
+    }
+}
+
+function vsPump() {
+    recv("voip_stream_in", function (msg, data) {
+        try { vsHandleIn(msg, data); } catch (e) {
+            console.log("[vs] 处理异常: " + e);
+            voipStreamEmit({ ev: "backend_error", detail: String(e) });
+        }
+        vsPump();
+    });
+}
+vsPump();
+
+function voipStreamStatus() {
+    var c = voipStreamSess;
+    if (!c) return JSON.stringify({ active: false, last: voipStreamLast });
+    return JSON.stringify({
+        active: true, callId: c.callId, state: c.state, generation: c.gen,
+        inRate: c.inRate, outRate: c.outRate,
+        queuedMs: c.fmt ? Math.round(vsQueuedMs(c)) : 0,
+        acceptedSrc: c.acceptedSrc,
+        srcSubmitted: c.fmt ? Math.round(vsSrcSubmitted(c)) : 0,
+        submittedEng: c.submittedOut, probeTries: c.probeTries,
+        fmt: c.fmt, last: null
+    });
+}
+// -------------------------VoIP 实时流式分区结束-------------------------
+
 // -------------------------语音通话(VoIP)分区-------------------------
 
 rpc.exports = {
@@ -3451,6 +3978,8 @@ rpc.exports = {
     voipInboundArm: voipInboundArm,
     voipInboundDisarm: voipInboundDisarm,
     voipInboundStatus: voipInboundStatus,
+    voipStreamDial: voipStreamDial,
+    voipStreamStatus: voipStreamStatus,
 };
 
 // -------------------------发送图片消息分区-------------------------

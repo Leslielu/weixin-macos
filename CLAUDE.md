@@ -164,6 +164,17 @@ Each WeChat version requires specific memory offsets in `wechat_version/*.json`.
   **验门控前必须重启微信清锁存**——锁存状态下麦克风通路已被旁路，对照轮可能同样零洞，
   A/B 会失真（先跑对照轮确认能复现 ~59% 再用它判门控）。
   录音验收用 `tools/voip/verify_recording.py`（0 洞 ≠ 内容对，还要 env_corr≥0.7）。
+- 实时双向语音流（2026-11-15 实现自动化全绿，**真机验收未做，勿投产**）：`/voice_calls` 五路由
+  （`GET /voice_calls/capabilities`、`POST /voice_calls` 预留、`WS /voice_calls/{id}/stream`、
+  `GET /voice_calls/{id}`、`POST /voice_calls/{id}/hangup`），JSON+base64 PCM WebSocket 协议
+  （generation/segment/seq、commit、clear、背压 buffer_full、input gap、心跳 ping 10s/pong 30s）。
+  设计 `docs/VOIP-STREAMING-DESIGN.md`；实现 `onebot/voice_stream*.go` + `onebot/script.js`
+  的「VoIP 实时流式分区」+ 联调客户端 `tools/voip/stream_client.py`（`--start` 才拨号）。
+  onebot 新增 `-stream_token`（空 = 实时路由 fail-closed 禁用）、`-stream_origins`。
+  与旧文件通话/入站接听共用 `voiceCallMu` 全局锁（实时期间旧 `/hangup_voice_call` 回 409
+  call_id_required）。进度/done 口径=`submitted_to_wechat`（不是对方已听到）；clear 只清
+  onebot 队列（已提交原生帧不可撤回，capabilities 如实标 false）；接通=inferred（出站静音
+  探测帧 ret==0），rejected/busy 事件**未实现**（capabilities 标 false）。
 - For OpenClaw integration, see `onebot/readme.md`
 
 ## IDA Pro Usage

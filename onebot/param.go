@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -167,6 +168,24 @@ type Config struct {
 	WechatPid       int    `json:"wechat_pid"`
 
 	WechatConf string `json:"wechat_conf"`
+
+	// 实时语音流(docs/VOIP-STREAMING-DESIGN.md): 内部 Bearer token(空=实时路由 fail-closed)
+	StreamToken     string `json:"stream_token"`
+	StreamOriginsRaw string `json:"stream_origins"`
+}
+
+// StreamOrigins 解析逗号分隔的 Origin 白名单
+func (c *Config) StreamOrigins() []string {
+	if c.StreamOriginsRaw == "" {
+		return nil
+	}
+	var out []string
+	for _, o := range strings.Split(c.StreamOriginsRaw, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			out = append(out, o)
+		}
+	}
+	return out
 }
 
 // VoiceMsg 对应外层的 <msg> 标签
