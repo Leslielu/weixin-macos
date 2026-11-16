@@ -166,6 +166,12 @@ onebot 启动干净：脚本全量加载、hook 全就位、无 ERROR/panic。
 ④ **stop 改走 RPC 通道**——布防态（无音频流量）的 Post+recv 送达失败（未深究 frida recv
 根因），RPC 传输已被反复验证；clear/append 保留 Post 通道（仅 connected 后发生）。
 ⑤ 联调客户端 `--incoming`/`--window`。
+⑥ **micGate hook 漏挂修复（2026-11-16 晚，用户实听复现 40ms 空洞+变慢）**：布防路径只调了
+`voipMicGateBegin`（一次性写 mode=2，被 SDK 在每次原生回调前写回 0），漏了旧 voipPlay 的
+`voipMicGateAttach()`（回调入口 onEnter 常驻拦）——已在布防时补挂并加日志；门控计数器
+（micGateCallbacks/Writes）暴露到 voipStreamStatus 便于核验。修复后用户实听：多遍 TTS
+循环播报全部清晰，无断续、无变慢。**教训：门控=「挂 hook」而非「写一次字段」，二者缺一
+即回到 §17.9 病灶**。
 
 ### 轮 D（待做）：验收矩阵剩余项
 

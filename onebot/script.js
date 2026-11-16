@@ -3609,6 +3609,10 @@ function voipStreamArmIncoming(callId, userId, optsJson) {
     voipKeep.push(c.frameBuf);
     voipStreamSess = c;
     voipInboundAttachRing(); // 常驻 hook 只挂不拆, 与旧入站路径共用
+    // ⚠️ micGate 的 HOOK 必须在布防时挂(旧 voipPlay 同款): SDK 每次原生录音回调前会把
+    // mode 写回 0, vsSetupConnected 里的 Begin 一次性写 2 会被覆盖, 只有回调入口
+    // onEnter 拦得住(§17.9)。漏挂 = 接听方 40ms 空洞+变慢(2026-11-16 用户实听复现)
+    if (c.micGate && !voipMicGateAttach()) c.micGate = false;
     // 窗口到期兜底(Go 侧 deadline 主导, JS 双保险)
     c.probeTimer = setTimeout(function () { vsArmWatch(c); }, c.windowMs + 1000);
     console.log("[vs] 入站布防 callId=" + callId + " window=" +
@@ -4085,6 +4089,9 @@ function voipStreamStatus() {
     return JSON.stringify({
         active: true, callId: c.callId, state: c.state, generation: c.gen,
         incoming: c.incoming, roomId: c.roomId || null,
+        micGate: !!c.micGate, micGateEng: !!(c.micGate && c.micGateEng),
+        micGateCallbacks: c.micGateCallbacks || 0,
+        micGateWrites: c.micGateWrites || 0,
         inRate: c.inRate, outRate: c.outRate,
         queuedMs: c.fmt ? Math.round(vsQueuedMs(c)) : 0,
         acceptedSrc: c.acceptedSrc,
