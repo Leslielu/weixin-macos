@@ -113,7 +113,8 @@ for programmatic message sending and receiving.
   auto-answer → same protocol; connect judged by startTalk+engine format, callee
   playback uses noPad+micGate per §17.9; fields `window_s`/`answer_delay_ms`/
   `mute_mic`/`mic_gate`, end reason `window_expired`). Design:
-  `docs/VOIP-STREAMING-DESIGN.md`, progress: `docs/VOIP-STREAMING-PROGRESS.md`;
+  `docs/VOIP-STREAMING-DESIGN.md`, progress: `docs/VOIP-STREAMING-PROGRESS.md`,
+  integration guide for mumble: `docs/VOIP-STREAMING-API.md`;
   code: `onebot/voice_stream*.go`, the "VoIP 实时流式分区" section of
   `onebot/script.js`, debug client `tools/voip/stream_client.py` (outbound dials
   only with explicit `--start`; inbound uses `--incoming`). New onebot

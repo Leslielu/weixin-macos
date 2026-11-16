@@ -172,7 +172,7 @@ Each WeChat version requires specific memory offsets in `wechat_version/*.json`.
   `mode:"incoming_stream"`（呼入布防：创建即布防→ringing→自动接听→同协议；接通判定用
   startTalk+格式，接听方播放 noPad+micGate 消洞；字段 `window_s`/`answer_delay_ms`/
   `mute_mic`/`mic_gate`，结束原因 `window_expired`）。
-  设计 `docs/VOIP-STREAMING-DESIGN.md`、进展 `docs/VOIP-STREAMING-PROGRESS.md`；
+  设计 `docs/VOIP-STREAMING-DESIGN.md`、进展 `docs/VOIP-STREAMING-PROGRESS.md`、mumble 接入文档 `docs/VOIP-STREAMING-API.md`；
   实现 `onebot/voice_stream*.go` + `onebot/script.js` 的「VoIP 实时流式分区」+
   联调客户端 `tools/voip/stream_client.py`（出站 `--start` 才拨号；入站 `--incoming`）。
   onebot 新增 `-stream_token`（空 = 实时路由 fail-closed 禁用）、`-stream_origins`。

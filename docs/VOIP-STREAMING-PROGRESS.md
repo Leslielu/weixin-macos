@@ -1,6 +1,6 @@
 # VoIP 实时流式 — 进展文档
 
-设计：`docs/VOIP-STREAMING-DESIGN.md`　需求：`wxgate-streaming-voice-requirements.md`（2026-11-15）
+设计：`docs/VOIP-STREAMING-DESIGN.md`　**mumble 接入文档：`docs/VOIP-STREAMING-API.md`（v1 契约+样例）**　需求：`wxgate-streaming-voice-requirements.md`（2026-11-15）
 本文跟踪实施与真机冒烟进展；实现细节看设计稿，通话底层标定看 `docs/VOIP-CALL-STATUS.md`。
 
 ## 1. 阶段状态
