@@ -166,6 +166,8 @@ type streamStatsSnapshot struct {
 	gapFrames       int64
 	gapSamples      int64
 	inDropFrames    int64
+	callerWxid      string
+	roomId          string
 	engineFormat    map[string]any
 	answerDetection string
 }
@@ -246,6 +248,8 @@ type streamSession struct {
 	gapSamples      int64
 	inDropFrames    int64
 	inDropSamples   int64
+	callerWxid      string
+	roomId          string
 	engineFormat    map[string]any
 	answerDetection string
 
@@ -318,7 +322,8 @@ func (s *streamSession) publishStats() {
 		consumedSrc: s.consumedSrc, queuedMs: s.queuedMs,
 		acceptedChunks: s.acceptedChunks, inputFrames: s.inputFrames,
 		gapFrames: s.gapFrames, gapSamples: s.gapSamples,
-		inDropFrames: s.inDropFrames, engineFormat: s.engineFormat,
+		inDropFrames: s.inDropFrames, callerWxid: s.callerWxid,
+		roomId: s.roomId, engineFormat: s.engineFormat,
 		answerDetection: s.answerDetection,
 	}
 	s.stats.Store(snap)
@@ -796,14 +801,27 @@ func (s *streamSession) bridgeState(f map[string]any) {
 		if s.getState() != "reserved" {
 			return
 		}
-		s.setState("ringing")
+		s.mu.Lock()
+		s.state = "ringing"
+		if cw, _ := f["callerWxid"].(string); cw != "" {
+			s.callerWxid = cw
+		}
+		if rid, _ := f["roomId"].(string); rid != "" {
+			s.roomId = rid
+		}
+		caller := s.callerWxid
+		s.mu.Unlock()
+		s.publishStats()
 		st := s.envelope("call.state")
 		st["state"] = "ringing"
 		if v, ok := f["roomKnown"].(bool); ok {
 			st["room_known"] = v
 		}
+		if caller != "" {
+			st["caller_wxid"] = caller
+		}
 		s.pushEvent(st)
-		Info("voip-stream: 来电响铃", "call_id", s.id, "user_id", s.userID)
+		Info("voip-stream: 来电响铃", "call_id", s.id, "caller", caller)
 	case "connected":
 		st := s.getState()
 		if st != "dialing" && st != "ringing" {
@@ -827,6 +845,11 @@ func (s *streamSession) bridgeState(f map[string]any) {
 		stEv := s.envelope("call.state")
 		stEv["state"] = "connected"
 		stEv["answer_detection"] = s.answerDetection
+		s.mu.Lock()
+		if s.callerWxid != "" {
+			stEv["caller_wxid"] = s.callerWxid
+		}
+		s.mu.Unlock()
 		if ef != nil {
 			stEv["engine_format"] = ef
 		}
@@ -1125,6 +1148,8 @@ func (s *streamSession) endedStats() map[string]any {
 	s.mu.Unlock()
 	m := map[string]any{
 		"duration_ms": durMs,
+		"caller_wxid": snap.callerWxid,
+		"room_id":     snap.roomId,
 		"input": map[string]any{
 			"frames": snap.inputFrames, "gap_frames": snap.gapFrames,
 			"gap_missing_samples": snap.gapSamples,
@@ -1184,8 +1209,16 @@ func (s *streamSession) sweep() {
 			return
 		}
 	case "ending":
-		if now.After(s.stopAckDeadline) {
-			s.completeEnding() // stop ack 超时: released=false(含入站 dialed=false 会话)
+		s.mu.Lock()
+		stopSeen := s.stopSeen
+		s.mu.Unlock()
+		// stop 每轮 sweep 重发直到 JS 确认: 单发曾被吞导致 JS 幽灵会话(背着 Go 接听了
+		// 一通电话, 2026-11-16)。RPC 廉价, 幽灵会话会偷接来电并碰已释放引擎, 必须杀干净
+		if !stopSeen {
+			_ = s.backend.Stop(s.id, "stop-retry")
+		}
+		if stopSeen || now.After(s.stopAckDeadline) {
+			s.completeEnding() // 确认 或 超时放弃(released=false)
 			return
 		}
 	}
@@ -1495,6 +1528,8 @@ func (s *streamSession) snapshot() map[string]any {
 	m := map[string]any{
 		"call_id": s.id, "user_id": s.userID, "source": s.source,
 		"direction": map[bool]string{true: "incoming", false: "outbound"}[s.incoming],
+		"caller_wxid": snap.callerWxid,
+		"room_id":     snap.roomId,
 		"state": st, "end_reason": reason, "end_detection": detection,
 		"dialed": dialed, "answered": answered, "resources_released": released,
 		"input_format": s.inFmt, "output_format": s.outFmt,

@@ -204,8 +204,9 @@ class Client:
                 ev = json.loads(raw)
                 t = ev.get("type")
                 if t == "call.state":
-                    self.log("state=%s detection=%s engine=%s",
-                             ev.get("state"), ev.get("answer_detection"),
+                    self.log("state=%s caller=%s detection=%s engine=%s",
+                             ev.get("state"), ev.get("caller_wxid"),
+                             ev.get("answer_detection"),
                              json.dumps(ev.get("engine_format")))
                     if ev.get("state") == "connected" and conn_evt is not None:
                         conn_evt.set()

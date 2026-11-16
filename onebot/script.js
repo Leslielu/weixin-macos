@@ -3181,6 +3181,49 @@ function voipParseRoomFromNotify(ptr, len) {
     } catch (e) { return null; }
 }
 
+// 来话通知 protobuf: field1=type, field2=room 子消息(2026-11-16 dump 实测):
+//   {1: roomid(varint), 2/3/4: varint, 5/6: 设备串(@im.wechat), 7: 主叫wxid,
+//    8: 被叫wxid, 9: "wechat", 10: "voip-2pj"}
+// 返回主叫 wxid(找不到返回 null)
+function voipParseNotifyCaller(b) {
+    function varint(arr, i) {
+        var v = 0, sh = 0, by;
+        do { by = arr[i++]; v += (by & 0x7f) * Math.pow(2, sh); sh += 7; } while ((by & 0x80) && i < arr.length);
+        return [v, i];
+    }
+    var i = 0;
+    while (i < b.length) {
+        var tag = b[i++];
+        var f = tag >> 3, w = tag & 7, r;
+        if (w === 2) {
+            r = varint(b, i); var l = r[0]; i = r[1];
+            if (f === 2) {
+                var end = i + l, j = i;
+                while (j < end) {
+                    var t2 = b[j++];
+                    var f2 = t2 >> 3, w2 = t2 & 7;
+                    if (w2 === 0) { r = varint(b, j); j = r[1]; }
+                    else if (w2 === 2) {
+                        r = varint(b, j); var l2 = r[0]; j = r[1];
+                        if (f2 === 7) {
+                            var s = "";
+                            for (var k = 0; k < l2 && j + k < b.length; k++)
+                                s += String.fromCharCode(b[j + k]);
+                            return s;
+                        }
+                        j += l2;
+                    } else if (w2 === 5) j += 4;
+                    else if (w2 === 1) j += 8;
+                    else return null;
+                }
+            }
+            i += l;
+        } else if (w === 0) { r = varint(b, i); i = r[1]; }
+        else return null;
+    }
+    return null;
+}
+
 function voipOnIncoming(args) {
     var sc = voipStreamSess;
     if (sc && sc.incoming) {
@@ -3633,15 +3676,20 @@ function vsOnIncomingNotify(c, args) {
     if (now > c.armDeadline) { vsTeardown(c, "window_expired"); return; }
     if (now - c.lastNotifyTs < 800) return; // 通知风暴去抖(与旧入站同参)
     c.lastNotifyTs = now;
+    var caller = null;
     try {
         var len = args[2].toInt32();
         if (len > 0 && len <= 65536) {
+            var raw = new Uint8Array(args[1].readByteArray(Math.min(len, 2048)));
             var room = voipParseRoomFromNotify(args[1], len);
             if (room) c.roomId = room;
+            caller = voipParseNotifyCaller(raw);
+            if (caller) c.callerWxid = caller;
         }
     } catch (e) {}
     c.state = "ringing";
-    voipStreamEmit({ ev: "state", state: "ringing", roomKnown: !!c.roomId });
+    voipStreamEmit({ ev: "state", state: "ringing", roomKnown: !!c.roomId,
+        callerWxid: c.callerWxid || null });
     console.log("[vs-in] 来话 room=" + c.roomId + " 延迟 " + c.answerDelayMs + "ms 接听");
     c.fmtTimer = setTimeout(function () { vsIncomingAnswer(c); }, c.answerDelayMs);
 }

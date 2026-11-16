@@ -792,12 +792,17 @@ func TestStreamIncomingFlow(t *testing.T) {
 	if st["state"] != "reserved" {
 		t.Fatalf("incoming start 应回当前状态: %v", st)
 	}
-	// 来电响铃
+	// 来电响铃(带主叫 wxid)
 	fb.submit(map[string]any{"ev": "state", "callId": id, "state": "ringing",
-		"roomKnown": true})
+		"roomKnown": true, "callerWxid": "wxid_caller", "roomId": "123"})
 	ring := wsRecv(t, conn, "call.state")
-	if ring["state"] != "ringing" {
-		t.Fatalf("期望 ringing: %v", ring)
+	if ring["state"] != "ringing" || ring["caller_wxid"] != "wxid_caller" {
+		t.Fatalf("期望 ringing + caller_wxid: %v", ring)
+	}
+	// 快照也带 caller
+	_, snap := e.do("GET", "/voice_calls/"+id, "", nil)
+	if d, _ := snap["data"].(map[string]any); d["caller_wxid"] != "wxid_caller" {
+		t.Fatalf("snapshot caller_wxid 异常: %v", d["caller_wxid"])
 	}
 	// 自动接听完成
 	fb.submit(map[string]any{"ev": "state", "callId": id, "state": "connected",

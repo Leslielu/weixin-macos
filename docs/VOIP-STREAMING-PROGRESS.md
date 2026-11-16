@@ -173,6 +173,15 @@ onebot 启动干净：脚本全量加载、hook 全就位、无 ERROR/panic。
 循环播报全部清晰，无断续、无变慢。**教训：门控=「挂 hook」而非「写一次字段」，二者缺一
 即回到 §17.9 病灶**。
 
+### 补记：主叫 wxid 识别 —— 2026-11-17 ✅
+
+来话通知 protobuf 的 room 子消息里就带着双方身份（dump 实测）：field7=主叫 wxid、
+field8=被叫 wxid。解析器（voipParseNotifyCaller，protobuf walk）已实现并用真实通知字节
+单测通过；`ringing`/`connected` 事件带 `caller_wxid`，会话快照与 `call.ended.stats` 同步
+携带。下游（mumble）从 `call.state(ringing)` 即可知道"谁打来的"，关联具体用户。
+配套加固：**Go 会话结束后 stop 每 500ms 重发直到 JS 确认**——单发被吞会产生 JS 幽灵
+会话，背着 Go 偷接来电（本机复现过一例，微信 crash 疑与此相关）。
+
 ### 轮 D（待做）：验收矩阵剩余项
 
 - 连续快速打断 20 次（协议自动化已覆盖，真机未做）
