@@ -3182,6 +3182,13 @@ function voipParseRoomFromNotify(ptr, len) {
 }
 
 function voipOnIncoming(args) {
+    var sc = voipStreamSess;
+    if (sc && sc.incoming) {
+        try { vsOnIncomingNotify(sc, args); } catch (e) {
+            console.log("[vs-in] 来话处理异常: " + e);
+        }
+        return;
+    }
     var c = voipInbound;
     if (!c || c.phase !== "armed") return;
     if (Date.now() > c.deadline) { voipInboundDisarmInternal("window-expired"); return; }
@@ -3534,13 +3541,11 @@ function voipStreamFixEndian(u8) {
     return { i16: le, swapped: false };
 }
 
-function voipStreamDial(callId, userId, optsJson) {
-    if (voipStreamSess) return "busy";
-    if (!callId || !userId) return "err:callId/userId 为空";
-    var opts = {};
-    try { opts = JSON.parse(optsJson || "{}"); } catch (e) {}
-    var c = {
-        callId: callId, userId: userId, state: "dialing",
+// 会话工厂(出站/入站共用字段)
+function vsNewSession(callId, userId, opts) {
+    return {
+        callId: callId, userId: userId, state: "reserved",
+        incoming: false,
         inRate: opts.inputRate > 0 ? opts.inputRate : 16000,
         outRate: opts.outputRate > 0 ? opts.outputRate : 24000,
         queueHardMs: opts.queueHardMs > 0 ? opts.queueHardMs : 1000,
@@ -3553,6 +3558,14 @@ function voipStreamDial(callId, userId, optsJson) {
         frameBuf: null, putExternal: null, submittedOut: 0, negRets: 0,
         engineLostTries: 0, probeTries: 0, lastStats: 0, startedAt: Date.now()
     };
+}
+
+function voipStreamDial(callId, userId, optsJson) {
+    if (voipStreamSess) return "busy";
+    if (!callId || !userId) return "err:callId/userId 为空";
+    var opts = {};
+    try { opts = JSON.parse(optsJson || "{}"); } catch (e) {}
+    var c = vsNewSession(callId, userId, opts);
     try {
         c.svc = voipService();
         c.putExternal = new NativeFunction(voipConfModule().base.add(VOIP_PUT_OFF),
@@ -3568,6 +3581,119 @@ function voipStreamDial(callId, userId, optsJson) {
     voipStreamEmit({ ev: "state", state: "dialing" });
     vsProbe(c);
     return "ok";
+}
+
+// ---- 入站布防(流式): 创建即布防, 来电自动接听 → ringing → connected 进同一套协议 ----
+function voipStreamArmIncoming(callId, userId, optsJson) {
+    if (voipStreamSess) return "busy";
+    if (!callId || !userId) return "err:callId/userId 为空";
+    var opts = {};
+    try { opts = JSON.parse(optsJson || "{}"); } catch (e) {}
+    var c = vsNewSession(callId, userId, opts);
+    c.incoming = true;
+    c.windowMs = (opts.windowS > 0 ? opts.windowS : 300) * 1000;
+    c.armDeadline = Date.now() + c.windowMs;
+    c.answerDelayMs = opts.answerDelayMs > 0 ? opts.answerDelayMs : 1200;
+    c.muteMic = opts.muteMic !== false;   // 默认静音本机麦克风(否则对方听到环境音)
+    c.micGate = opts.micGate !== false;   // 默认门控麦克风生产源(§17.9 消洞)
+    c.roomId = null; c.lastNotifyTs = 0; c.answerTries = 0; c.engineTries = 0;
+    c.micGateEng = null; c.micGateCallbacks = 0; c.micGateWrites = 0;
+    c.micGateSavedMode = null;
+    try {
+        c.svc = voipService();
+        c.putExternal = new NativeFunction(voipConfModule().base.add(VOIP_PUT_OFF),
+            "int", ["pointer", "pointer", "int", "int", "int"]);
+        c.frameBuf = Memory.alloc(16384);
+    } catch (e) { return "err:" + e; }
+    // 未拨号, voipKeep 无人重置, 直接入池安全
+    voipKeep.push(c.frameBuf);
+    voipStreamSess = c;
+    voipInboundAttachRing(); // 常驻 hook 只挂不拆, 与旧入站路径共用
+    // 窗口到期兜底(Go 侧 deadline 主导, JS 双保险)
+    c.probeTimer = setTimeout(function () { vsArmWatch(c); }, c.windowMs + 1000);
+    console.log("[vs] 入站布防 callId=" + callId + " window=" +
+        Math.round(c.windowMs / 1000) + "s answerDelay=" + c.answerDelayMs + "ms");
+    return "ok";
+}
+
+function vsArmWatch(c) {
+    if (voipStreamSess !== c) return;
+    if (c.state === "reserved" && Date.now() >= c.armDeadline)
+        vsTeardown(c, "window_expired");
+}
+
+// RecvNotify hook 分发入口(常驻 hook, 布防期才处理; 与旧入站路径互斥由全局锁保证)
+function vsOnIncomingNotify(c, args) {
+    if (c.state !== "reserved") return;
+    var now = Date.now();
+    if (now > c.armDeadline) { vsTeardown(c, "window_expired"); return; }
+    if (now - c.lastNotifyTs < 800) return; // 通知风暴去抖(与旧入站同参)
+    c.lastNotifyTs = now;
+    try {
+        var len = args[2].toInt32();
+        if (len > 0 && len <= 65536) {
+            var room = voipParseRoomFromNotify(args[1], len);
+            if (room) c.roomId = room;
+        }
+    } catch (e) {}
+    c.state = "ringing";
+    voipStreamEmit({ ev: "state", state: "ringing", roomKnown: !!c.roomId });
+    console.log("[vs-in] 来话 room=" + c.roomId + " 延迟 " + c.answerDelayMs + "ms 接听");
+    c.fmtTimer = setTimeout(function () { vsIncomingAnswer(c); }, c.answerDelayMs);
+}
+
+// 接听: App 层信令(房间号优先来话通知, 全局字符串兜底 — setTimeout 重试不忙等) → Accept
+function vsIncomingAnswer(c) {
+    if (voipStreamSess !== c || c.state !== "ringing") return;
+    var room = c.roomId;
+    if (!room) {
+        try { room = voipReadStdString(baseAddr.add(VOIP_ROOM_OFF)) || null; } catch (e) {}
+        if (!room) {
+            if (++c.answerTries < 8) {
+                c.fmtTimer = setTimeout(function () { vsIncomingAnswer(c); }, 300);
+                return;
+            }
+            console.log("[vs-in] 无房间号(通知解析失败且全局为空), 跳过信令直接 Accept");
+        }
+    }
+    if (room) {
+        try {
+            var sigFn = new NativeFunction(baseAddr.add(VOIP_ANSWERSIG_OFF), "int",
+                ["int", "pointer", "int", "int"]);
+            var sr = sigFn(0, voipBuildStdString(room), 0, 0);
+            console.log("[vs-in] 接听信令 ret=" + sr);
+        } catch (e) { console.log("[vs-in] 接听信令异常: " + e); }
+    }
+    var r = null;
+    try {
+        var acceptFn = new NativeFunction(voipConfModule().base.add(VOIP_ANSWER_OFF),
+            "int", ["pointer", "int", "int", "int"]);
+        r = acceptFn(c.svc, 1, 0, 0x22);
+        console.log("[vs-in] Accept ret=" + r);
+    } catch (e) { console.log("[vs-in] Accept 异常: " + e); }
+    c.answerRet = r;
+    vsWaitEngineConnect(c);
+}
+
+// 接听方接通判定: startTalk≥1 且引擎格式可读。
+// ⚠️ 禁止出站式静音探测帧——接听前往引擎 buffer 喂帧会滞留, 接通后以"嘟嘟"碎片反复播出。
+function vsWaitEngineConnect(c) {
+    if (voipStreamSess !== c) return;
+    var st = null;
+    try {
+        st = c.svc.add(8).readPointer().add(VOIP_CE_OFF)
+            .add(VOIP_CE_STARTTALK_OFF).readU32();
+    } catch (e) {}
+    if (st === null || st < 1) {
+        if (++c.engineTries > 40) { // ~8s 宽限(与旧入站 housekeep 同参)
+            vsTeardown(c, "backend_error:engine_not_ready");
+            return;
+        }
+        c.fmtTimer = setTimeout(function () { vsWaitEngineConnect(c); }, 200);
+        return;
+    }
+    console.log("[vs-in] 引擎就绪(startTalk=" + st + "), 读格式接通");
+    vsSetupConnected(c, "accept_inferred");
 }
 
 // 出站接通探测: 每 200ms 试探一帧数字静音。等待码 = 未接听/引擎未就绪, 原地重试;
@@ -3589,11 +3715,15 @@ function vsProbe(c) {
     c.probeTimer = setTimeout(function () { vsProbe(c); }, 200);
 }
 
-// 探测帧被消费 ⇒ 已接听。格式此刻才落定, 200ms 轮询直到可读(最多 25 次)。
+// 探测帧被消费 ⇒ 已接听(出站)。格式此刻才落定。
 function vsAnswered(c) {
     if (voipStreamSess !== c) return;
-    c.state = "answer_fmt";
     console.log("[vs] 接通(等待 " + (c.probeTries * 200) + "ms), 读引擎格式");
+    vsSetupConnected(c, "put_ready_inferred");
+}
+
+// 格式就绪后的公共接线(出站探测命中 / 入站 Accept 后引擎就绪, 都走这里)
+function vsSetupConnected(c, detection) {
     var tries = 0;
     function fmtLoop() {
         if (voipStreamSess !== c) return;
@@ -3607,16 +3737,19 @@ function vsAnswered(c) {
             frameMs: ef.frameMs, frameBytes: ef.frameBytes, payloadBytes: ef.payloadBytes,
             engRate: ef.contentRate, engCh: ef.channels, payloadSamples: ef.payloadBytes / 2
         };
+        // 接听方铁律(§17.7/§17.9): 帧长=内容长不补零尾(零尾渲染成静音 ⇒ 空洞) + 门控麦克风生产源
+        if (c.incoming) c.fmt.frameBytes = c.fmt.payloadBytes;
         var e2 = voipCaptureEngine();
         c.fmt.capRate = e2 ? e2.rate : ef.contentRate;
         c.fmt.pullBytes = e2 ? e2.pullBytes : c.fmt.payloadBytes;
         c.rs = voipStreamResampler(c.inRate, c.fmt.engRate);
-        voipMuteMic(c.svc, "stream-answered");
+        voipMuteMic(c.svc, c.incoming ? "stream-incoming" : "stream-answered");
         c.state = "connected";
         c.playT0 = Date.now();
         c.lastStats = 0;
-        voipStreamEmit({ ev: "state", state: "connected", answerDetection: "put_ready_inferred",
+        voipStreamEmit({ ev: "state", state: "connected", answerDetection: detection,
             engineFormat: c.fmt });
+        if (c.micGate) voipMicGateBegin(c);
         vsCapStart(c);
         c.playTimer = setTimeout(function () { vsPlayTick(c); }, 0);
     }
@@ -3936,11 +4069,22 @@ function vsPump() {
 }
 vsPump();
 
+// 停止/解除布防: 走 RPC(传输可靠)。与 append 不同, stop 不需要与音频同通道保序——
+// teardown 清掉一切, 迟到的 append 只会得到 no_session。(Post 通道曾出现布防态 stop
+// 送达失败的案例 2026-11-16, 未深究 frida recv 根因)
+function voipStreamStop(callId, reason) {
+    var c = voipStreamSess;
+    if (!c || (callId && callId !== c.callId)) return "no_session";
+    vsTeardown(c, reason || "stop-request");
+    return "ok";
+}
+
 function voipStreamStatus() {
     var c = voipStreamSess;
     if (!c) return JSON.stringify({ active: false, last: voipStreamLast });
     return JSON.stringify({
         active: true, callId: c.callId, state: c.state, generation: c.gen,
+        incoming: c.incoming, roomId: c.roomId || null,
         inRate: c.inRate, outRate: c.outRate,
         queuedMs: c.fmt ? Math.round(vsQueuedMs(c)) : 0,
         acceptedSrc: c.acceptedSrc,
@@ -3979,6 +4123,8 @@ rpc.exports = {
     voipInboundDisarm: voipInboundDisarm,
     voipInboundStatus: voipInboundStatus,
     voipStreamDial: voipStreamDial,
+    voipStreamArmIncoming: voipStreamArmIncoming,
+    voipStreamStop: voipStreamStop,
     voipStreamStatus: voipStreamStatus,
 };
 

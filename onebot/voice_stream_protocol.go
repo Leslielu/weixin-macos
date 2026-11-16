@@ -38,6 +38,11 @@ const (
 	StreamPongTimeoutS    = 30
 	StreamRetentionMin    = 10 // 结束记录/幂等记录保留(分钟)
 	StreamIdemMaxEntries  = 128
+
+	// 入站布防(P1)
+	StreamIncomingWindowDefaultS = 300 // 布防窗口默认(秒)
+	StreamIncomingWindowMaxS     = 600
+	StreamIncomingAnswerDelayMs  = 1200 // 来电到接听延时
 )
 
 // ---- 速率限制(§10.3) ----
@@ -72,62 +77,80 @@ func (f AudioFormat) validate() error {
 
 func (f AudioFormat) isZero() bool { return f.SampleRate == 0 && f.Codec == "" }
 
-// ---- 请求体(§4.1) ----
+// ---- 请求体(§4.1; P1 增 incoming_stream 布防模式) ----
 type StreamCreateRequest struct {
-	UserID       string       `json:"user_id"`
-	Source       string       `json:"source"`
-	Mode         string       `json:"mode"`
+	UserID        string       `json:"user_id"`
+	Source        string       `json:"source"`
+	Mode          string       `json:"mode"` // stream(呼出) | incoming_stream(呼入布防)
 	RingTimeoutS  int          `json:"ring_timeout_s"`
-	MaxDurationS int          `json:"max_duration_s"`
-	InputFormat  AudioFormat `json:"input_format"`
-	OutputFormat AudioFormat `json:"output_format"`
+	MaxDurationS  int          `json:"max_duration_s"`
+	InputFormat   AudioFormat `json:"input_format"`
+	OutputFormat  AudioFormat `json:"output_format"`
+	WindowS       int          `json:"window_s,omitempty"`        // incoming: 布防窗口(1-600, 默认300), 无来电自动释放
+	AnswerDelayMs int          `json:"answer_delay_ms,omitempty"` // incoming: 来电到接听延时(0-10000, 默认1200)
+	MuteMic       *bool        `json:"mute_mic,omitempty"`        // incoming: 接听后静音本机麦克风(默认 true)
+	MicGate       *bool        `json:"mic_gate,omitempty"`        // incoming: 门控麦克风生产源消洞(默认 true, §17.9)
 }
 
-func (r *StreamCreateRequest) validate() (ringS, maxS int, err error) {
+func (r *StreamCreateRequest) validate() (ringS, maxS, winS, delayMs int, err error) {
 	if r.UserID == "" {
-		return 0, 0, fmt.Errorf("user_id 必填")
+		return 0, 0, 0, 0, fmt.Errorf("user_id 必填")
 	}
 	if len(r.UserID) > 128 {
-		return 0, 0, fmt.Errorf("user_id 过长")
+		return 0, 0, 0, 0, fmt.Errorf("user_id 过长")
 	}
-	if r.Mode != "stream" {
-		return 0, 0, fmt.Errorf("mode 仅支持 stream(收到 %q)", r.Mode)
+	if r.Mode != "stream" && r.Mode != "incoming_stream" {
+		return 0, 0, 0, 0, fmt.Errorf("mode 仅支持 stream / incoming_stream(收到 %q)", r.Mode)
 	}
 	if r.Source == "" {
-		return 0, 0, fmt.Errorf("source 必填(调用方标识, 如 mumble)")
+		return 0, 0, 0, 0, fmt.Errorf("source 必填(调用方标识, 如 mumble)")
 	}
 	if len(r.Source) > 64 {
-		return 0, 0, fmt.Errorf("source 过长(≤64)")
+		return 0, 0, 0, 0, fmt.Errorf("source 过长(≤64)")
 	}
 	ringS = r.RingTimeoutS
 	if ringS <= 0 {
 		ringS = StreamRingMaxS
 	}
 	if ringS > StreamRingMaxS {
-		return 0, 0, fmt.Errorf("ring_timeout_s 上限 %d", StreamRingMaxS)
+		return 0, 0, 0, 0, fmt.Errorf("ring_timeout_s 上限 %d", StreamRingMaxS)
 	}
 	maxS = r.MaxDurationS
 	if maxS <= 0 {
 		maxS = StreamMaxDurationCapS
 	}
 	if maxS > StreamMaxDurationCapS {
-		return 0, 0, fmt.Errorf("max_duration_s 上限 %d", StreamMaxDurationCapS)
+		return 0, 0, 0, 0, fmt.Errorf("max_duration_s 上限 %d", StreamMaxDurationCapS)
+	}
+	winS = r.WindowS
+	if winS <= 0 {
+		winS = StreamIncomingWindowDefaultS
+	}
+	if winS > StreamIncomingWindowMaxS {
+		return 0, 0, 0, 0, fmt.Errorf("window_s 上限 %d", StreamIncomingWindowMaxS)
+	}
+	delayMs = r.AnswerDelayMs
+	if delayMs <= 0 {
+		delayMs = StreamIncomingAnswerDelayMs
+	}
+	if delayMs > 10000 {
+		return 0, 0, 0, 0, fmt.Errorf("answer_delay_ms 上限 10000")
 	}
 	if !r.InputFormat.isZero() {
 		if err := r.InputFormat.validate(); err != nil {
-			return 0, 0, fmt.Errorf("input_format: %v", err)
+			return 0, 0, 0, 0, fmt.Errorf("input_format: %v", err)
 		}
 	} else {
 		r.InputFormat = AudioFormat{Codec: "pcm_s16le", SampleRate: 16000, Channels: 1}
 	}
 	if !r.OutputFormat.isZero() {
 		if err := r.OutputFormat.validate(); err != nil {
-			return 0, 0, fmt.Errorf("output_format: %v", err)
+			return 0, 0, 0, 0, fmt.Errorf("output_format: %v", err)
 		}
 	} else {
 		r.OutputFormat = AudioFormat{Codec: "pcm_s16le", SampleRate: 24000, Channels: 1}
 	}
-	return ringS, maxS, nil
+	return ringS, maxS, winS, delayMs, nil
 }
 
 // ---- 稳定错误码(§14) ----

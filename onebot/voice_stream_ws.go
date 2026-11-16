@@ -79,6 +79,7 @@ func (s *streamSession) buildHello() map[string]any {
 	h := s.envelope("hello")
 	h["protocol_version"] = StreamProtocolVersion
 	h["state"] = s.getState()
+	h["direction"] = map[bool]string{true: "incoming", false: "outbound"}[s.incoming]
 	h["input_format"] = s.inFmt
 	h["output_format"] = s.outFmt
 	h["input_source"] = "remote_downlink"
@@ -128,8 +129,11 @@ func (m *StreamManager) handleStreamWS(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.ws = &streamWSConn{conn: conn}
-	s.startDeadlineSet = true
-	s.startDeadline = time.Now().Add(s.mgr.cfg.StartTimeout)
+	if !s.incoming {
+		// 入站无 call.start 动作, 无 start 截止; 窗口截止在 sweep
+		s.startDeadlineSet = true
+		s.startDeadline = time.Now().Add(s.mgr.cfg.StartTimeout)
+	}
 	s.mu.Unlock()
 	Info("voip-stream: 控制连接建立", "call_id", s.id)
 

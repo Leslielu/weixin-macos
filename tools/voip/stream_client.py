@@ -84,7 +84,7 @@ class Client:
         body = {
             "user_id": self.args.user_id,
             "source": "stream-client",
-            "mode": "stream",
+            "mode": "incoming_stream" if self.args.incoming else "stream",
             "ring_timeout_s": self.args.ring_timeout,
             "max_duration_s": self.args.max_duration,
             "input_format": {"codec": "pcm_s16le",
@@ -92,6 +92,8 @@ class Client:
             "output_format": {"codec": "pcm_s16le",
                               "sample_rate": self.args.out_rate, "channels": 1},
         }
+        if self.args.incoming:
+            body["window_s"] = self.args.window
         code, resp = http_json("POST", self.api + "/voice_calls", body,
                                self.token, {"Idempotency-Key": self.args.idem_key or ""})
         if code != 201:
@@ -107,7 +109,7 @@ class Client:
         return ws_path
 
     async def run(self):
-        if not self.args.start:
+        if not self.args.start and not self.args.incoming:
             ws_path = self.create()
             self.log("未带 --start, 不拨号。stream_path:", ws_path,
                      "(10s 后预留自动释放)")
@@ -121,12 +123,13 @@ class Client:
         async with websockets.connect(ws_url, additional_headers=hdrs,
                                       max_size=1 << 20, open_timeout=10) as ws:
             hello = json.loads(await ws.recv())
-            self.log("hello: ver=%s state=%s in=%s out=%s clear=%s",
+            self.log("hello: ver=%s state=%s dir=%s in=%s out=%s",
                      hello.get("protocol_version"), hello.get("state"),
-                     hello.get("input_format"), hello.get("output_format"),
-                     hello.get("clear"))
-            await ws.send(json.dumps({"type": "call.start",
-                                      "request_id": "c-start"}))
+                     hello.get("direction"), hello.get("input_format"),
+                     hello.get("output_format"))
+            if not self.args.incoming:
+                await ws.send(json.dumps({"type": "call.start",
+                                          "request_id": "c-start"}))
             await self.pump(ws)
 
     async def pump(self, ws):
@@ -355,6 +358,9 @@ def main():
     ap.add_argument("--audio", default="", help="s16le mono 原始 PCM 文件, 流式播放")
     ap.add_argument("--gap", type=int, default=5,
                     help="--audio 播完后的停顿秒数, 之后从头重播(0=只播一遍)")
+    ap.add_argument("--incoming", action="store_true",
+                    help="入站布防模式(mode=incoming_stream): 等待来电自动接听")
+    ap.add_argument("--window", type=int, default=300, help="入站布防窗口秒数")
     ap.add_argument("--record", action="store_true",
                     help="保存远端音频到 /tmp(敏感!)")
     ap.add_argument("--idem-key", default="", help="Idempotency-Key")

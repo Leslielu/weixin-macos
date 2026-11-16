@@ -12,7 +12,8 @@
 | 2 | onebot Go 会话/WS/背压/清理 | ✅ 假底层 11 用例全绿（含 -race） |
 | 3 | wxgate 代理+鉴权 | ✅ 代理 5 用例全绿 |
 | 0 | 能力补证（接通探测/自声回灌/clear 残留/拒接忙线） | 🔶 本轮冒烟覆盖前两项 |
-| 4 | 真机验收 + mac-m1 部署 | ⬜ 未开始，**勿投产** |
+| 4 | 真机验收 + mac-m1 部署（出站） | ✅ 2026-11-15 |
+| P1 | 呼入流式 incoming_stream | ✅ 2026-11-16 实现+真机验证，部署见 §4.5 补记 |
 
 ## 2. 已实现清单（2026-11-15）
 
@@ -141,6 +142,30 @@ onebot 启动干净：脚本全量加载、hook 全就位、无 ERROR/panic。
 
 结论：流式接口可承载真实 ASR→TTS 对话形态；停顿期采集对端语音质量足够回放辨认。
 **用户侧验收（2026-11-15）：三遍播报均清晰，无断续、无杂音 —— 真实对话形态通过。**
+
+### 轮 E：呼入流式（P1, mode=incoming_stream）—— 2026-11-16 ✅
+
+实现：创建即布防（voiceCallMu 全局锁与出站/旧路径互斥）→ 来电 `ringing` → 自动接听
+（App 信令 + Accept，房间号来话通知优先/全局兜底 setTimeout 重试）→ 接通判定用
+`startTalk+格式`（禁用出站静音探测帧——接听前喂帧滞留成嘟嘟声）→ 进入同一套 WS 协议。
+接听方播放启用 noPad+micGate（§17.9 消洞配置），mute_mic 默认 true。
+新请求字段：`window_s`(1-600, 默认300)/`answer_delay_ms`(默认1200)/`mute_mic`/`mic_gate`；
+新结束原因 `window_expired`；call.start 在入站模式为幂等确认。
+
+| 验证项 | 结果 |
+|---|---|
+| 假底层用例 | ✅ 入站全流程/布防窗口到期/响铃中解除/校验 |
+| 真机呼入端到端（mac-m1 旧接口拨打 dev） | ✅ ringing→connected(accept_inferred) 2s |
+| 下行采集 | ✅ production TTS 261 帧 gap=0，录音 5.2s 100% 语音段 |
+| 上行 | ✅ 双向验证（dev 流 250 块 4.96s 精确） |
+| 远端挂断 | ✅ production 播完 eof → dev remote_hangup 干净收尾 |
+| 布防解除 | ✅ scoped hangup 秒级释放（RPC stop 修复 Post 送达失败问题） |
+
+**冒烟修复**：① sweep stop-ack 兜底去掉 `dialed` 前置（入站会话曾卡死 ending）；
+② `casEnding` 补 `ringing` 态；③ 入站布防接线（创建时同步 ArmIncoming RPC，失败回滚）；
+④ **stop 改走 RPC 通道**——布防态（无音频流量）的 Post+recv 送达失败（未深究 frida recv
+根因），RPC 传输已被反复验证；clear/append 保留 Post 通道（仅 connected 后发生）。
+⑤ 联调客户端 `--incoming`/`--window`。
 
 ### 轮 D（待做）：验收矩阵剩余项
 

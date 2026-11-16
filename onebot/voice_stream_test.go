@@ -36,6 +36,7 @@ type fakeBackend struct {
 	clears          int
 	stops           []string
 	hangupN         int
+	armedIncoming   int
 	emitSegmentDone bool
 }
 
@@ -66,6 +67,13 @@ func (fb *fakeBackend) Dial(callID, userID string, _ StreamDialOpts) error {
 			"frameBytes": 960, "payloadBytes": 640, "payloadSamples": 320,
 			"capRate": 16000, "pullBytes": 640}})
 	return nil
+}
+
+func (fb *fakeBackend) ArmIncoming(callID, userID string, _ StreamIncomingOpts) error {
+	fb.mu.Lock()
+	fb.armedIncoming++
+	fb.mu.Unlock()
+	return nil // 接通由测试驱动 submit state ringing/connected
 }
 
 func (fb *fakeBackend) Append(callID, reqID string, gen int64, seg string, seq int64, pcm []byte) error {
@@ -279,23 +287,33 @@ func TestStreamProtocolValidate(t *testing.T) {
 	req := &StreamCreateRequest{UserID: "wxid_x", Source: "mumble", Mode: "stream",
 		InputFormat:  AudioFormat{Codec: "pcm_s16le", SampleRate: 16000, Channels: 1},
 		OutputFormat: AudioFormat{Codec: "pcm_s16le", SampleRate: 48000, Channels: 1}}
-	if _, _, err := req.validate(); err != nil {
+	if _, _, _, _, err := req.validate(); err != nil {
 		t.Fatalf("合法请求被拒: %v", err)
 	}
 	bad := *req
 	bad.Mode = "file"
-	if _, _, err := bad.validate(); err == nil {
+	if _, _, _, _, err := bad.validate(); err == nil {
 		t.Fatal("mode=file 应被拒绝")
 	}
 	bad = *req
 	bad.InputFormat.SampleRate = 44100
-	if _, _, err := bad.validate(); err == nil {
+	if _, _, _, _, err := bad.validate(); err == nil {
 		t.Fatal("44100 应被拒绝")
 	}
 	bad = *req
 	bad.MaxDurationS = 600
-	if _, _, err := bad.validate(); err == nil {
+	if _, _, _, _, err := bad.validate(); err == nil {
 		t.Fatal("超上限时长应被拒绝")
+	}
+	inc := *req
+	inc.Mode = "incoming_stream"
+	inc.WindowS = 99999
+	if _, _, _, _, err := inc.validate(); err == nil {
+		t.Fatal("incoming 超上限窗口应被拒绝")
+	}
+	inc.WindowS = 60
+	if _, _, winS, _, err := inc.validate(); err != nil || winS != 60 {
+		t.Fatalf("incoming 窗口校验异常: win=%d err=%v", winS, err)
 	}
 
 	if _, se := decodeAudioChunk("!!!not-b64!!!"); se == nil || se.Code != "invalid_message" {
@@ -735,6 +753,136 @@ func TestStreamDialFailed(t *testing.T) {
 }
 
 // ---- scoped hangup 与未知 ID ----
+
+func createIncomingReq(t *testing.T, e *streamTestEnv, windowS int) (int, map[string]any) {
+	t.Helper()
+	body := fmt.Sprintf(`{"user_id":"wxid_peer","source":"mumble","mode":"incoming_stream",
+		"window_s":%d,"answer_delay_ms":1200,
+		"input_format":{"codec":"pcm_s16le","sample_rate":16000,"channels":1},
+		"output_format":{"codec":"pcm_s16le","sample_rate":24000,"channels":1}}`, windowS)
+	return e.do("POST", "/voice_calls", body, nil)
+}
+
+func incomingEngineFormat() map[string]any {
+	return map[string]any{"engRate": 16000, "engCh": 1, "frameMs": 20,
+		"frameBytes": 640, "payloadBytes": 640, "payloadSamples": 320,
+		"capRate": 16000, "pullBytes": 640}
+}
+
+func TestStreamIncomingFlow(t *testing.T) {
+	fb := &fakeBackend{emitSegmentDone: true}
+	e := newStreamTestEnv(t, fb)
+	code, body := createIncomingReq(t, e, 60)
+	if code != 201 {
+		t.Fatalf("incoming 创建: %d %v", code, body)
+	}
+	id := body["data"].(map[string]any)["call_id"].(string)
+	conn, _, err := e.wsDial(id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	hello := wsRecv(t, conn, "hello")
+	if hello["direction"] != "incoming" {
+		t.Fatalf("hello direction 应为 incoming: %v", hello["direction"])
+	}
+	// call.start 幂等确认(无拨号动作)
+	wsSend(t, conn, map[string]any{"type": "call.start", "request_id": "s1"})
+	st := wsRecv(t, conn, "call.state")
+	if st["state"] != "reserved" {
+		t.Fatalf("incoming start 应回当前状态: %v", st)
+	}
+	// 来电响铃
+	fb.submit(map[string]any{"ev": "state", "callId": id, "state": "ringing",
+		"roomKnown": true})
+	ring := wsRecv(t, conn, "call.state")
+	if ring["state"] != "ringing" {
+		t.Fatalf("期望 ringing: %v", ring)
+	}
+	// 自动接听完成
+	fb.submit(map[string]any{"ev": "state", "callId": id, "state": "connected",
+		"answerDetection": "accept_inferred", "engineFormat": incomingEngineFormat()})
+	connected := wsRecv(t, conn, "call.state")
+	if connected["state"] != "connected" ||
+		connected["answer_detection"] != "accept_inferred" {
+		t.Fatalf("接通事件异常: %v", connected)
+	}
+	// 双向流
+	wsSend(t, conn, map[string]any{"type": "audio.append", "request_id": "a0",
+		"generation": 1, "segment_id": "s", "seq": 0,
+		"audio_b64": base64.StdEncoding.EncodeToString(pcmChunk(320))})
+	_ = wsRecv(t, conn, "audio.accepted")
+	// 本地挂断
+	wsSend(t, conn, map[string]any{"type": "call.hangup", "request_id": "h1"})
+	ended := wsRecv(t, conn, "call.ended")
+	if ended["reason"] != "local_hangup" || ended["resources_released"] != true {
+		t.Fatalf("结束异常: %v", ended)
+	}
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if fb.armedIncoming != 1 {
+		t.Fatalf("布防次数=%d", fb.armedIncoming)
+	}
+	if fb.hangupN != 0 {
+		t.Fatal("入站布防/通话不应调原生拨号挂断(dialed=false)")
+	}
+}
+
+func TestStreamIncomingWindowExpiry(t *testing.T) {
+	fb := &fakeBackend{}
+	e := newStreamTestEnv(t, fb)
+	code, body := createIncomingReq(t, e, 1)
+	if code != 201 {
+		t.Fatalf("创建: %d", code)
+	}
+	id := body["data"].(map[string]any)["call_id"].(string)
+	conn, _, err := e.wsDial(id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = wsRecv(t, conn, "hello")
+	waitFor(t, "window_expired", func() bool {
+		_, st := e.do("GET", "/voice_calls/"+id, "", nil)
+		d, _ := st["data"].(map[string]any)
+		return d != nil && d["end_reason"] == "window_expired" &&
+			d["resources_released"] == true
+	})
+	// 释放后可再创建
+	if codeNew, _ := e.create("wxid_next", nil); codeNew != 201 {
+		t.Fatalf("窗口到期释放后应可再创建: %d", codeNew)
+	}
+}
+
+func TestStreamIncomingRingHangup(t *testing.T) {
+	fb := &fakeBackend{}
+	e := newStreamTestEnv(t, fb)
+	code, body := createIncomingReq(t, e, 60)
+	if code != 201 {
+		t.Fatalf("创建: %d", code)
+	}
+	id := body["data"].(map[string]any)["call_id"].(string)
+	conn, _, err := e.wsDial(id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = wsRecv(t, conn, "hello")
+	fb.submit(map[string]any{"ev": "state", "callId": id, "state": "ringing",
+		"roomKnown": false})
+	_ = wsRecv(t, conn, "call.state")
+	wsSend(t, conn, map[string]any{"type": "call.hangup", "request_id": "h"})
+	ended := wsRecv(t, conn, "call.ended")
+	if ended["reason"] != "local_hangup" {
+		t.Fatalf("响铃中解除应 local_hangup: %v", ended)
+	}
+	fb.mu.Lock()
+	stops := len(fb.stops)
+	fb.mu.Unlock()
+	if stops == 0 {
+		t.Fatal("解除布防应通知 JS teardown")
+	}
+}
 
 func TestStreamScopedHangup(t *testing.T) {
 	fb := &fakeBackend{}

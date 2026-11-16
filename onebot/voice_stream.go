@@ -211,6 +211,9 @@ type streamSession struct {
 	ringTimeout        time.Duration
 	maxDuration        time.Duration
 	createdAt          time.Time
+	incoming           bool
+	windowDeadline     time.Time // incoming: 布防窗口
+	incomingOpts       StreamIncomingOpts
 
 	mgr     *StreamManager
 	backend StreamBackend
@@ -277,7 +280,7 @@ type streamSession struct {
 	stopSeen         bool
 }
 
-func (m *StreamManager) newSession(req *StreamCreateRequest, ringS, maxS int) *streamSession {
+func (m *StreamManager) newSession(req *StreamCreateRequest, ringS, maxS, winS, delayMs int) *streamSession {
 	id := uuid.New().String()
 	s := &streamSession{
 		id: id, userID: req.UserID, source: req.Source,
@@ -285,15 +288,24 @@ func (m *StreamManager) newSession(req *StreamCreateRequest, ringS, maxS int) *s
 		ringTimeout: time.Duration(ringS) * time.Second,
 		maxDuration: time.Duration(maxS) * time.Second,
 		createdAt:   time.Now(),
-		mgr:         m, backend: m.backend,
-		state:   "reserved",
-		gen:     1,
-		cmdCh:   make(chan wsCommand, 1024),
+		incoming:    req.Mode == "incoming_stream",
+		windowDeadline: time.Now().Add(time.Duration(winS) * time.Second),
+		incomingOpts: StreamIncomingOpts{
+			InputRate: req.InputFormat.SampleRate, OutputRate: req.OutputFormat.SampleRate,
+			QueueHardMs: m.cfg.QueueHardMs, MaxSeconds: maxS,
+			WindowS: winS, AnswerDelayMs: delayMs,
+			MuteMic: boolOr(req.MuteMic, true), MicGate: boolOr(req.MicGate, true),
+		},
+		mgr:      m,
+		backend:  m.backend,
+		state:    "reserved",
+		gen:      1,
+		cmdCh:    make(chan wsCommand, 1024),
 		bridgeCh: make(chan StreamEvent, 512),
-		outCh:   make(chan map[string]any, 256),
-		inCh:    make(chan map[string]any, StreamInputQueueMax),
-		hashes:  map[int64]string{},
-		pending: map[string]*streamPendingAppend{},
+		outCh:    make(chan map[string]any, 256),
+		inCh:     make(chan map[string]any, StreamInputQueueMax),
+		hashes:   map[int64]string{},
+		pending:  map[string]*streamPendingAppend{},
 	}
 	s.publishStats()
 	return s
@@ -444,6 +456,14 @@ func (s *streamSession) handleCommand(cmd wsCommand) {
 }
 
 func (s *streamSession) cmdStart(cmd wsCommand) {
+	if s.incoming {
+		// 入站: 创建即布防, call.start 幂等确认(无拨号动作)
+		st := s.envelope("call.state")
+		st["request_id"] = cmd.requestID
+		st["state"] = s.getState()
+		s.pushEvent(st)
+		return
+	}
 	switch s.getState() {
 	case "reserved":
 		s.setState("dialing")
@@ -669,7 +689,15 @@ func (s *streamSession) cmdClear(cmd wsCommand) {
 func (s *streamSession) cmdHangup(cmd wsCommand) {
 	switch s.getState() {
 	case "reserved":
-		s.finalizeNoJS("local_hangup", "", "")
+		if s.incoming {
+			// 布防解除: JS 会话在场, 需走 Stop → stopped → 收尾(dialed=false 不调原生挂断)
+			s.beginEnding("local_hangup", "")
+		} else {
+			s.finalizeNoJS("local_hangup", "", "")
+		}
+	case "ringing":
+		// 来电响铃中解除: 不接听、不拒接, 布防取消(铃声自然停止)
+		s.beginEnding("local_hangup", "")
 	case "dialing", "connected":
 		s.beginEnding("local_hangup", "")
 	default:
@@ -764,8 +792,21 @@ func (s *streamSession) handleBridge(ev StreamEvent) {
 
 func (s *streamSession) bridgeState(f map[string]any) {
 	switch evStr(f, "state") {
+	case "ringing":
+		if s.getState() != "reserved" {
+			return
+		}
+		s.setState("ringing")
+		st := s.envelope("call.state")
+		st["state"] = "ringing"
+		if v, ok := f["roomKnown"].(bool); ok {
+			st["room_known"] = v
+		}
+		s.pushEvent(st)
+		Info("voip-stream: 来电响铃", "call_id", s.id, "user_id", s.userID)
 	case "connected":
-		if s.getState() != "dialing" {
+		st := s.getState()
+		if st != "dialing" && st != "ringing" {
 			return
 		}
 		ef, _ := f["engineFormat"].(map[string]any)
@@ -773,6 +814,9 @@ func (s *streamSession) bridgeState(f map[string]any) {
 		s.state = "connected"
 		s.answered = true
 		s.connectedAt = time.Now()
+		if s.incoming {
+			s.durationDeadline = s.connectedAt.Add(s.maxDuration) // 通话时长自接通计
+		}
 		s.answerDetection = evStr(f, "answerDetection")
 		if s.answerDetection == "" {
 			s.answerDetection = "put_ready_inferred"
@@ -780,15 +824,15 @@ func (s *streamSession) bridgeState(f map[string]any) {
 		s.engineFormat = ef
 		s.mu.Unlock()
 		s.publishStats()
-		st := s.envelope("call.state")
-		st["state"] = "connected"
-		st["answer_detection"] = s.answerDetection
+		stEv := s.envelope("call.state")
+		stEv["state"] = "connected"
+		stEv["answer_detection"] = s.answerDetection
 		if ef != nil {
-			st["engine_format"] = ef
+			stEv["engine_format"] = ef
 		}
-		s.pushEvent(st)
+		s.pushEvent(stEv)
 		Info("voip-stream: 已接通", "call_id", s.id, "user_id", s.userID,
-			"detection", s.answerDetection)
+			"detection", s.answerDetection, "incoming", s.incoming)
 	case "remote_end_hint":
 		if s.getState() == "connected" {
 			s.beginEnding("remote_hangup", "start_talk_down_inferred")
@@ -818,11 +862,11 @@ func (s *streamSession) bridgeStopped(reason string) {
 			s.mu.Unlock()
 		}
 		s.completeEnding()
-	case "dialing", "connected":
+	case "dialing", "connected", "ringing":
 		s.beginEnding(mapped, "")
 		s.completeEnding() // JS 已停, 无需等 stop ack
 	default:
-		// reserved 等: JS 不可能有会话
+		// reserved(出站未拨): JS 不可能有会话
 	}
 }
 
@@ -993,7 +1037,8 @@ func (s *streamSession) finalizeNoJS(reason, detection, detail string) {
 func (s *streamSession) casEnding(reason, detection string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.state != "reserved" && s.state != "dialing" && s.state != "connected" {
+	if s.state != "reserved" && s.state != "dialing" && s.state != "connected" &&
+		s.state != "ringing" {
 		return false
 	}
 	s.state = "ending"
@@ -1073,6 +1118,8 @@ func (s *streamSession) endedStats() map[string]any {
 	s.mu.Lock()
 	if !s.dialAt.IsZero() {
 		durMs = time.Since(s.dialAt).Milliseconds()
+	} else if !s.connectedAt.IsZero() {
+		durMs = time.Since(s.connectedAt).Milliseconds() // 入站: 自接通计
 	}
 	hr := s.hangupRet
 	s.mu.Unlock()
@@ -1100,6 +1147,14 @@ func (s *streamSession) sweep() {
 	now := time.Now()
 	switch s.getState() {
 	case "reserved":
+		if s.incoming {
+			// 布防窗口: 无来电自动释放(JS 会话在场 → 走 beginEnding 让 JS teardown)
+			if now.After(s.windowDeadline) {
+				s.beginEnding("window_expired", "")
+				return
+			}
+			break
+		}
 		// attach 后由 start 截止接管; 未 attach 才看 attach 截止(§4.2)
 		s.mu.Lock()
 		sdSet := s.startDeadlineSet
@@ -1129,8 +1184,8 @@ func (s *streamSession) sweep() {
 			return
 		}
 	case "ending":
-		if s.dialed && now.After(s.stopAckDeadline) {
-			s.completeEnding() // stop ack 超时: released=false
+		if now.After(s.stopAckDeadline) {
+			s.completeEnding() // stop ack 超时: released=false(含入站 dialed=false 会话)
 			return
 		}
 	}
@@ -1242,7 +1297,7 @@ func (m *StreamManager) handleCapabilities(w http.ResponseWriter, r *http.Reques
 	m.mu.Unlock()
 	data := map[string]any{
 		"protocol_version": StreamProtocolVersion,
-		"modes":            []string{"outbound_stream"},
+		"modes":            []string{"outbound_stream", "incoming_stream"},
 		"duplex":           true,
 		"input_source":     "remote_downlink",
 		"remote_independent_track": false,
@@ -1268,6 +1323,9 @@ func (m *StreamManager) handleCapabilities(w http.ResponseWriter, r *http.Reques
 		"queue": map[string]any{"target_ms": StreamQueueTargetMs, "hard_ms": m.cfg.QueueHardMs},
 		"max_duration_s":  m.cfg.MaxDurationS,
 		"attach_timeout_s": StreamAttachTimeout,
+		"incoming_window_default_s": StreamIncomingWindowDefaultS,
+		"incoming_window_max_s":     StreamIncomingWindowMaxS,
+		"incoming_answer_delay_ms":  StreamIncomingAnswerDelayMs,
 		"heartbeat": map[string]any{"ping_s": StreamPingIntervalS, "pong_timeout_s": StreamPongTimeoutS},
 		"recording": false,
 		"busy":      busy,
@@ -1283,7 +1341,7 @@ func (m *StreamManager) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeStreamJSON(w, 400, streamErrBody("invalid_request", "请求体解析失败: "+err.Error()))
 		return
 	}
-	ringS, maxS, err := req.validate()
+	ringS, maxS, winS, delayMs, err := req.validate()
 	if err != nil {
 		writeStreamJSON(w, 422, streamErrBody("unsupported_format", err.Error()))
 		return
@@ -1297,6 +1355,8 @@ func (m *StreamManager) handleCreate(w http.ResponseWriter, r *http.Request) {
 		maxS = m.cfg.MaxDurationS
 	}
 	norm, _ := json.Marshal(map[string]any{"u": req.UserID, "ring": ringS, "max": maxS,
+		"win": winS, "delay": delayMs, "mm": boolOr(req.MuteMic, true),
+		"mg": boolOr(req.MicGate, true),
 		"in": req.InputFormat, "out": req.OutputFormat})
 	paramHash := chunkHash(norm)
 
@@ -1334,7 +1394,18 @@ func (m *StreamManager) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	voiceCallBusy.Store(true)
 
-	s := m.newSession(&req, ringS, maxS)
+	s := m.newSession(&req, ringS, maxS, winS, delayMs)
+	// 入站: 创建即布防(JS RecvNotify hook 武装)。同步 RPC(≤10s), 失败即回滚。
+	if s.incoming {
+		if err := s.backend.ArmIncoming(s.id, s.userID, s.incomingOpts); err != nil {
+			voiceCallMu.Unlock()
+			voiceCallBusy.Store(false)
+			Warn("voip-stream: 入站布防失败", "err", err)
+			writeStreamJSON(w, 500, streamErrBody("backend_error",
+				"布防失败: "+err.Error()))
+			return
+		}
+	}
 	respBody, _ := json.Marshal(map[string]any{"status": "ok", "retcode": 0, "data": map[string]any{
 		"protocol_version": StreamProtocolVersion,
 		"call_id":          s.id,
@@ -1423,6 +1494,7 @@ func (s *streamSession) snapshot() map[string]any {
 	snap := s.stats.Load()
 	m := map[string]any{
 		"call_id": s.id, "user_id": s.userID, "source": s.source,
+		"direction": map[bool]string{true: "incoming", false: "outbound"}[s.incoming],
 		"state": st, "end_reason": reason, "end_detection": detection,
 		"dialed": dialed, "answered": answered, "resources_released": released,
 		"input_format": s.inFmt, "output_format": s.outFmt,

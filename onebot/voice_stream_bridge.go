@@ -61,8 +61,20 @@ type StreamDialOpts struct {
 	MaxSeconds  int
 }
 
+type StreamIncomingOpts struct {
+	InputRate     int
+	OutputRate    int
+	QueueHardMs   int
+	MaxSeconds    int
+	WindowS       int
+	AnswerDelayMs int
+	MuteMic       bool
+	MicGate       bool
+}
+
 type StreamBackend interface {
 	Dial(callID, userID string, opts StreamDialOpts) error
+	ArmIncoming(callID, userID string, opts StreamIncomingOpts) error
 	Append(callID, reqID string, gen int64, seg string, seq int64, pcm []byte) error
 	Commit(callID, reqID string, gen int64, seg string) error
 	Clear(callID, reqID string, oldGen, newGen int64) error
@@ -113,6 +125,29 @@ type streamFailure struct{ Code string }
 
 func (e *streamFailure) Error() string { return e.Code }
 
+func (fridaStreamBackend) ArmIncoming(callID, userID string, opts StreamIncomingOpts) error {
+	optsJSON, _ := json.Marshal(map[string]any{
+		"inputRate": opts.InputRate, "outputRate": opts.OutputRate,
+		"queueHardMs": opts.QueueHardMs, "maxSeconds": opts.MaxSeconds,
+		"windowS": opts.WindowS, "answerDelayMs": opts.AnswerDelayMs,
+		"muteMic": opts.MuteMic, "micGate": opts.MicGate,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ret, err := safeExportsCall(ctx, "voipStreamArmIncoming", callID, userID, string(optsJSON))
+	if err != nil {
+		return err
+	}
+	s := jsString(ret)
+	if s != "ok" {
+		if len(s) > 120 {
+			s = s[:120]
+		}
+		return &streamFailure{Code: s}
+	}
+	return nil
+}
+
 func (fridaStreamBackend) Append(callID, reqID string, gen int64, seg string, seq int64, pcm []byte) error {
 	streamPostMeta("append", callID, reqID, map[string]any{
 		"generation": gen, "segmentId": seg, "seq": seq}, pcm)
@@ -132,7 +167,21 @@ func (fridaStreamBackend) Clear(callID, reqID string, oldGen, newGen int64) erro
 }
 
 func (fridaStreamBackend) Stop(callID, reason string) error {
-	streamPostMeta("stop", callID, "", map[string]any{"reason": reason}, nil)
+	// 走 RPC 而非 Post+recv: 布防态(无音频流量)曾出现 Post 送达失败(2026-11-16),
+	// RPC 传输已被拨号/布防/状态反复验证。stop 不需要与 append 同通道保序。
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ret, err := safeExportsCall(ctx, "voipStreamStop", callID, reason)
+	if err != nil {
+		return err
+	}
+	s := jsString(ret)
+	if s != "ok" {
+		if len(s) > 120 {
+			s = s[:120]
+		}
+		return &streamFailure{Code: s}
+	}
 	return nil
 }
 
