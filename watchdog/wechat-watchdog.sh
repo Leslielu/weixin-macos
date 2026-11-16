@@ -5,6 +5,8 @@
 #      (onebot/wxgate 不会自动重连微信, 必须重启)
 #   2. 微信被外部重启(升级/手动) → 检测 PID 变化 → 重启 bot 链
 #   3. onebot 58080 没监听 → 重启 bot 链
+#   4. wxgate 36060 没监听(微信/onebot都健康时) → 只单独重启 wxgate(2026-11-17 加:
+#      wxgate 死亡曾无人兜底, 23:01 死后躺到次日人工发现)
 # 告警: 恢复完成后给 ludaohe 发文本+截屏(经 onebot 58080, 恢复后必达);
 #       死亡瞬间链路已断发不出, 只记日志(留档截图在 shots/ 供事后诊断)
 # 回车安全: 每次回车前用 lsappinfo 检查前台应用必须是微信本体, 否则跳过
@@ -496,6 +498,21 @@ if ! lsof -ti:58080 >/dev/null 2>&1; then
     restart_chain
     if lsof -ti:58080 >/dev/null 2>&1; then
         notify "onebot 58080 未监听, bot 链已重启恢复"
+    fi
+    exit 0
+fi
+
+# --- 4. wxgate 端口检查(2026-11-17): 走到这说明微信+onebot 都健康, 只单独重启
+# wxgate(start.sh restart-wxgate 不碰 onebot/微信), 避免小故障触发全链重启。
+if ! lsof -ti:36060 >/dev/null 2>&1; then
+    log "wxgate 36060 未监听"
+    "$WXGATE_DIR/start.sh" restart-wxgate >> "$LOG" 2>&1
+    sleep 2
+    if lsof -ti:36060 >/dev/null 2>&1; then
+        notify "wxgate 36060 未监听, 已单独重启 wxgate(微信/onebot 未动)"
+        log "wxgate 已单独重启恢复"
+    else
+        log "wxgate 重启后仍未监听, 下轮继续重试"
     fi
     exit 0
 fi
