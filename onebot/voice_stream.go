@@ -837,8 +837,10 @@ func (s *streamSession) bridgeAppendAck(f map[string]any) {
 		s.nextSeq = p.seq + 1
 		s.hashes[p.seq] = p.hash
 		s.queuedMs = int(evInt(f, "queuedMs"))
-		if s.curSegment == "" {
+		if s.curSegment != p.seg {
 			s.curSegment = p.seg
+			s.segCommitted = false
+			s.segHasData = false
 		}
 		s.segHasData = true
 		s.segLastSeq = p.seq

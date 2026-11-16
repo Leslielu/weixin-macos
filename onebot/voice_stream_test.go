@@ -62,7 +62,7 @@ func (fb *fakeBackend) Dial(callID, userID string, _ StreamDialOpts) error {
 	}
 	fb.submit(map[string]any{"ev": "state", "callId": callID, "state": "connected",
 		"answerDetection": "put_ready_inferred",
-		"engineFormat":    map[string]any{"engRate": 16000, "engCh": 1, "frameMs": 20,
+		"engineFormat": map[string]any{"engRate": 16000, "engCh": 1, "frameMs": 20,
 			"frameBytes": 960, "payloadBytes": 640, "payloadSamples": 320,
 			"capRate": 16000, "pullBytes": 640}})
 	return nil
@@ -321,6 +321,37 @@ func TestStreamProtocolValidate(t *testing.T) {
 }
 
 // ---- 全流程 ----
+
+func TestStreamConsecutiveSegmentsCommitIndependently(t *testing.T) {
+	fb := &fakeBackend{}
+	e := newStreamTestEnv(t, fb)
+	id := mustCreate(t, e)
+	conn, _, err := e.wsDial(id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	wsRecv(t, conn, "hello")
+	wsSend(t, conn, map[string]any{"type": "call.start", "request_id": "start"})
+	wsRecv(t, conn, "call.state")
+	wsRecv(t, conn, "call.state")
+	for index, segment := range []string{"greeting", "task", "answer"} {
+		request := fmt.Sprintf("append-%d", index)
+		wsSend(t, conn, map[string]any{"type": "audio.append", "request_id": request,
+			"generation": 1, "segment_id": segment, "seq": index,
+			"audio_b64": base64.StdEncoding.EncodeToString(pcmChunk(320))})
+		accepted := wsRecv(t, conn, "audio.accepted")
+		if accepted["segment_id"] != segment {
+			t.Fatalf("段确认错误: %v", accepted)
+		}
+		wsSend(t, conn, map[string]any{"type": "audio.commit", "request_id": "commit-" + segment,
+			"generation": 1, "segment_id": segment, "last_seq": index})
+		result := wsRecv(t, conn, "result")
+		if result["request_id"] != "commit-"+segment || result["ok"] != true {
+			t.Fatalf("连续段提交失败: %v", result)
+		}
+	}
+}
 
 func TestStreamFullFlow(t *testing.T) {
 	fb := &fakeBackend{emitSegmentDone: true}
