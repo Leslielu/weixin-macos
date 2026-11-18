@@ -1250,6 +1250,7 @@ func (m *StreamManager) finishSession(s *streamSession, released bool, reason, d
 	}
 	m.mu.Unlock()
 	// 释放全局通话锁(创建时 TryLock 持有)
+	voiceCallHolderClear()
 	voiceCallMu.Unlock()
 	voiceCallBusy.Store(false)
 }
@@ -1422,15 +1423,23 @@ func (m *StreamManager) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// 全局通话锁: 与旧文件通话/入站接听共用同一把 voiceCallMu(§11.2);
 	// 持有直到会话结束(finishSession 统一释放)
 	if !voiceCallMu.TryLock() {
-		writeStreamJSON(w, 409, streamErrBody("call_busy", "已有通话进行中"))
+		_, msg := voiceCallBusyReject(req.UserID)
+		writeStreamJSON(w, 409, streamErrBody("call_busy", msg))
 		return
 	}
 	voiceCallBusy.Store(true)
 
 	s := m.newSession(&req, ringS, maxS, winS, delayMs)
+	if s.incoming {
+		voiceCallHolderSet(&voiceCallHolder{Kind: "stream_incoming",
+			CallID: s.id, UserID: s.userID, WindowEndsAt: s.windowDeadline})
+	} else {
+		voiceCallHolderSet(&voiceCallHolder{Kind: "stream_outgoing", CallID: s.id, UserID: s.userID})
+	}
 	// 入站: 创建即布防(JS RecvNotify hook 武装)。同步 RPC(≤10s), 失败即回滚。
 	if s.incoming {
 		if err := s.backend.ArmIncoming(s.id, s.userID, s.incomingOpts); err != nil {
+			voiceCallHolderClear()
 			voiceCallMu.Unlock()
 			voiceCallBusy.Store(false)
 			Warn("voip-stream: 入站布防失败", "err", err)
@@ -1454,6 +1463,7 @@ func (m *StreamManager) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if idemKey != "" {
 		if len(m.idem) >= StreamIdemMaxEntries {
 			m.mu.Unlock()
+			voiceCallHolderClear()
 			voiceCallMu.Unlock()
 			voiceCallBusy.Store(false)
 			writeStreamJSON(w, 503, streamErrBody("backend_unhealthy",

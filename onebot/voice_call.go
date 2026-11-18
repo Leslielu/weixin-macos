@@ -35,6 +35,73 @@ var (
 	voipPCMRates = []int{8000, 16000, 24000, 44100, 48000}
 )
 
+// voiceCallHolder 当前通话槽占用者的诊断信息(非权威状态, 权威在各会话自身):
+// Lock 成功后 voiceCallHolderSet, Unlock 前 voiceCallHolderClear。
+// 2026-11-18 事故: 布防窗口占槽拒呼出, 错误只说「已有通话进行中」, 排查全靠拼日志。
+type voiceCallHolder struct {
+	Kind         string    // outgoing | stream_incoming | stream_outgoing
+	CallID       string    // 流式会话 id; 旧文件通话路径无
+	UserID       string
+	WindowEndsAt time.Time // stream_incoming: 布防窗口预计自动释放时刻
+}
+
+var voiceCallHolderNow atomic.Pointer[voiceCallHolder]
+
+func voiceCallHolderSet(h *voiceCallHolder) { voiceCallHolderNow.Store(h) }
+func voiceCallHolderClear()                 { voiceCallHolderNow.Store(nil) }
+
+// voiceCallHolderDesc 人话描述当前占用者(忙碌拒绝文案 / Warn 日志 / status 查询用)
+func voiceCallHolderDesc() string {
+	h := voiceCallHolderNow.Load()
+	if h == nil {
+		return "通话槽被占用(占用者未知)"
+	}
+	switch h.Kind {
+	case "stream_incoming", "stream_outgoing":
+		name := "实时流式通话"
+		if h.Kind == "stream_incoming" {
+			name = "入站自动接听布防"
+		}
+		state := ""
+		if streamMgr != nil {
+			if s := streamMgr.lookupAny(h.CallID); s != nil {
+				switch s.getState() {
+				case "reserved":
+					if s.incoming {
+						remain := int(time.Until(s.windowDeadline).Seconds())
+						if remain < 0 {
+							remain = 0
+						}
+						state = fmt.Sprintf("(等待来电, 约%d秒后自动释放)", remain)
+					} else {
+						state = "(已预留, 待客户端接入)"
+					}
+				case "dialing":
+					state = "(拨号/振铃中)"
+				case "connected":
+					state = "(通话中)"
+				default:
+					state = "(结束中)"
+				}
+			}
+		}
+		return fmt.Sprintf("%s call_id=%s%s", name, h.CallID, state)
+	default: // outgoing: 旧文件通话路径
+		return fmt.Sprintf("出站语音通话(user=%s)", h.UserID)
+	}
+}
+
+// voiceCallBusyReject 忙碌拒绝的统一文案+日志, 返回 (占用者描述, 完整错误信息)
+func voiceCallBusyReject(requester string) (string, string) {
+	desc := voiceCallHolderDesc()
+	if requester != "" {
+		Warn("语音通话拒绝: 通话槽被占用", "requester", requester, "holder", desc)
+	} else {
+		Warn("语音通话拒绝: 通话槽被占用", "holder", desc)
+	}
+	return desc, "通话槽被占用(占用者: " + desc + ")"
+}
+
 // VoiceCallRequest /send_voice_call 请求体
 type VoiceCallRequest struct {
 	UserID        string `json:"user_id"`       // 被叫 wxid, 必填
@@ -189,16 +256,19 @@ func voiceCallHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !voiceCallMu.TryLock() {
-		writeJSON(w, map[string]any{"status": "failed", "error": "已有通话进行中"})
+		desc, msg := voiceCallBusyReject(req.UserID)
+		writeJSON(w, map[string]any{"status": "failed", "error": msg, "holder": desc})
 		return
 	}
 	voiceCallBusy.Store(true)
+	voiceCallHolderSet(&voiceCallHolder{Kind: "outgoing", UserID: req.UserID})
 
 	if req.Async {
 		// 后台跑完整通话, 立即返回(避免长通话把 HTTP 请求挂几分钟)
 		go func() {
 			defer voiceCallMu.Unlock()
 			defer voiceCallBusy.Store(false)
+			defer voiceCallHolderClear()
 			res := runVoiceCall(req)
 			Info("语音通话(异步)结束", "user_id", req.UserID, "result", res)
 		}()
@@ -209,6 +279,7 @@ func voiceCallHandler(w http.ResponseWriter, r *http.Request) {
 
 	defer voiceCallMu.Unlock()
 	defer voiceCallBusy.Store(false)
+	defer voiceCallHolderClear()
 	writeJSON(w, runVoiceCall(req))
 }
 
@@ -544,7 +615,11 @@ func voiceCallStatusHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"status": "failed", "error": err.Error()})
 		return
 	}
-	writeJSON(w, map[string]any{"status": "ok", "busy": voiceCallBusy.Load(), "data": st})
+	resp := map[string]any{"status": "ok", "busy": voiceCallBusy.Load(), "data": st}
+	if voiceCallBusy.Load() {
+		resp["holder"] = voiceCallHolderDesc()
+	}
+	writeJSON(w, resp)
 }
 
 // voiceCallHangupHandler POST /hangup_voice_call —— 手动挂断(打断长语音)

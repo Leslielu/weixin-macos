@@ -544,6 +544,9 @@ func TestStreamOwnerExclusion(t *testing.T) {
 	if code != 409 || body["error"].(map[string]any)["code"] != "call_busy" {
 		t.Fatalf("锁被占应 409 call_busy: %d %v", code, body)
 	}
+	if msg, _ := body["error"].(map[string]any)["message"].(string); !strings.Contains(msg, "通话槽被占用") {
+		t.Fatalf("call_busy 应带占用者信息: %v", body)
+	}
 	voiceCallMu.Unlock()
 
 	id := mustCreate(t, e)

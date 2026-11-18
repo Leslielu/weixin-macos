@@ -108,9 +108,10 @@ func voiceCallInboundHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 与出站互斥: 出站通话进行中不接受布防
+	// 与出站互斥: 通话槽被占(出站通话/流式会话/布防窗口)不接受布防
 	if !voiceCallMu.TryLock() {
-		writeJSON(w, map[string]any{"status": "failed", "message": "出站通话进行中, 无法布防入站接听"})
+		_, msg := voiceCallBusyReject("inbound_arm")
+		writeJSON(w, map[string]any{"status": "failed", "message": "无法布防入站接听: " + msg})
 		return
 	}
 	voiceCallMu.Unlock()

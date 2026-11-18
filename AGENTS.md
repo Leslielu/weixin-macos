@@ -57,7 +57,13 @@ for programmatic message sending and receiving.
   (hearing them): a silence-trimmed WAV lands in `voice_records/` and its path
   is returned; without voice/text it is a record-only call. Plus
   `GET /voice_call_status` and `POST /hangup_voice_call`. One call at a time;
-  outbound and inbound are mutually exclusive. Inbound answering (implemented
+  outbound and inbound are mutually exclusive. Busy rejections (since
+  2026-11-18) say `通话槽被占用(占用者: …)` and name the holder (an inbound
+  arming window includes its call_id and seconds left before auto-release);
+  the legacy endpoint also returns a `holder` field, logs a Warn line, and
+  `GET /voice_call_status` includes `holder` while busy. Legacy endpoint
+  business failures still use HTTP 200 (OneBot convention); wxgate maps them
+  to 409 for busy and 502 otherwise. Inbound answering (implemented
   2026-11-05): `POST /voice_call_inbound`
   `{enabled, voice|<text>, record?, max_seconds?, answer_delay_ms?,
   window_seconds?, multi?, hangup?, mute_mic?, mic_gate?, content_rate_div?,
