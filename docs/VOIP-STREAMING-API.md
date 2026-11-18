@@ -18,7 +18,7 @@
 | 鉴权 | `Authorization: Bearer <voice_api_token>`（= `~/Prog/wxgate/.stream_token` = config.yaml `voice_api_token`） |
 | 协议版本 | 1（hello 与 capabilities 都会回带） |
 | 音频格式 | 裸 PCM `s16le` mono，base64 编码，无 WAV 头；上行/下行采样率各自在创建时协商（16k/24k/48k） |
-| 全局限制 | 同一时刻全系统一通电话（与旧文件通话/旧入站接听互斥，占线返回 409 `call_busy`） |
+| 全局限制 | 同一时刻全系统一通电话（与旧文件通话/旧入站接听互斥，占线返回 409 `call_busy`）；**呼出优先**（2026-11-18）：占槽者是待机布防窗口（未接过任何来电）时，呼出会自动解除布防并放行，只有真通话（拨号/接通/响铃/结束中）才 409 |
 | 硬时限 | 通话 ≤300s（从拨号/接通计）；服务端心跳 ping 10s、pong 30s 未响应判死 |
 
 所有路由（capabilities/创建/WS/状态/挂断）都要带 token；无 token 时路由整体 fail-closed（503）。
@@ -54,8 +54,11 @@
 
 - 成功 **201**：`data.call_id`、`data.stream_path`（WS 地址）、`data.attach_deadline_ms`。
 - 建议带 `Idempotency-Key` 头（≤128 字符）：同 key 同参数重放返回原会话，不同参数 409。
-- 错误：`422 unsupported_format`（格式/参数越界）、`409 call_busy`（全局占线）、
+- 错误：`422 unsupported_format`（格式/参数越界）、`409 call_busy`（全局占线；message 带
+  占用者描述与预计释放时间，2026-11-18 起）、
   `409 idempotency_conflict`、`503 backend_unhealthy`（上一通清理未确认，需重启 onebot）。
+  调用方（如 mumble）呼出被 409 拒绝只发生在真通话占槽——待机布防窗口会被服务端自动解除，
+  **无需先解除布防再呼出**；呼出期间布防调用得到 409 属预期，循环重试即可。
 - **预留超时**：呼出创建后 10s 内必须连 WS，连上后 10s 内必须 `call.start`，否则自动释放；
   呼入（incoming_stream）按 `window_s` 计，无来电自动释放（结束原因 `window_expired`）。
 

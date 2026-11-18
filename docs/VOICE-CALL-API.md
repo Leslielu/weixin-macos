@@ -98,9 +98,15 @@ curl -X POST http://127.0.0.1:58080/send_voice_call \
 {"status":"failed","error":"对方未接听(超时)","waited_ms":60123}
 ```
 
-常见错误：`已有通话进行中`、`拨号未成功: <code>`、`注入启动失败: <msg>`、
+常见错误：`通话槽被占用(占用者: <描述>)`（2026-11-18 起；占用者描述含 call_id 与
+预计释放时间，响应另带 `holder` 字段并打 Warn 日志。**呼出优先**：占槽者是待机
+布防窗口（未接过任何来电）时自动解除布防放行本次呼出，仅真通话仍返回此错误）、
+`拨号未成功: <code>`、`注入启动失败: <msg>`、
 `对方未接听(超时)`、`音频过短或为空(N 字节)`、`user_id 必填`、
 `voice/text/record 至少填一个`。
+
+> HTTP 状态：业务失败仍是 HTTP 200（OneBot 传统语义）；经 wxgate `/api/send_voice_call`
+> 代理时映射为 busy→409、其余业务失败→502（2026-11-18 起），body 原样保留。
 
 ### 录音产物
 
@@ -135,11 +141,15 @@ curl http://127.0.0.1:58080/voice_call_status
     "maxLateMs": 3,
     "lateOver3ms": 0,
     "last": {"reason": "eof", "answered": true, "frameMs": 20, "calls": 1200, "bytesSent": 1152000, "totalBytes": 1152000, "error": ""}
-  }
+  },
+  "holder": "入站自动接听布防 call_id=<uuid>(等待来电, 约285秒后自动释放)"
 }
 ```
 
 `busy` 表示 OneBot 侧通话锁是否被占；`data` 是 Frida 侧引擎状态，`last` 为上一通摘要。
+`holder`（2026-11-18 起）仅在 `busy:true` 时出现：人话描述当前占用者——出站通话
+（user=…）/实时流式通话（call_id=…）/入站布防窗口（call_id + 剩余自动释放秒数），
+与忙碌拒绝错误里的文案同源。
 
 ---
 
