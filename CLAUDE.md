@@ -143,6 +143,9 @@ Each WeChat version requires specific memory offsets in `wechat_version/*.json`.
   （`/send_voice_call` 与 `/voice_calls` mode=stream）自动解除布防并限时等锁（10s）；
   真通话（拨号/接通/响铃/结束中）与入站布防请求不抢占，照常拒绝。布防窗口由调用方
   （mumble 循环）自动重布防，无需服务端恢复。
+  **呼入接听信令带重试**（2026-11-18）：上一通电话刚挂断时（引擎异常收尾后 ~26s 实测）
+  状态机会拒绝接听信令（ret=-1342177280），`vsIncomingAnswer` 500ms×12 补打至成功，
+  全程失败不建引擎直接放弃。呼出后立刻呼入的场景由此闭环。
   通话槽忙碌拒绝（2026-11-18）：错误文案「通话槽被占用(占用者: …)」带占用者描述（入站布防窗口给
   call_id 和剩余秒数），旧接口另回 `holder` 字段并打 Warn 日志；`/voice_call_status` busy 时也回
   `holder`。旧接口业务失败仍 HTTP 200（OneBot 传统语义），wxgate 已映射 busy→409 / 其余→502。
