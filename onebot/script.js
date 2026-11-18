@@ -2742,7 +2742,10 @@ function voipApplyFormat(c, tag) {
     if (c.noPad) c.frameBytes = c.payloadBytes;
     var loadRate = c.loadRate > 0 ? c.loadRate
         : (c.contentDiv > 0) ? Math.round(c.contentRate / c.contentDiv)
-        : (c.contentRate >= 32000 ? c.contentRate : Math.round(c.contentRate / 2));
+        : c.contentRate; // 内容率恒=引擎率(上方 11-05 接听方实测)。曾对 <32k 引擎减半:
+        // 16k 引擎配 8k 载荷 = 音高×2 速度×2(2026-11-18 21:40 实测「尖锐快放」);
+        // 拨号前引擎默认读数恒 16k, 接通后通常重协商 48k 故 27 次历史未暴露,
+        // 重启后首通引擎停留 16k 才首次踩中。入站路径显式 div=1 不走此分支。
     c.playU8 = voipLoadPayload(c.prefix, loadRate, c.channels);
     var need = Math.max(16384, c.frameBytes * 4);
     if (!c.frameBuf || need > c.frameCap) {

@@ -89,7 +89,12 @@ for programmatic message sending and receiving.
   downlink is captured, optional playback runs, then hangup; `enabled:false`
   disarms. Playback content must be resampled to the negotiated engine rate
   (`content_rate_div` defaults to 1); the SDK ignores the declared rate, so
-  any other ratio shifts pitch (half rate = pitch x2). Its status endpoint,
+  any other ratio shifts pitch (half rate = pitch x2). Payload rate choice
+  (fixed 2026-11-18): content rate always equals the engine rate — a
+  fallback used to halve it for engines under 32kHz (16k engine + 8k payload
+  = pitch x2, speed x2, "sharp and fast"); pre-dial engine reads default to
+  16k and calls usually renegotiate to 48k on answer, so it stayed hidden
+  until a post-restart first call kept a 16k engine. Its status endpoint,
   `GET /voice_call_inbound_status`, finalizes the capture to
   `voice_records/call_inbound_<ts>.wav`. Code: `onebot/voice_call.go`,
   `onebot/voice_call_inbound.go` and the VoIP section of `onebot/script.js`;
