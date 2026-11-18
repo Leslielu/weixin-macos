@@ -139,6 +139,10 @@ Each WeChat version requires specific memory offsets in `wechat_version/*.json`.
   拨号、等接听、播放给定音频或 TTS、挂断；`record:true` 采集对方下行音频（听对方），
   挂断后裁首尾静音封装 WAV 落 `voice_records/` 并在响应返回路径；不带 voice/text 时为纯采集模式。
   配 `GET /voice_call_status`、`POST /hangup_voice_call`。同一时刻只允许一通，出站/入站互斥。
+  **呼出优先**（2026-11-18）：占槽者是待机布防窗口（reserved，未接过任何来电）时，呼出
+  （`/send_voice_call` 与 `/voice_calls` mode=stream）自动解除布防并限时等锁（10s）；
+  真通话（拨号/接通/响铃/结束中）与入站布防请求不抢占，照常拒绝。布防窗口由调用方
+  （mumble 循环）自动重布防，无需服务端恢复。
   通话槽忙碌拒绝（2026-11-18）：错误文案「通话槽被占用(占用者: …)」带占用者描述（入站布防窗口给
   call_id 和剩余秒数），旧接口另回 `holder` 字段并打 Warn 日志；`/voice_call_status` busy 时也回
   `holder`。旧接口业务失败仍 HTTP 200（OneBot 传统语义），wxgate 已映射 busy→409 / 其余→502。

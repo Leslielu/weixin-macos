@@ -539,6 +539,9 @@ func TestStreamIdempotency(t *testing.T) {
 func TestStreamOwnerExclusion(t *testing.T) {
 	fb := &fakeBackend{}
 	e := newStreamTestEnv(t, fb)
+	oldWait := voiceCallPreemptWait
+	voiceCallPreemptWait = 100 * time.Millisecond // 裸锁场景无可抢占对象, 不用等满上限
+	t.Cleanup(func() { voiceCallPreemptWait = oldWait })
 	voiceCallMu.Lock() // 模拟旧文件通话进行中
 	code, body := e.create("wxid_a", nil)
 	if code != 409 || body["error"].(map[string]any)["code"] != "call_busy" {

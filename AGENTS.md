@@ -57,7 +57,14 @@ for programmatic message sending and receiving.
   (hearing them): a silence-trimmed WAV lands in `voice_records/` and its path
   is returned; without voice/text it is a record-only call. Plus
   `GET /voice_call_status` and `POST /hangup_voice_call`. One call at a time;
-  outbound and inbound are mutually exclusive. Busy rejections (since
+  outbound and inbound are mutually exclusive. Outbound has priority (since
+  2026-11-18): when the slot is held by an idle arming window (reserved, no
+  call ever answered), an outbound request (`/send_voice_call` or
+  `/voice_calls` mode=stream) disarms it and waits up to 10s for the lock;
+  real calls (dialing/ringing/connected/ending) and inbound arming requests
+  are never preempted and still get rejected. The caller (mumble loop)
+  re-arms by itself, so the server never restores the window.
+  Busy rejections (since
   2026-11-18) say `通话槽被占用(占用者: …)` and name the holder (an inbound
   arming window includes its call_id and seconds left before auto-release);
   the legacy endpoint also returns a `holder` field, logs a Warn line, and

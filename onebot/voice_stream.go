@@ -373,6 +373,22 @@ func (s *streamSession) requestHangup() {
 	s.enqueueCmd(wsCommand{kind: wsCmdHangup})
 }
 
+// hangupIfReserved 呼出抢占用(2026-11-18): 仅当会话仍处 reserved(待机, 未拨出/
+// 未接通)时才解除, 状态检查与入队对 s.mu 原子。真通话返回 false 不动。
+func (s *streamSession) hangupIfReserved() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != "reserved" {
+		return false
+	}
+	select {
+	case s.cmdCh <- wsCommand{kind: wsCmdHangup}:
+		return true
+	default:
+		return false // 队列异常满, 放弃抢占(调用方走忙碌拒绝)
+	}
+}
+
 // ---- 事件信封(§5.1) ----
 
 func (s *streamSession) envelope(typ string) map[string]any {
@@ -1423,9 +1439,13 @@ func (m *StreamManager) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// 全局通话锁: 与旧文件通话/入站接听共用同一把 voiceCallMu(§11.2);
 	// 持有直到会话结束(finishSession 统一释放)
 	if !voiceCallMu.TryLock() {
-		_, msg := voiceCallBusyReject(req.UserID)
-		writeStreamJSON(w, 409, streamErrBody("call_busy", msg))
-		return
+		// 呼出优先(2026-11-18): 占槽者是待机布防窗口 → 解除后限时等锁;
+		// 入站布防请求不抢占, 真通话(拨号/接通/结束中)照常拒绝
+		if req.Mode == "incoming_stream" || !lockVoiceCallPreempting(req.UserID, voiceCallPreemptWait) {
+			_, msg := voiceCallBusyReject(req.UserID)
+			writeStreamJSON(w, 409, streamErrBody("call_busy", msg))
+			return
+		}
 	}
 	voiceCallBusy.Store(true)
 

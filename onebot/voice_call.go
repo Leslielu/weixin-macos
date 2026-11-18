@@ -102,6 +102,47 @@ func voiceCallBusyReject(requester string) (string, string) {
 	return desc, "通话槽被占用(占用者: " + desc + ")"
 }
 
+// voiceCallPreemptWait 呼出抢占布防窗口后限时等锁的总时长。
+// 常规情况解除+释放 <1s; 上限只用于「呼出与 mumble 重布防循环竞争」的极端场景。
+var voiceCallPreemptWait = 10 * time.Second
+
+// preemptIncomingWindowIfIdle 呼出优先(2026-11-18): 占槽者是「待机布防窗口」
+// (stream_incoming 且仍 reserved, 未接过任何来电)时解除它, 给呼出让路。
+// 真通话(dialing/connected/ending)不动 → 返回 false, 走常规忙碌拒绝。
+// 状态检查与挂断请求对会话锁原子(防: 检查后来电、却把刚响起的真来电挂断)。
+func preemptIncomingWindowIfIdle(requester string) bool {
+	h := voiceCallHolderNow.Load()
+	if h == nil || h.Kind != "stream_incoming" || streamMgr == nil {
+		return false
+	}
+	s := streamMgr.lookupAny(h.CallID)
+	if s == nil || !s.incoming {
+		return false
+	}
+	if !s.hangupIfReserved() {
+		return false
+	}
+	Warn("voip: 呼出抢占待机布防窗口", "call_id", h.CallID, "requester", requester)
+	return true
+}
+
+// lockVoiceCallPreempting 抢锁: 若占槽者是待机布防窗口则解除, 然后限时轮询拿锁。
+// 期间布防被调用方重布(mumble 循环 ~2s 一轮)也继续解除——呼出优先于布防;
+// 时限内拿不到锁才放弃(调用方回忙碌拒绝)。
+func lockVoiceCallPreempting(requester string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if voiceCallMu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		preemptIncomingWindowIfIdle(requester)
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // VoiceCallRequest /send_voice_call 请求体
 type VoiceCallRequest struct {
 	UserID        string `json:"user_id"`       // 被叫 wxid, 必填
@@ -256,9 +297,12 @@ func voiceCallHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !voiceCallMu.TryLock() {
-		desc, msg := voiceCallBusyReject(req.UserID)
-		writeJSON(w, map[string]any{"status": "failed", "error": msg, "holder": desc})
-		return
+		// 呼出优先(2026-11-18): 占槽者是待机布防窗口 → 解除后限时等锁; 真通话仍拒绝
+		if !lockVoiceCallPreempting(req.UserID, voiceCallPreemptWait) {
+			desc, msg := voiceCallBusyReject(req.UserID)
+			writeJSON(w, map[string]any{"status": "failed", "error": msg, "holder": desc})
+			return
+		}
 	}
 	voiceCallBusy.Store(true)
 	voiceCallHolderSet(&voiceCallHolder{Kind: "outgoing", UserID: req.UserID})
