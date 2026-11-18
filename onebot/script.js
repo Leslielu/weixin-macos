@@ -3695,9 +3695,10 @@ function vsOnIncomingNotify(c, args) {
 }
 
 // 接听: App 层信令(房间号优先来话通知, 全局字符串兜底 — setTimeout 重试不忙等) → Accept。
-// 信令重试(2026-11-18 实测): 上一通电话刚挂断时(引擎异常收尾后 ~26s)状态机仍会拒绝
-// 接听信令(ret=-1342177280), 旧代码单发不重试 ⇒ 来电没人接。500ms 补打至成功或 12 次;
-// 全程失败不建引擎直接放弃(Go 侧按 ring/backend 超时收尾)。会话收尾后守卫自动停补打。
+// ⚠️ 信令失败不许阻断 Accept、不许重试(2026-11-18 实测复盘): 本生产 4.1.15.55 上信令
+// 恒返回 -1342177280(11-16 接通成功那次同样失败 ⇒ 偏移/调用约定待重标定, 另案),
+// 但 Accept ret=0 即真实接通(11-16 22:59 信令失败仍 1s 内引擎就绪)。曾试过
+// 500ms×12 重试+全败跳过 Accept ⇒ 白烧 6s 响铃且必不接通, 已回退。
 function vsIncomingAnswer(c) {
     if (voipStreamSess !== c || c.state !== "ringing") return;
     var room = c.roomId;
@@ -3712,23 +3713,13 @@ function vsIncomingAnswer(c) {
         }
     }
     if (room) {
-        var sr = null;
         try {
             var sigFn = new NativeFunction(baseAddr.add(VOIP_ANSWERSIG_OFF), "int",
                 ["int", "pointer", "int", "int"]);
-            sr = sigFn(0, voipBuildStdString(room), 0, 0);
+            var sr = sigFn(0, voipBuildStdString(room), 0, 0);
+            // -1342177280 = 本构建恒定失败(历史接通案例同样如此), 仅记日志不重试
+            console.log("[vs-in] 接听信令 ret=" + sr + (sr !== 0 ? "(已知恒失败, 不影响接通)" : ""));
         } catch (e) { console.log("[vs-in] 接听信令异常: " + e); }
-        if (sr !== 0) {
-            c.sigTries = (c.sigTries || 0) + 1;
-            if (c.sigTries <= 12) {
-                console.log("[vs-in] 接听信令 ret=" + sr + " 第" + c.sigTries + "次失败, 500ms后补打");
-                c.fmtTimer = setTimeout(function () { vsIncomingAnswer(c); }, 500);
-                return;
-            }
-            console.log("[vs-in] 接听信令 ret=" + sr + " 重试12次仍失败, 放弃接听(不建引擎)");
-            return;
-        }
-        console.log("[vs-in] 接听信令 ret=0" + (c.sigTries ? " (补打" + c.sigTries + "次后成功)" : ""));
     }
     var r = null;
     try {

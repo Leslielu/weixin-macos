@@ -64,12 +64,17 @@ for programmatic message sending and receiving.
   real calls (dialing/ringing/connected/ending) and inbound arming requests
   are never preempted and still get rejected. The caller (mumble loop)
   re-arms by itself, so the server never restores the window.
-  Inbound answer signaling retries (since 2026-11-18): right after a call
-  hangs up (observed ~26s after an abrupt engine teardown) the WeChat VoIP
-  state machine still rejects the answer signaling (ret=-1342177280);
-  `vsIncomingAnswer` retries every 500ms up to 12 times, gives up without
-  building an engine if all attempts fail. This closes the
-  call-out-then-immediately-call-in scenario.
+  Inbound answer = Accept alone; the app-layer answer signaling is a red
+  herring (as of 2026-11-18): on this production the signaling
+  (`0x4bc8164`) always returns -1342177280 — the 2026-11-16 successful
+  answer failed identically (offset/ABI needs recalibration, tracked
+  separately) — while `Accept ret=0` genuinely connects (engine ready ~1s).
+  Never retry the signaling or gate Accept on it: a 500ms x 12 retry that
+  skipped Accept after failures burned 6s of ring time and never connected;
+  it was reverted. Also: an inbound call placed within ~1s of a call ending
+  can have its notify delivered before the (re-)arming hook attaches
+  (2026-11-18 21:30) — that call is missed, the next one within the window
+  is not.
   Busy rejections (since
   2026-11-18) say `通话槽被占用(占用者: …)` and name the holder (an inbound
   arming window includes its call_id and seconds left before auto-release);
