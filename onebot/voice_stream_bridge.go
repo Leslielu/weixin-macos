@@ -185,6 +185,24 @@ func (fridaStreamBackend) Stop(callID, reason string) error {
 	return nil
 }
 
+// JSStatus 查询 JS 侧当前流式会话(幽灵布防检测用)。voipStreamStatus 是现成 RPC。
+func (fridaStreamBackend) JSStatus() (active bool, callID string, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ret, err := safeExportsCall(ctx, "voipStreamStatus")
+	if err != nil {
+		return false, "", err
+	}
+	var st struct {
+		Active bool   `json:"active"`
+		CallID string `json:"callId"`
+	}
+	if err := json.Unmarshal([]byte(jsString(ret)), &st); err != nil {
+		return false, "", err
+	}
+	return st.Active, st.CallID, nil
+}
+
 func (fridaStreamBackend) HangupNative() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

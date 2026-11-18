@@ -74,7 +74,14 @@ for programmatic message sending and receiving.
   it was reverted. Also: an inbound call placed within ~1s of a call ending
   can have its notify delivered before the (re-)arming hook attaches
   (2026-11-18 21:30) — that call is missed, the next one within the window
-  is not.
+  is not. Ghost-arm sweep (root-caused 2026-11-18 21:46): a lost JS stop
+  leaves `voipStreamSess` set, so every new arm fails with JS busy until the
+  ghost's window expires (up to ~5 min dead zone) and incoming calls in that
+  window are answered by the ghost with no client attached — connected but
+  dead silent. `handleCreate` now queries the JS session on a busy arm
+  (`voipStreamStatus`) and force-stops any callId that belongs to no live Go
+  session (`voipStreamStop ghost-clear`, hanging up zombie calls too), then
+  retries the arm once.
   Busy rejections (since
   2026-11-18) say `通话槽被占用(占用者: …)` and name the holder (an inbound
   arming window includes its call_id and seconds left before auto-release);

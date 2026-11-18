@@ -1251,6 +1251,33 @@ func (s *streamSession) sweep() {
 
 // ---- manager 收尾 ----
 
+// clearGhostArm 清除 JS 侧残留的幽灵布防。前提: 本方法只在「Go 侧无任何活会话却
+// ArmIncoming=busy」时调用——JS 有会话而 Go 没有 ⇒ 那是 stop 送达失败的残留
+// (2026-11-16 首证, 2026-11-18 21:46 复发: 幽灵接起来电但无人推音频 ⇒ 接通即死寂,
+// 新布防被拒直到幽灵窗口到期, 最长 ~5 分钟死区)。幽灵若挂着僵尸通话一并代挂
+// (不属于活会话的接听必然没有客户端推音频)。返回是否成功拆了东西。
+func (m *StreamManager) clearGhostArm(jsStatus interface {
+	JSStatus() (bool, string, error)
+	Stop(callID, reason string) error
+}) bool {
+	active, jsCallID, err := jsStatus.JSStatus()
+	if err != nil || !active || jsCallID == "" {
+		return false
+	}
+	m.mu.Lock()
+	_, live := m.sessions[jsCallID]
+	m.mu.Unlock()
+	if live {
+		return false // 归活会话所有, 不动
+	}
+	Warn("voip-stream: 发现幽灵布防, 强拆(可能代挂僵尸通话)", "js_call_id", jsCallID)
+	if err := jsStatus.Stop(jsCallID, "ghost-clear"); err != nil {
+		Warn("voip-stream: 幽灵布防强拆失败", "js_call_id", jsCallID, "err", err)
+		return false
+	}
+	return true
+}
+
 func (m *StreamManager) finishSession(s *streamSession, released bool, reason, detection string) {
 	m.mu.Lock()
 	delete(m.sessions, s.id)
@@ -1459,13 +1486,26 @@ func (m *StreamManager) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// 入站: 创建即布防(JS RecvNotify hook 武装)。同步 RPC(≤10s), 失败即回滚。
 	if s.incoming {
 		if err := s.backend.ArmIncoming(s.id, s.userID, s.incomingOpts); err != nil {
-			voiceCallHolderClear()
-			voiceCallMu.Unlock()
-			voiceCallBusy.Store(false)
-			Warn("voip-stream: 入站布防失败", "err", err)
-			writeStreamJSON(w, 500, streamErrBody("backend_error",
-				"布防失败: "+err.Error()))
-			return
+			// JS busy = JS 侧有残留会话。Go 能 TryLock 成功说明没有任何活会话,
+			// 该残留必是幽灵布防(stop 送达失败遗留) → 强拆后重试一次。
+			if err.Error() == "busy" {
+				if sw, ok := s.backend.(interface {
+					JSStatus() (bool, string, error)
+					Stop(callID, reason string) error
+				}); ok && m.clearGhostArm(sw) {
+					Warn("voip-stream: 幽灵已拆, 重试布防", "call_id", s.id)
+					err = s.backend.ArmIncoming(s.id, s.userID, s.incomingOpts)
+				}
+			}
+			if err != nil {
+				voiceCallHolderClear()
+				voiceCallMu.Unlock()
+				voiceCallBusy.Store(false)
+				Warn("voip-stream: 入站布防失败", "err", err)
+				writeStreamJSON(w, 500, streamErrBody("backend_error",
+					"布防失败: "+err.Error()))
+				return
+			}
 		}
 	}
 	respBody, _ := json.Marshal(map[string]any{"status": "ok", "retcode": 0, "data": map[string]any{

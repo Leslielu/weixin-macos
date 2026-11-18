@@ -40,6 +40,8 @@ type fakeBackend struct {
 	emitSegmentDone bool
 }
 
+func (fb *fakeBackend) SetHub(h *StreamHub) { fb.hub = h }
+
 func (fb *fakeBackend) submit(fields map[string]any) {
 	fb.submitData(fields, nil)
 }
@@ -144,10 +146,12 @@ type streamTestEnv struct {
 	srv *httptest.Server
 }
 
-func newStreamTestEnv(t *testing.T, fb *fakeBackend) *streamTestEnv {
+func newStreamTestEnv(t *testing.T, fb StreamBackend) *streamTestEnv {
 	t.Helper()
 	hub := NewStreamHub()
-	fb.hub = hub
+	if ha, ok := fb.(interface{ SetHub(*StreamHub) }); ok {
+		ha.SetHub(hub) // fakeBackend 及其包装器注入事件回环
+	}
 	mgr := NewStreamManager(StreamConfig{
 		Token: "tk", SweepEvery: 50 * time.Millisecond,
 		AttachTimeout: 300 * time.Millisecond, StartTimeout: 300 * time.Millisecond,
@@ -570,6 +574,87 @@ func TestStreamOwnerExclusion(t *testing.T) {
 	// 清理: 挂断释放锁
 	_, _ = e.do("POST", "/voice_calls/"+id+"/hangup", "", nil)
 	waitFor(t, "release", func() bool { return !StreamBusy() })
+}
+
+// ---- 幽灵布防强拆 ----
+
+// ghostSweepBackend 模拟「Go 会话已结束但 JS 布防残留」的幽灵场景
+type ghostSweepBackend struct {
+	*fakeBackend
+	mu           sync.Mutex
+	armBusyFirst bool
+	jsActive     bool
+	jsCallID     string
+	sweepStopped string
+}
+
+func (g *ghostSweepBackend) ArmIncoming(callID, userID string, opts StreamIncomingOpts) error {
+	g.mu.Lock()
+	busy := g.armBusyFirst
+	if busy {
+		g.armBusyFirst = false
+	}
+	g.mu.Unlock()
+	if busy {
+		return &streamFailure{Code: "busy"}
+	}
+	return g.fakeBackend.ArmIncoming(callID, userID, opts)
+}
+
+func (g *ghostSweepBackend) JSStatus() (bool, string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.jsActive, g.jsCallID, nil
+}
+
+func (g *ghostSweepBackend) Stop(callID, reason string) error {
+	g.mu.Lock()
+	if callID == g.jsCallID && reason == "ghost-clear" {
+		g.sweepStopped = callID
+		g.jsActive = false
+	}
+	g.mu.Unlock()
+	return g.fakeBackend.Stop(callID, reason)
+}
+
+// JS busy(幽灵残留)时创建应自动强拆幽灵并重试成功(2026-11-18 21:46 死寂通话根因)
+func TestGhostArmSweepOnBusy(t *testing.T) {
+	g := &ghostSweepBackend{fakeBackend: &fakeBackend{}}
+	e := newStreamTestEnv(t, g)
+	oldMgr := streamMgr
+	streamMgr = e.mgr
+	t.Cleanup(func() { streamMgr = oldMgr })
+
+	code, body := e.do("POST", "/voice_calls", preemptTestIncomingBody, nil)
+	if code != 201 {
+		t.Fatalf("首次布防应成功: %d %v", code, body)
+	}
+	firstID := body["data"].(map[string]any)["call_id"].(string)
+	_, _ = e.do("POST", "/voice_calls/"+firstID+"/hangup", "", nil)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && StreamBusy() {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 模拟 JS 幽灵: 残留第一通的会话, 下次 ArmIncoming 首打返回 busy
+	g.mu.Lock()
+	g.armBusyFirst = true
+	g.jsActive = true
+	g.jsCallID = firstID
+	g.mu.Unlock()
+
+	code2, body2 := e.do("POST", "/voice_calls", preemptTestIncomingBody, nil)
+	if code2 != 201 {
+		t.Fatalf("幽灵强拆后布防应成功: %d %v", code2, body2)
+	}
+	g.mu.Lock()
+	swept := g.sweepStopped
+	g.mu.Unlock()
+	if swept != firstID {
+		t.Fatalf("应强拆幽灵会话 %s: got %q", firstID, swept)
+	}
+	id2 := body2["data"].(map[string]any)["call_id"].(string)
+	_, _ = e.do("POST", "/voice_calls/"+id2+"/hangup", "", nil)
 }
 
 // ---- 鉴权 ----

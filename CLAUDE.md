@@ -191,7 +191,11 @@ Each WeChat version requires specific memory offsets in `wechat_version/*.json`.
   联调客户端 `tools/voip/stream_client.py`（出站 `--start` 才拨号；入站 `--incoming`）。
   onebot 新增 `-stream_token`（空 = 实时路由 fail-closed 禁用）、`-stream_origins`。
   与旧文件通话/入站接听共用 `voiceCallMu` 全局锁（实时期间旧 `/hangup_voice_call` 回 409
-  call_id_required）。进度/done 口径=`submitted_to_wechat`（不是对方已听到）；clear 只清
+  call_id_required）。⚠️ 幽灵布防（2026-11-18 根因修复）：JS stop 送达失败会在 JS 残留
+  `voipStreamSess` ⇒ 新布防全被拒（JS busy）直到幽灵窗口到期（最长 ~5 分钟死区），期间来电话
+  被幽灵接起但无客户端推音频 = **接通即死寂**。现 `handleCreate` 遇 JS busy 自动查 JS 现状
+  （`voipStreamStatus`），不属于任何活 Go 会话即强拆（`voipStreamStop ghost-clear`，僵尸通话
+  一并代挂）并重试布防，死区从 ~5 分钟缩到一次布防重试。进度/done 口径=`submitted_to_wechat`（不是对方已听到）；clear 只清
   onebot 队列；接通/呼入接听=inferred，rejected/busy 事件**未实现**（capabilities 标 false）。
   ⚠️ stop 走 RPC（`voipStreamStop`）：布防态 Post+recv 曾送达失败；append/commit/clear 仍走
   Post 通道（仅 connected 后发生，与音频保序）。
